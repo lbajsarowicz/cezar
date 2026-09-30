@@ -12,7 +12,7 @@ Non-goals: serving arbitrary host files, adding an artifact endpoint, or changin
 
 - [x] 1.1 Add a transcript destination classifier and local-only renderer — targeted tests pass — b1b4b908
 - [x] 1.2 Preserve safety confirmation for HTTPS and cockpit-relative links — targeted tests pass — b1b4b908
-- [ ] 1.3 Run the full repository validation gate and authoritative PR review
+- [x] 1.3 Run the full repository validation gate and authoritative PR review — self-review approved; GitHub cannot accept author approval
 
 ## Risks
 
@@ -26,4 +26,4 @@ Non-goals: serving arbitrary host files, adding an artifact endpoint, or changin
 
 - [x] 1.1 Add a transcript destination classifier and local-only renderer — targeted tests pass — b1b4b908
 - [x] 1.2 Preserve safety confirmation for HTTPS and cockpit-relative links — targeted tests pass — b1b4b908
-- [ ] 1.3 Run the full repository validation gate and authoritative PR review
+- [x] 1.3 Run the full repository validation gate and authoritative PR review — self-review approved; GitHub cannot accept author approval
