@@ -1,127 +1,127 @@
 # Tracker provider: GitHub
 
-This file is the GitHub implementation of the tracker operations contract (see `TEMPLATE.md` for the contract itself). Every skill in the collection performs issue/PR state management through **named tracker operations** — `**get-issue**`, `**comment-pr**`, and so on — and this file defines what each operation means for GitHub, using the `gh` CLI.
+This file is the GitHub implementation of the tracker operations contract (see `TEMPLATE.md` for the contract itself). Skills perform issue/PR state management through **named tracker operations** — `**get-issue**`, `**comment-pr**`, and so on — and this file defines what each operation means for GitHub, using the `gh` CLI.
 
-How it is used at runtime: `om-setup-agent-pipeline` copies this file into the repository at `.ai/trackers/github.md`, and the config's `tracker` field selects it. When a skill says "tracker operation **get-pr**", execute the command documented under that operation heading in the repo's copy. The repo's copy is authoritative: teams extend or override any operation by editing it — add flags, swap a command, append repo-specific conventions — and every skill picks the change up on its next run. An operation not covered by an edit keeps its behavior from this file's text as copied.
+At runtime: `om-setup-agent-pipeline` copies this file into the repository at `.ai/trackers/github.md`, and the config's `tracker` field selects it. When a skill says "tracker operation **get-pr**", execute the command documented under that operation heading in the repo's copy. The repo's copy is authoritative: teams extend or override any operation by editing it, and every skill picks the change up on its next run. An operation not covered by an edit keeps its behavior from this file's text as copied.
 
 ## Prerequisites
 
-- `gh` CLI installed and authenticated. Verify with the **auth-check** operation before a batch run; fail fast when unauthenticated.
+- `gh` CLI installed and authenticated, and `jq` available (the label guards and several operations parse JSON with it). Verify with the **auth-check** operation before a batch run; fail fast when unauthenticated.
+- **Minimum `gh` version: 2.82.1** (released 2025-10-22). Older clients abort every label, assignee, and title/body edit on the retired Projects (classic) API — see the next section. **auth-check** warns when the installed client is older.
 - All operations accept an optional `{repo}` (`owner/name`); when omitted, `gh` infers it from the current checkout's git remote. Pass `--repo {owner}/{repo}` explicitly whenever a skill operates on a repository other than the current one.
+
+### Projects (classic) deprecation — the failure that silently leaves a PR unlabeled
+
+GitHub [sunset Projects (classic)](https://github.blog/changelog/2024-05-23-sunset-notice-projects-classic/), and its GraphQL fields (`repository.pullRequest.projectCards`, `repository.issue.projectCards`, `organization.projects`) now answer with an error instead of data. `gh pr edit` and `gh issue edit` reach the API through GraphQL and, on clients older than 2.82.1, request those retired fields **unconditionally** — no `--add-project` flag involved. `gh` treats the error as fatal, so the command exits non-zero **before applying the edit**, printing only:
+
+```text
+GraphQL: Projects (classic) is being deprecated in favor of the new Projects experience, see: https://github.blog/changelog/2024-05-23-sunset-notice-projects-classic/. (repository.pullRequest.projectCards)
+```
+
+That text reads like a deprecation warning, but the label was never applied and the PR keeps its previous state.
+
+**Diagnose it correctly.** Any operation failing with `Projects (classic) is being deprecated` is reporting a **stale `gh` client**, not a repository or organization misconfiguration: no classic project has to be attached to anything for it to fire, and it is not specific to one repo, one owner, or one token.
+
+**Why this descriptor does not hit it.** Every label, assignee, and title/body mutation below is written against the REST API (`gh api`), which never touches the GraphQL project fields and therefore behaves identically on every client version. That is deliberate — do not "simplify" the guards back to `gh pr edit --add-label`.
+
+**Upgrade the client anyway.** Read paths keep the coupling: `gh issue view` / `gh pr view` without `--json` render the classic project column, and `projectCards` is still offered as a fetchable `--json` field (cli/cli#11769), so a field list that names it errors on any version. Distribution packages lag years behind — Debian bookworm ships 2.23, Ubuntu 2.45, Alpine stable 2.72, all affected — so install from [GitHub's own package repositories](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#recommended-official) or Homebrew rather than the distro's:
+
+```bash
+gh --version                                   # must report >= 2.82.1
+brew upgrade gh                                # macOS / Linuxbrew
+sudo apt update && sudo apt install --only-upgrade gh   # after adding GitHub's apt repo
+```
+
+Upstream references: cli/cli#11983 (`gh pr edit` aborts without any project flag), cli/cli#11986 → fixed in [v2.82.1](https://github.com/cli/cli/releases/tag/v2.82.1) ("Fix `gh pr edit` not detecting classic projects feature deprecation"), cli/cli#11992 / #12476 / #12640 (the same error from `gh issue view`; the maintainers' answer is to upgrade), cli/cli#11769 (open: drop `projectCards` as a fetchable field).
 
 ## Conventions
 
 - Issue and PR identifiers are numbers; in text they are written `#123`.
+- A `--json` field list must never include `projectCards`: it is a Projects (classic) relic that errors on every client version (see above). Request only the fields the calling skill names.
 - A PR is linked to the issue it resolves with `Fixes #{issueId}` (or `Closes #{issueId}`) in the PR body; GitHub then closes the issue on merge. To reference without auto-closing, use a plain issue link.
 - PRs open as **drafts** when a skill says so; a human (or **mark-pr-ready**) promotes them.
-- Claim/lock signals on an issue or PR are: assignee set to the automation user, the `in-progress` label, and a `🤖`-prefixed claim comment. All three are set on claim; the label is guarded (below).
+- Claim/lock signals on an issue or PR are: assignee set to the automation user, the `in-progress` label, and a `🤖`-prefixed claim comment. All three are set on claim; the label is guarded (below). The `ci-monitoring` label is **not** a claim signal — it marks work that is finished and reported while its CI-result follow-up is still owed, and never makes another skill back off.
 - Long, multi-line comment bodies are posted with `--body-file` (or a heredoc via process substitution) so formatting is preserved.
-- CI status truth comes from **get-pr-checks**; the set of *required* checks comes from **get-required-checks**. Both of its reads mean "nothing is required" when there is no branch protection (the `--required` query reports no required checks, and the fallback endpoint answers HTTP 404); a 401/403 on the fallback means protection is unreadable and is surfaced as an error rather than guessed away.
+- CI status truth comes from **get-pr-checks**; the set of *required* checks comes from **get-required-checks** (branch protection). When branch protection is not readable (404), treat every reported check as required.
 
 ## Label guards
 
 Every label mutation goes through an existence guard so a missing label degrades to a logged skip instead of a failure, and `labels.enabled: false` in the config skips label operations entirely.
 
+The guards mutate through the **REST API**, not `gh pr edit` / `gh issue edit`. Those two route through GraphQL, which requests the retired Projects (classic) fields on clients older than 2.82.1 and aborts the whole edit before the label lands (see Prerequisites). REST never touches those fields, so labels apply on any client version. Keep it that way.
+
 ```bash
-# The repo's label names are fetched once per shell and reused, so a batch of guard
-# checks costs one API round trip rather than one per label. Call repo_labels with no
-# pipe: a pipeline would run it in a subshell and throw the cache away. A failed fetch
-# leaves the cache empty, so the next guard retries instead of treating every label as
-# absent.
-repo_labels() {
-  if [ -z "${REPO_LABELS-}" ]; then
-    REPO_LABELS=$(gh label list --limit 200 --json name --jq '.[].name')
-  fi
+# Target repository: $REPO when a skill addresses another repository (set by repo-info),
+# otherwise the current checkout's.
+tracker_repo() {
+  if [ -n "${REPO:-}" ]; then printf '%s' "$REPO"
+  else gh repo view --json nameWithOwner --jq .nameWithOwner; fi
 }
 
 label_exists() {
-  repo_labels
-  grep -Fxq "$1" <<EOF
-$REPO_LABELS
-EOF
+  gh api --paginate "repos/$(tracker_repo)/labels" --jq '.[].name' | grep -Fxq "$1"
 }
 
-# PR labels
+# PR labels. $1 = label, $2 = PR number.
 apply_label() {
   if [ "$LABELS_ENABLED" != "true" ]; then return 0; fi
   if label_exists "$1"; then
-    gh pr edit "$2" --add-label "$1"
+    gh api -X POST "repos/$(tracker_repo)/issues/$2/labels" -f "labels[]=$1" >/dev/null
   else
     echo "Skipping label '$1' (not defined in this repo). Create it with: gh label create '$1'"
   fi
 }
 
-# Issue labels
-apply_issue_label() {
-  if [ "$LABELS_ENABLED" != "true" ]; then return 0; fi
-  if label_exists "$1"; then
-    gh issue edit "$2" --add-label "$1"
-  else
-    echo "Skipping label '$1' (not defined in this repo). Create it with: gh label create '$1'"
-  fi
-}
+# Issue labels. GitHub labels issues and PRs through the same /issues/ endpoint, so this
+# delegates; it keeps its own name because skills call the guards by name. $1 = label,
+# $2 = issue id.
+apply_issue_label() { apply_label "$1" "$2"; }
 
-remove_issue_label() {
+# Removal. $1 = label, $2 = PR or issue number. A label that is not currently applied
+# answers 404 — a no-op, not a failure, so removal needs no existence check.
+remove_label() {
   if [ "$LABELS_ENABLED" != "true" ]; then return 0; fi
-  if label_exists "$1"; then
-    gh issue edit "$2" --remove-label "$1"
-  fi
+  gh api -X DELETE \
+    "repos/$(tracker_repo)/issues/$2/labels/$(printf '%s' "$1" | jq -sRr @uri)" \
+    >/dev/null 2>&1 || true
 }
+remove_issue_label() { remove_label "$1" "$2"; }
 
-# Pipeline labels are mutually exclusive. The target is added and the siblings that
-# are actually present are removed in a single call, then the resulting set is read
-# back: a partial failure must not leave the PR with no pipeline label.
+# Pipeline labels are mutually exclusive: setting one removes the others first.
+# Note the argument order, unchanged: $1 = PR number, $2 = label.
 set_pipeline_label() {
   if [ "$LABELS_ENABLED" != "true" ]; then return 0; fi
-  pr="$1"
-  target="$2"
-  if ! label_exists "$target"; then
-    echo "Skipping label '$target' (not defined in this repo). Create it with: gh label create '$target'"
-    return 0
-  fi
-  remove=""
   for label in $PIPELINE_LABELS; do
-    [ "$label" = "$target" ] && continue
-    label_exists "$label" || continue
-    remove="${remove:+$remove,}$label"
+    [ "$label" = "$2" ] && continue
+    remove_label "$label" "$1"
   done
-  if [ -n "$remove" ]; then
-    gh pr edit "$pr" --add-label "$target" --remove-label "$remove"
-  else
-    gh pr edit "$pr" --add-label "$target"
-  fi
-  present=$(gh pr view "$pr" --json labels --jq '.labels[].name')
-  if ! grep -Fxq "$target" <<EOF
-$present
-EOF
-  then
-    echo "set_pipeline_label: '$target' is not on PR #$pr after the transition." >&2
-    return 1
-  fi
-  for label in $PIPELINE_LABELS; do
-    [ "$label" = "$target" ] && continue
-    if grep -Fxq "$label" <<EOF
-$present
-EOF
-    then
-      echo "set_pipeline_label: '$label' is still on PR #$pr after the transition." >&2
-      return 1
-    fi
-  done
+  apply_label "$2" "$1"
 }
 ```
 
-When operating on a different repository than the current checkout, add `--repo "$REPO"` to each command inside the guards and check label existence against that repo (`gh label list --repo "$REPO"`). The cache is not repo-keyed, so `unset REPO_LABELS` before the guards when one shell moves between repositories.
+Cross-repository targets need no extra flags: `tracker_repo` resolves `$REPO` when a skill set it, and every guard interpolates the result, so the existence check and the mutation always address the same repository.
+
+Read the labels back (`gh pr view {prNumber} --json labels`) whenever the label state gates a later decision — a mutation the guard logged as skipped is a normal outcome, and a run that assumes it landed will branch wrongly.
 
 ## Operations
 
 ### Identity and repository
 
 #### auth-check
-Verify the CLI is authenticated. → exit status.
+Verify the CLI is authenticated and new enough. → exit status (non-zero when unauthenticated), plus a warning on stdout when the client predates the Projects (classic) fix.
 ```bash
-gh auth status
+gh auth status || exit 1
+
+# Clients older than 2.82.1 abort `gh pr edit` / `gh issue edit` on the retired Projects
+# (classic) GraphQL fields (see Prerequisites). The guards mutate through REST, so a run
+# still works — but read paths stay affected, so warn instead of failing silently.
+GH_VERSION=$(gh --version | sed -n '1s/.*gh version \([0-9][0-9.]*\).*/\1/p')
+MIN_GH_VERSION=2.82.1
+if [ "$(printf '%s\n%s\n' "$MIN_GH_VERSION" "$GH_VERSION" | sort -V | head -n1)" != "$MIN_GH_VERSION" ]; then
+  echo "WARNING: gh $GH_VERSION predates $MIN_GH_VERSION — 'gh pr edit'/'gh issue edit' fail on the Projects (classic) deprecation. Upgrade: https://github.com/cli/cli/blob/trunk/docs/install_linux.md#recommended-official"
+fi
 ```
+`sort -V` exists on GNU and BSD/macOS `sort`; where it does not, compare `gh --version` against 2.82.1 by inspection and report the same warning.
 
 #### current-user
 → the automation user's login.
@@ -177,15 +177,17 @@ gh issue comment {issueId} --repo {owner}/{repo} --body "<body>"
 ```
 
 #### update-issue
-`{issueId}`, new title and/or body (use a body-file for multi-line bodies). Edits the issue's own fields; does not touch labels or assignees (those have their own operations).
+`{issueId}`, new title and/or body. Edits the issue's own fields; does not touch labels or assignees (those have their own operations). Pass only what changed; read the body from a file so multi-line content survives.
 ```bash
-gh issue edit {issueId} --repo {owner}/{repo} --title "<title>" --body-file <file>
+gh api -X PATCH repos/{owner}/{repo}/issues/{issueId} -f title="<title>"
+gh api -X PATCH repos/{owner}/{repo}/issues/{issueId} -F body=@<file>
 ```
+`gh issue edit {issueId} --title "<title>" --body-file <file>` does the same on `gh` >= 2.82.1 and is fine interactively; older clients fail before writing anything (see Prerequisites), so script the REST form.
 
 #### assign-issue / unassign-issue
 ```bash
-gh issue edit {issueId} --repo {owner}/{repo} --add-assignee "<login>"
-gh issue edit {issueId} --repo {owner}/{repo} --remove-assignee "<login>"
+gh api -X POST   repos/{owner}/{repo}/issues/{issueId}/assignees -f "assignees[]=<login>"
+gh api -X DELETE repos/{owner}/{repo}/issues/{issueId}/assignees -f "assignees[]=<login>"
 ```
 
 #### label-issue / unlabel-issue
@@ -203,20 +205,26 @@ gh api repos/{owner}/{repo}/issues/comments/{commentId} --jq '{body,user:.user.l
 gh api repos/{owner}/{repo}/issues/{number}/comments --jq '.[] | {id,user:.user.login,body}'
 ```
 
+#### update-comment
+`{commentId}`, new body → rewrite an existing conversation comment in place (works for issue and PR conversation comments alike). This is how marker-idempotent comments (label rationale, verification, claim take-overs) are updated on re-runs: find your `🤖 …` marker via **list-issue-comments**, then update that comment instead of posting a new one. Use a body file so multi-line bodies survive.
+```bash
+gh api -X PATCH repos/{owner}/{repo}/issues/comments/{commentId} -F body=@<path>
+```
+
 ### Pull requests
 
 #### get-pr
 `{prNumber}`, field list → PR data. Request only the fields the calling skill names; the full field set skills use:
 ```bash
-gh pr view {prNumber} --json number,title,url,body,state,author,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,maintainerCanModify,mergeable,mergeStateStatus,reviewDecision,labels,latestReviews,reviews,commits,files,assignees,comments,mergedAt,mergeCommit,closingIssuesReferences
+gh pr view {prNumber} --json number,title,url,body,state,author,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,maintainerCanModify,mergeable,mergeStateStatus,reviewDecision,labels,latestReviews,reviews,commits,files,assignees,comments,mergedAt,mergeCommit,closingIssuesReferences,createdAt,closedAt,additions,changedFiles
 ```
 
 #### list-prs
 State/search filters, field list, limit → PRs.
 ```bash
 gh pr list --state open --json number,title,url,author,labels,reviewDecision,mergeable,mergeStateStatus,headRefName,baseRefName,updatedAt,isDraft,assignees --limit 100
-gh pr list --state merged --search "merged:>=${SINCE_DATE}" --json number,title,url,body,author,mergedAt,mergeCommit,baseRefName,headRefName,closingIssuesReferences,labels --limit {limit}
-gh pr list --state closed --search "closed:>=${SINCE_DATE} is:unmerged" --json number,title,url,body,author,closedAt,baseRefName,headRefName,closingIssuesReferences,labels --limit {limit}
+gh pr list --state merged --search "merged:>=${SINCE_DATE}" --json number,title,url,body,author,createdAt,mergedAt,mergeCommit,baseRefName,headRefName,closingIssuesReferences,labels --limit {limit}
+gh pr list --state closed --search "closed:>=${SINCE_DATE} is:unmerged" --json number,createdAt,title,url,body,author,closedAt,baseRefName,headRefName,closingIssuesReferences,labels --limit {limit}
 ```
 
 #### search-prs
@@ -232,6 +240,14 @@ gh pr create --repo {owner}/{repo} --base "$BASE_BRANCH" --draft --title "<title
 PR_URL=$(gh pr view --json url --jq .url)
 PR_NUMBER=$(gh pr view --json number --jq .number)
 ```
+
+#### update-pr
+`{prNumber}`, new title and/or new body → the PR's own title/body rewritten in place (not a comment), e.g. describing what a PR actually ships once its scope changed. Pass whichever of title / body changed; omit the other. Read the body from a file so multi-line content survives.
+```bash
+gh api -X PATCH repos/{owner}/{repo}/pulls/{prNumber} -f title="<title>"
+gh api -X PATCH repos/{owner}/{repo}/pulls/{prNumber} -F body=@<path>
+```
+`gh pr edit {prNumber} --title … --body-file …` does the same on `gh` >= 2.82.1. On older clients it exits non-zero with the Projects (classic) error and writes nothing (see Prerequisites) — which reads like a no-op, so script the REST form above.
 
 #### comment-pr
 `{prNumber}`, body. For long structured comments:
@@ -281,16 +297,14 @@ gh pr view {prNumber} --json url --jq .url
 Fallbacks: for a **private** repo the raw URLs need auth and will not render — post the comment with the image links plus the local artifact paths and note that inline rendering is unavailable (a private-visibility limit), rather than failing. When even the evidence branch cannot be pushed (no write access), degrade to listing the artifact paths in the comment. Never store evidence on the change's own branch, and never force-push.
 
 #### assign-pr / unassign-pr
+Assignees live on the shared `/issues/` endpoint for PRs too — `{prNumber}` is the path segment.
 ```bash
-gh pr edit {prNumber} --add-assignee "<login>"
-gh pr edit {prNumber} --remove-assignee "<login>"
+gh api -X POST   repos/{owner}/{repo}/issues/{prNumber}/assignees -f "assignees[]=<login>"
+gh api -X DELETE repos/{owner}/{repo}/issues/{prNumber}/assignees -f "assignees[]=<login>"
 ```
 
 #### label-pr / unlabel-pr
-Always through the guards: `apply_label "<label>" {prNumber}` / `set_pipeline_label {prNumber} "<label>"` for the mutually exclusive pipeline group; direct removal:
-```bash
-gh pr edit {prNumber} --remove-label "<label>"
-```
+Always through the guards: `apply_label "<label>" {prNumber}` / `set_pipeline_label {prNumber} "<label>"` for the mutually exclusive pipeline group; direct removal: `remove_label "<label>" {prNumber}`.
 
 #### get-pr-diff
 `{prNumber}` → full diff, or the changed-file list with `--name-only`.
@@ -338,28 +352,9 @@ gh pr checks {prNumber} --json name,state,link
 ```
 
 #### get-required-checks
-`{prNumber}` → the required status checks for the PR. Ask the PR directly; `--required` keeps only the checks branch protection enforces, and `bucket` gives each one's current state. When branch protection requires nothing, `gh` exits 1 with `no required checks reported` and no JSON — that is "nothing is required", not an error; any other exit 1 is a genuine failure and is re-raised:
+Base branch → the set of required status checks. A 404 means branch protection is not readable — treat all reported checks as required.
 ```bash
-out=$(gh pr checks {prNumber} --required --json name,state,link,bucket 2>&1); status=$?
-if [ "$status" -eq 0 ]; then
-  printf '%s\n' "$out"
-elif printf '%s' "$out" | grep -qi 'no required checks reported'; then
-  :  # no check is required
-else
-  printf '%s\n' "$out" >&2
-  false
-fi
-```
-When the raw protection contexts are needed instead, read the endpoint with its headers so a repo with no protection is distinguishable from one whose protection is unreadable:
-```bash
-resp=$(gh api --include "repos/{owner}/{repo}/branches/${BASE_BRANCH}/protection/required_status_checks" 2>/dev/null || true)
-code=$(printf '%s\n' "$resp" | head -1 | awk '{print $2}')
-case "$code" in
-  200) printf '%s\n' "$resp" | tr -d '\r' | sed '1,/^$/d' | jq -r '.contexts[]' ;;
-  404) : ;;  # no branch protection: no check is required
-  401|403) echo "get-required-checks: branch protection is unreadable (HTTP $code); surface this error instead of treating every check as required." >&2; false ;;
-  *) echo "get-required-checks: unexpected response (HTTP ${code:-none})." >&2; false ;;
-esac
+gh api repos/{owner}/{repo}/branches/{baseRefName}/protection/required_status_checks --jq '.contexts[]' 2>/dev/null
 ```
 
 #### get-pr-comment / get-review-comment
@@ -368,6 +363,14 @@ Conversation comment id (`issuecomment-<id>` links) vs inline review comment id 
 gh api repos/{owner}/{repo}/issues/comments/{commentId} --jq '{body,user:.user.login,url:.html_url}'
 gh api repos/{owner}/{repo}/pulls/comments/{commentId} --jq '{body,user:.user.login,url:.html_url}'
 ```
+
+#### list-review-comments
+`{prNumber}` → every inline review comment on the diff (the conversation comments come from **list-issue-comments**; these are the ones anchored to a file and line).
+```bash
+gh api --paginate repos/{owner}/{repo}/pulls/{prNumber}/comments \
+  --jq '.[] | {id,user:.user.login,path,line:(.line // .original_line),body,url:.html_url,reply_to:.in_reply_to_id}'
+```
+REST does not expose a thread's resolved state (that lives in GraphQL's review threads), so treat every returned comment as potentially open and judge it against the current diff. `reply_to` is non-null on replies, which is what lets you reconstruct a thread. Consumers treat an unavailable operation as "inline feedback out of reach", not as a failure: they fall back to review bodies plus conversation comments and state the gap in their report.
 
 ### CI runs
 
@@ -406,9 +409,9 @@ gh run watch {runId} --exit-status
 ### Labels
 
 #### list-labels
-→ all label names defined in the repo.
+→ all label names defined in the repo. Paginated, so repositories with large taxonomies are not truncated the way a fixed `gh label list --limit` is.
 ```bash
-gh label list --limit 200 --json name --jq '.[].name'
+gh api --paginate repos/{owner}/{repo}/labels --jq '.[].name'
 ```
 
 #### create-label
@@ -438,7 +441,7 @@ gh label create skip-qa           --color 0e8a16 --description "Low risk, QA not
 gh label create qa-approved       --color 0e8a16 --description "Manual QA passed"
 gh label create qa-self-verified  --color c5def5 --description "Self-QA exception used"
 gh label create in-progress       --color c5def5 --description "An automated skill is working on this"
-gh label create ci-monitoring     --color fbca04 --description "An automated skill is watching CI on this"
+gh label create ci-monitoring     --color d4c5f9 --description "Work complete and reported; agent is watching CI results"
 gh label create do-not-close      --color c5def5 --description "Humans only: never auto-close this issue"
 gh label create priority-low      --color e4e669 --description "Cosmetic or follow-up work"
 gh label create priority-medium   --color fbca04 --description "Ordinary bug or feature"
