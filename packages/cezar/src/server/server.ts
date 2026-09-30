@@ -581,6 +581,7 @@ export interface WorkspaceConfigResponse {
   resources: {
     maxParallel: number;
     maxMonitoringSessions: number;
+    idleTimeoutMinutes: number | null;
     monitoringWakeIntervalMinutes: number | null;
     autoResumeOnUsageLimit: boolean;
     memoryLimitMb: number | null;
@@ -3052,6 +3053,7 @@ export function createApp(deps: ServerDeps) {
     resources: {
       maxParallel: config.resources.maxParallel,
       maxMonitoringSessions: config.resources.maxMonitoringSessions,
+      idleTimeoutMinutes: config.resources.idleTimeoutMinutes,
       monitoringWakeIntervalMinutes: config.resources.monitoringWakeIntervalMinutes,
       autoResumeOnUsageLimit: config.resources.autoResumeOnUsageLimit,
       memoryLimitMb: config.resources.memoryLimitMb,
@@ -3205,6 +3207,7 @@ export function createApp(deps: ServerDeps) {
       .object({
         maxParallel: z.number().int().min(1).max(16).optional(),
         maxMonitoringSessions: z.number().int().min(0).max(16).optional(),
+        idleTimeoutMinutes: z.number().int().min(0).max(1440).nullable().optional(),
         monitoringWakeIntervalMinutes: z.number().int().min(1).max(60).nullable().optional(),
         autoResumeOnUsageLimit: z.boolean().optional(),
         memoryLimitMb: z.number().int().min(0).max(1_048_576).nullable().optional(),

@@ -2069,7 +2069,11 @@ export async function getWorkspaceConfig(opts?: ReadOptions): Promise<WorkspaceC
     await cez.api.v1.workspace.config.$get({}, init(opts)),
     '/workspace/config',
   )
-  return { ...answer, agentDefaults: answer.agentDefaults ?? {} }
+  return {
+    ...answer,
+    agentDefaults: answer.agentDefaults ?? {},
+    resources: { ...answer.resources, idleTimeoutMinutes: answer.resources.idleTimeoutMinutes ?? 15 },
+  }
 }
 
 /**

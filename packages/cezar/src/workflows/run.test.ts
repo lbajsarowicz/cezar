@@ -1338,6 +1338,55 @@ describe('CEZ:ASK parks as waiting and emits ask.requested (#473)', () => {
     expect(questions[0]!.options).toHaveLength(2);
   }, 30_000);
 
+  it('uses the configured plain-wait timeout and preserves the expiry safeguard (#992)', () => {
+    vi.useFakeTimers();
+    const record = store.createRun({
+      title: 'idle timeout',
+      workflow: 'quick-task',
+      task: 'idle timeout',
+      steps: [{ id: 'task', name: 'Task', kind: 'agent' }],
+    });
+    const ended = vi.fn();
+    const state = {
+      cancelled: false,
+      session: { open: true, end: ended },
+    } as never;
+    const internals = manager as unknown as {
+      armIdleTimer: (runId: string, state: never) => void;
+    };
+
+    internals.armIdleTimer(record.id, state);
+    vi.advanceTimersByTime(14 * 60_000);
+    expect(ended).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(60_000);
+    expect(ended).toHaveBeenCalledOnce();
+    expect(readEvents(record.id).some((event) => event.message === 'session closed after 15m of inactivity')).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it.each([0, null])('does not arm the plain-wait timeout when configured as %s (#992)', (minutes) => {
+    manager.dispose();
+    manager = new RunManager(store, repoRoot, {
+      semaphore: new WorkspaceSemaphore({ initial: { idleTimeoutMinutes: minutes } }),
+    });
+    const ended = vi.fn();
+    const state = { cancelled: false, session: { open: true, end: ended } } as never;
+    const record = store.createRun({
+      title: 'no idle timeout',
+      workflow: 'quick-task',
+      task: 'no idle timeout',
+      steps: [{ id: 'task', name: 'Task', kind: 'agent' }],
+    });
+    const internals = manager as unknown as {
+      armIdleTimer: (runId: string, state: never) => void;
+    };
+    vi.useFakeTimers();
+    internals.armIdleTimer(record.id, state);
+    vi.advanceTimersByTime(24 * 60 * 60_000);
+    expect(ended).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
   it('an intermediate CEZ:ASK pauses before the following check', async () => {
     const record = manager.startRun(BLOCKING_CHECK, { task: 'mock:ask choose a path', worktree: false });
     currentId = record.id;
