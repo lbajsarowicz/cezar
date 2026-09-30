@@ -300,6 +300,30 @@ describe('systemPrompt end-to-end (dry run)', () => {
     expect(capturedSystemPrompt()).toBe(composeSystemPrompt(CONFIG_PROMPT, HANDOFF_INSTRUCTIONS));
   });
 
+  // A tracker-automation launch is the third provenance key (spec 2026-09-30-system-prompt-diet
+  // D4): without it, a Jira/Linear-launched task that its own order asks to create an automation
+  // still gets the tutorial, the loop D4 exists to close.
+  it('automations on and reachable: a task a tracker automation launched is not taught the CLI', async () => {
+    process.env.CEZ_AUTOMATIONS = '1';
+    process.env.CEZ_API_URL = 'http://127.0.0.1:4321';
+    try {
+      writeFileSync(argsFile, '', 'utf8');
+      const record = manager.startRun(workflow, { task: 'triage it mock:done' });
+      store.updateRun(record.id, {
+        automationTracker: { automationId: 'a1', automationRevision: 1, receiptId: 'r1', provider: 'jira', key: 'FWC-1', url: 'https://example.atlassian.net/browse/FWC-1' },
+      });
+      const deadline = Date.now() + 20_000;
+      while (!['done', 'review', 'failed', 'cancelled'].includes(store.getRun(record.id)?.status ?? '')) {
+        if (Date.now() > deadline) throw new Error('run did not finish in time');
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    } finally {
+      delete process.env.CEZ_AUTOMATIONS;
+      delete process.env.CEZ_API_URL;
+    }
+    expect(capturedSystemPrompt()).toBe(composeSystemPrompt(CONFIG_PROMPT, HANDOFF_INSTRUCTIONS));
+  });
+
   it('automations on but unreachable (headless), or opted out: no task is taught the CLI', async () => {
     delete process.env.CEZ_AUTOMATIONS;
     delete process.env.CEZ_API_URL;

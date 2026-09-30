@@ -197,7 +197,7 @@ export async function runTaskCommand(
           id: string;
           title: string;
           status: string;
-          costUsd?: number;
+          costUsd?: number | null;
           branch?: string;
           dispatch?: { rootRunId: string; parentRunId?: string; kind?: string; report?: { status: string; verdict?: string } };
         }>;
@@ -220,14 +220,14 @@ export async function runTaskCommand(
               status: run.status,
               title: run.title,
               ...(run.branch ? { branch: run.branch } : {}),
-              ...(run.costUsd !== undefined ? { costUsd: run.costUsd } : {}),
+              ...(typeof run.costUsd === 'number' ? { costUsd: run.costUsd } : {}),
               ...(run.dispatch?.kind ? { kind: run.dispatch.kind } : {}),
               ...(run.dispatch?.report ? { report: { status: run.dispatch.report.status, ...(run.dispatch.report.verdict ? { verdict: run.dispatch.report.verdict } : {}) } } : {}),
             }));
             for (const child of byParent.get(run.id) ?? []) print(child, depth + 1);
             return;
           }
-          const cost = run.costUsd !== undefined ? ` $${run.costUsd.toFixed(2)}` : '';
+          const cost = typeof run.costUsd === 'number' ? ` $${run.costUsd.toFixed(2)}` : '';
           const report = run.dispatch?.report ? ` → ${run.dispatch.report.status}${run.dispatch.report.verdict ? ` (${run.dispatch.report.verdict})` : ''}` : '';
           io.log(`${'  '.repeat(depth)}${run.id.slice(0, 8)}  ${run.status}${cost}  ${run.title}${run.branch ? `  [${run.branch}]` : ''}${report}`);
           for (const child of byParent.get(run.id) ?? []) print(child, depth + 1);

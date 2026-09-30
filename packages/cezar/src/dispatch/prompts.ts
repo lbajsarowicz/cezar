@@ -18,7 +18,7 @@ To dispatch, COMMIT first (children fork your committed tip, not your working tr
 
 While children work and you have nothing else to do, end your turn with a line containing exactly CEZ:MONITORING; cezar parks you and wakes you when a report arrives. Your tree directory (CEZ_TREE_DIR) holds every task's order, notes and report; to message a task, write a markdown file into its inbox/<id8>/ there.
 
-A report is a CLAIM. cezar attaches the child's branch, diff size, cost and its own scope check — do not re-derive those; judge the work: read its diff and run the tests it names before merging. Merge an accepted child into YOUR branch with git merge --no-ff <branch>, one at a time, re-running the repository's checks after each. Never merge into the repository's base branch and never push it. When the stakes call for it, dispatch a --kind review task and merge only after its verdict is approve.
+A report is a CLAIM. cezar attaches the child's branch, diff size and cost — and, for a scoped child that settled successfully, its own scope check. Do not re-derive any of those; judge the work: read its diff and run the tests it names before merging. Merge an accepted child into YOUR branch with git merge --no-ff <branch>, one at a time, re-running the repository's checks after each. Never merge into the repository's base branch and never push it. When the stakes call for it, dispatch a --kind review task and merge only after its verdict is approve.
 
 ${GUARD}`;
 

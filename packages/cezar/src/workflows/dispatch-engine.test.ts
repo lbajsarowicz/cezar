@@ -573,6 +573,25 @@ describe('the dispatch engine (spec 2026-09-10-dispatch)', () => {
       await waitFor(created.id, settled);
       expect(notes(created.id).some((n) => n.includes('autonomous — continuing'))).toBe(true);
     }, 40_000);
+
+    it('lets the user finish a retry-capped park — it settles done and reports done, not partial', async () => {
+      const parent = await parkedRoot();
+      const created = dispatchOk(parent.id, order('mock:autonomous keep at it', { retry_limit: 0 }));
+      await waitFor(created.id, (r) => r?.status === 'waiting');
+      expect(store.getRun(created.id)?.dispatch?.retryLimitReached).toBe(true);
+      // The user answers the parked run. That wake is not the capped nudge, so the retry park is
+      // retired and this turn's CEZ:DONE lets the run settle finished instead of as unfinished.
+      expect(manager.sendMessage(created.id, [{ type: 'text', text: 'mock:done use date-fns' }])).toBe(true);
+      await waitFor(created.id, settled);
+      expect(store.getRun(created.id)?.status).toBe('done');
+      expect(store.getRun(created.id)?.dispatch?.retryLimitReached).toBeUndefined();
+      const reportPath = join(treeDirOf(parent.id), 'units', created.id.slice(0, 8), 'report.md');
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(reportPath) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+      const report = readFileSync(reportPath, 'utf8');
+      expect(report).toContain('"status": "done"');
+      expect(report).not.toContain('"status": "partial"');
+    }, 40_000);
   });
 
   describe('the scope check', () => {

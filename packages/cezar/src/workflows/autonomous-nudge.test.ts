@@ -218,6 +218,28 @@ describe('autonomous mode nudges at turn end instead of parking (#autonomous)', 
     expect(store.getRun(record.id)?.activity).toBeUndefined();
   }, 180_000);
 
+  it('a retry-limit park that then goes idle settles unfinished, not as a success', async () => {
+    const record = manager.startRun(SINGLE_STEP, {
+      task: 'never finishes on its own',
+      worktree: false,
+      autonomous: true,
+      dispatch: { rootRunId: 'tree-root', parentRunId: 'tree-root', retryLimit: 0 },
+    });
+    currentId = record.id;
+    await waitFor(record.id, (r) => r?.status === 'waiting');
+    // Exactly what `armIdleTimer` does after 15 minutes of silence, and what a manual close
+    // amounts to. Before the fix this settled the run `done` and the parent read a finished task.
+    const live = (manager as unknown as {
+      active: Map<string, { session?: { end(): void; readonly open: boolean } }>;
+    }).active.get(record.id);
+    expect(live?.session?.open).toBe(true);
+    live!.session!.end();
+    await waitFor(record.id, (r) => r?.status === 'failed');
+    expect(store.getRun(record.id)?.error).toContain('retry limit stopped cezar');
+    // The park is durable, so a restart settles it unfinished too rather than force-succeeding it.
+    expect(store.getRun(record.id)?.dispatch?.retryLimitReached).toBe(true);
+  }, 40_000);
+
   it('parks on a question the agent repeats after a nudge instead of nudging it to the cap', async () => {
     // The live-session failure this pins: the agent asked how to proceed around a refused
     // `cez task create`, the nudge overrode it forty times, and the agent improvised at full

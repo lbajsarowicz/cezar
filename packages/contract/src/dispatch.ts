@@ -95,6 +95,9 @@ export const dispatchSchema = z.object({
   scope: z.string().max(1000).optional(),
   /** Its order's `retry_limit`: the most auto-continues cezar gives it after an unfinished turn. */
   retryLimit: z.number().int().min(0).max(3).optional(),
+  /** Its `retry_limit` stopped the auto-continue nudge while the task was unfinished: the run parks,
+   *  and a session that closes without the agent finishing settles it unfinished, not as a success. */
+  retryLimitReached: z.boolean().optional(),
   /** Set at settle: the changed files checked against `scope`, as one line. */
   scopeCheck: z.string().max(2000).optional(),
   /** This task's own report — last one wins. */

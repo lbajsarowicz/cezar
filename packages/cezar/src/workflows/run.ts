@@ -401,6 +401,9 @@ interface ActiveRun {
    * `tryAutonomousNudge` and the park in `runAgentStep`'s turn-end.
    */
   askPark?: 'waiting' | 'abandoned';
+  /** The retry-cap note is written once per session, even though every later turn at the cap parks
+   *  the same way. Reset with the run's next session, like `autoContinues`. */
+  retryCapNoted?: boolean;
   /** The last `CEZ:ASK` the autonomous nudge overrode, as its joined question text. An agent
    *  that asks the SAME thing again right after being nudged is blocked on something the nudge
    *  cannot answer (a disabled capability, a missing credential), and parks instead of burning
@@ -1677,6 +1680,20 @@ export class RunManager {
           });
           continue;
         }
+        // A `waiting` run parked because its retry cap stopped the auto-continue nudge is just as
+        // unfinished as one stopped mid-turn: settling it as a success would report a task that
+        // never declared itself done. `settleUnfinished` keeps its report `partial`.
+        if (run.dispatch?.retryLimitReached) {
+          const stoppedAt = new Date().toISOString();
+          for (const step of run.steps) {
+            if (step.status === 'waiting' || step.status === 'running') {
+              this.store.updateStep(run.id, step.id, { status: 'failed', finishedAt: stoppedAt });
+            }
+          }
+          this.settleUnfinished(run.id);
+          this.reportSettledChildToParent(run.id);
+          continue;
+        }
         for (const step of run.steps) {
           if (step.status === 'waiting' || step.status === 'running') {
             this.store.updateStep(run.id, step.id, { status: 'done', finishedAt: new Date().toISOString() });
@@ -1885,7 +1902,11 @@ export class RunManager {
    */
   private prepareAutomationsSession(runId: string, state: ActiveRun): void {
     const record = this.store.getRun(runId);
-    const relevant = !record?.dispatch?.parentRunId && !record?.automation && !record?.automationTrigger;
+    const relevant =
+      !record?.dispatch?.parentRunId &&
+      !record?.automation &&
+      !record?.automationTrigger &&
+      !record?.automationTracker;
     state.automationsPrompt = relevant && automationsReachable() ? AUTOMATIONS_PROMPT : undefined;
   }
 
@@ -3246,6 +3267,9 @@ export class RunManager {
     const delivered = state.session.sendMessage(deliverable);
     if (delivered) {
       for (const write of imageLibraryWrites) write();
+      // Any non-nudge wake re-engages a retry-capped park: the run will take another turn, and a
+      // plain one re-parks (re-arming the marker), while a `CEZ:DONE` turn lets it settle finished.
+      this.retireRetryCap(runId, state);
       this.clearPendingAsk(runId);
       this.clearIdleTimer(state);
       this.clearMonitoringWakeTimer(state, runId);
@@ -3541,6 +3565,9 @@ export class RunManager {
       return;
     }
 
+    // A new session starts the auto-continue budget over, so the retry-cap park marker retires
+    // with it: how this run's NEXT settle is judged depends on how this session ends, not the last.
+    this.retireRetryCap(runId, state);
     this.store.updateRun(runId, {
       status: 'running',
       error: undefined,
@@ -3661,6 +3688,7 @@ export class RunManager {
           // Goal achieved (agent contract, #347) — same as in runAgentStep.
           this.store.appendEvent(runId, { type: 'lifecycle', message: 'goal achieved — session closed' });
           appendHandoffHeartbeat(this.dataDir, runId, 'turn complete — goal achieved, session closed');
+          this.retireRetryCap(runId, state);
           state.session?.end();
           return;
         }
@@ -4509,6 +4537,7 @@ export class RunManager {
           // of parking at `waiting` — the run completes and frees its slot.
           emit({ type: 'lifecycle', message: 'goal achieved — session closed' });
           appendHandoffHeartbeat(this.dataDir, runId, 'turn complete — goal achieved, session closed');
+          this.retireRetryCap(runId, state);
           state.session?.end();
           return;
         }
@@ -5060,6 +5089,13 @@ export class RunManager {
    */
   private async settleSuccess(runId: string): Promise<void> {
     const run = this.store.getRun(runId);
+    // A `waiting` run whose retry cap stopped the auto-continue nudge is UNFINISHED: the session
+    // closed (idle timeout, crash, manual close) without the agent ever declaring it done. Settling
+    // it as a success would tell the parent a ceiling hit was a finished task and invite a merge.
+    if (run?.status === 'waiting' && run.dispatch?.retryLimitReached) {
+      this.settleUnfinished(runId);
+      return;
+    }
     let review = false;
     if (run?.worktreePath && existsSync(run.worktreePath)) {
       const diff = await worktreeDiff(run.worktreePath, run.baseBranch ?? 'HEAD');
@@ -5087,6 +5123,37 @@ export class RunManager {
         ? 'changes ready for review — send feedback, open a draft PR, or finish'
         : 'run finished',
     });
+  }
+
+  /**
+   * The other ending for a session that closed without the agent finishing: the run's order capped
+   * its auto-continues and the retry note already explains why. `failed` is the run-status
+   * vocabulary's word for "unfinished" — the report the parent reads is `partial`
+   * (`childSettleReport`), so the ceiling is not mistaken for a finished task.
+   */
+  private settleUnfinished(runId: string): void {
+    const reason =
+      'the retry limit stopped cezar auto-continuing before the task finished — continue it to keep going';
+    this.store.updateRun(runId, {
+      status: 'failed',
+      error: reason,
+      finishedAt: new Date().toISOString(),
+      currentStepId: undefined,
+      autoResumeAttempts: undefined,
+    });
+    this.store.appendEvent(runId, { type: 'lifecycle', message: `run stopped — ${reason}` });
+  }
+
+  /**
+   * A retry-capped park is over the moment the run is woken by anything other than the capped
+   * auto-continue nudge: a delivered message, a child's report, a monitoring wake. The run then
+   * takes another turn, and how that turn ends decides the settle — `CEZ:DONE` finishes it, a
+   * plain end re-parks it (`tryAutonomousNudge` re-arms the marker). `state.retryCapNoted` is
+   * retired with it so a later park explains itself once more.
+   */
+  private retireRetryCap(runId: string, state?: ActiveRun): void {
+    if (state) state.retryCapNoted = false;
+    this.updateDispatch(runId, ({ retryLimitReached: _retired, ...rest }) => rest);
   }
 
   /**
@@ -5243,6 +5310,9 @@ export class RunManager {
    *    both) and take effect on the first turn after the cap;
    *  - the cap: at `MAX_AUTO_CONTINUES` this returns `false` and the turn parks exactly as a
    *    non-autonomous one does today — `waiting` (or `monitoring`), idle timer armed, slot freed;
+   *  - the run's own `retry_limit`, when its order named one: the same park, sooner. It is not a
+   *    success — a session that closes without the agent finishing settles the run `failed`, and
+   *    its report reads `partial`, because the retry ceiling stopping cezar is not the task ending.
    *  - `cancel` (`state.cancelled`) and the memory-limit pause (which clears `state.autonomous`,
    *    see `enforceMemoryLimit`) each stop it before the next nudge;
    *  - the session ending for any reason (agent exit, crash, `finish`, idle timeout) leaves
@@ -5277,11 +5347,18 @@ export class RunManager {
     if ((state.autoContinues ?? 0) >= MAX_AUTO_CONTINUES) return false;
     const retryLimit = this.dispatchOf(runId)?.retryLimit;
     if (retryLimit !== undefined && (state.autoContinues ?? 0) >= retryLimit) {
-      this.store.appendEvent(runId, {
-        type: 'note',
-        stepId,
-        message: `retry limit reached — its order allows ${retryLimit} auto-continue${retryLimit === 1 ? '' : 's'}, so the run parks instead of continuing on its own`,
-      });
+      // The note explains the FIRST park of a session; an agent that keeps ending turns unfinished
+      // parks the same way every time after, and repeating the note would bury the transcript.
+      if (!state.retryCapNoted) {
+        state.retryCapNoted = true;
+        // Durable for `recover()`: a restart while parked must settle this run unfinished too.
+        this.updateDispatch(runId, (dispatch) => ({ ...dispatch, retryLimitReached: true }));
+        this.store.appendEvent(runId, {
+          type: 'note',
+          stepId,
+          message: `retry limit reached — its order allows ${retryLimit} auto-continue${retryLimit === 1 ? '' : 's'}, so the run parks instead of continuing on its own`,
+        });
+      }
       return false;
     }
     if (state.cancelled) return false;

@@ -147,6 +147,19 @@ describe('cez task', () => {
     expect(JSON.parse(tree.out[0]!)).toEqual([{ id: 'root-0000', depth: 0, status: 'done', title: 'Root' }]);
   });
 
+  it('tolerates a null costUsd — an old or hand-edited record must not throw through the schema', async () => {
+    const h = harness({
+      status: 200,
+      body: [
+        { id: 'run-1', title: 'Me', status: 'running', costUsd: null, dispatch: { rootRunId: 'run-1' } },
+      ],
+    });
+    expect(await runTaskCommand(['list', '--json'], env, h.io)).toBe(0);
+    expect(JSON.parse(h.out[0]!)).toEqual([{ id: 'run-1', depth: 0, status: 'running', title: 'Me' }]);
+    expect(await runTaskCommand(['list'], env, h.io)).toBe(0);
+    expect(h.out[1]).toBe('run-1  running  Me');
+  });
+
   it('list prints the tree this task belongs to, indented, with status, cost and verdicts', async () => {
     const h = harness({
       status: 200,

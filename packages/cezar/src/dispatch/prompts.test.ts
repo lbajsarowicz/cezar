@@ -44,7 +44,9 @@ describe('the dispatch prompt', () => {
 
   it('treats a report as a claim the parent still checks before merging, and keeps the Guard and the tree directory', () => {
     expect(DISPATCH_PROMPT).toMatch(/A report is a CLAIM/);
-    expect(DISPATCH_PROMPT).toMatch(/its own scope check — do not re-derive those/);
+    // Scope check is attached only for a scoped child that settled successfully — the prompt must
+    // hedge, or a parent would re-derive nothing and trust a verdict a failed child never carried.
+    expect(DISPATCH_PROMPT).toMatch(/its own scope check\. Do not re-derive any of those/);
     expect(DISPATCH_PROMPT).toContain('read its diff and run the tests it names before merging');
     expect(DISPATCH_PROMPT).toContain('CEZ:ASK');
     expect(DISPATCH_PROMPT).toContain('CEZ:MONITORING');

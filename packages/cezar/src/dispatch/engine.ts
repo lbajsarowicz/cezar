@@ -165,6 +165,9 @@ export function childSettleReport(
   // `done`, and reporting that upward as success would turn "I stopped and asked before doing
   // something irreversible" into a clean `done` nobody ever answered — the Guard's whole premise.
   const unanswered = own ? undefined : child.dispatch?.pendingAsk;
+  // The retry cap stopped cezar before the task finished; the run settles unfinished, and the
+  // parent hears `partial` rather than reading the ceiling as a finished job.
+  const retryLimited = own || unanswered ? undefined : child.dispatch?.retryLimitReached;
   const report: DispatchReport =
     own ??
     (unanswered
@@ -176,17 +179,28 @@ export function childSettleReport(
           errors: child.error ? [child.error] : [],
           suggestions: [],
         } satisfies DispatchReport)
-      : ({
-          status: statusToReportStatus(child.status),
-          result:
-            context.resumeNotes?.trim() ||
-            child.error?.trim() ||
-            'no structured report — the run settled without calling `cez task report`',
-          evidence: [],
-          side_effects: [],
-          errors: child.error ? [child.error] : [],
-          suggestions: [],
-        } satisfies DispatchReport));
+      : retryLimited
+        ? ({
+            status: 'partial',
+            result:
+              child.error?.trim() ||
+              'the retry limit stopped cezar auto-continuing before the task finished — continue it to keep going',
+            evidence: [],
+            side_effects: [],
+            errors: child.error ? [child.error] : [],
+            suggestions: [],
+          } satisfies DispatchReport)
+        : ({
+            status: statusToReportStatus(child.status),
+            result:
+              context.resumeNotes?.trim() ||
+              child.error?.trim() ||
+              'no structured report — the run settled without calling `cez task report`',
+            evidence: [],
+            side_effects: [],
+            errors: child.error ? [child.error] : [],
+            suggestions: [],
+          } satisfies DispatchReport));
 
   const where = child.branch
     ? `${child.id}, branch ${child.branch}${child.baseBranch ? ` off ${child.baseBranch}` : ''}`
@@ -216,13 +230,21 @@ export function withPendingReport(dispatch: RunDispatch, entry: DispatchPendingR
   return { ...dispatch, pendingReports: all.slice(-MAX_PENDING_REPORTS), ...(droppedReports ? { droppedReports } : {}) };
 }
 
-/** A scope token that names a path rather than prose: it has a separator, a wildcard or an
- *  extension. `scope` is free text, and "only the auth module" must not read as three paths. */
+/** Every token that could name a path: a separator, a wildcard, an extension, or a bare word
+ *  ("docs"). Prose is not filtered out here — a bare word can only ADD matches, so it errs towards
+ *  "inside", and `scopeVerdict` refuses an "outside" verdict when no token clearly names a path. */
 function scopePathTokens(scope: string): string[] {
   return scope
     .split(/[\s,;]+/)
     .map(scopePathToken)
-    .filter((token) => token.length > 0 && (/[/*?]/.test(token) || /\.[A-Za-z0-9]+$/.test(token)));
+    .filter((token) => token.length > 0 && (/[/*?]/.test(token) || /\.[A-Za-z0-9]+$/.test(token) || /^[A-Za-z0-9._-]+$/.test(token)));
+}
+
+/** A token that names a path without ambiguity: a glob, a directory (trailing slash) or a file
+ *  (extension). Bare words ("docs") and slash-prose ("and/or") match, but cannot on their own
+ *  justify telling the parent a correct change fell outside its scope. */
+function isUnambiguousPathToken(token: string): boolean {
+  return /[*?[{]/.test(token) || token.endsWith('/') || /\.[A-Za-z0-9]+$/.test(token);
 }
 
 /** A bare root ("/", ".", "*") means the whole repository; otherwise a token loses the quoting
@@ -255,10 +277,18 @@ export function scopeVerdict(scope: string, changedFiles: readonly string[]): st
       return file === token || file.startsWith(`${token}/`);
     });
   const outside = changedFiles.filter((file) => !inside(file));
-  if (outside.length === 0) return `scope check: all ${changedFiles.length} changed file${changedFiles.length === 1 ? '' : 's'} inside the declared scope`;
+  if (outside.length === 0) {
+    return `scope check: all ${changedFiles.length} changed file${changedFiles.length === 1 ? '' : 's'} inside the declared scope`;
+  }
+  // An "outside" verdict needs at least one token that clearly names a path. When every token is
+  // prose or a bare word, every file reading outside is a parse failure ("and/or the auth module"),
+  // not a finding — and the parent, told not to re-derive it, would reject correct work.
+  if (outside.length === changedFiles.length && !tokens.some(isUnambiguousPathToken)) {
+    return 'scope check: not checked — the declared scope names no unambiguous paths';
+  }
   const listed = outside.slice(0, SCOPE_CHECK_LISTED).join(', ');
   const more = outside.length > SCOPE_CHECK_LISTED ? ` and ${outside.length - SCOPE_CHECK_LISTED} more` : '';
-  return `scope check: ${outside.length} of ${changedFiles.length} changed files outside the declared scope: ${listed}${more}`;
+  return `scope check: ${outside.length} of ${changedFiles.length} changed file${changedFiles.length === 1 ? '' : 's'} outside the declared scope: ${listed}${more}`;
 }
 
 /**

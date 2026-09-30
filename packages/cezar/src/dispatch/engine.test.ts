@@ -261,6 +261,31 @@ describe('childSettleReport', () => {
       }));
     expect(own.report.status).toBe('done');
   });
+
+  /**
+   * The retry cap parks a run `waiting`; the idle timeout then settles it. Before this, the
+   * fallback report read `done` and the parent was invited to merge work nobody finished.
+   */
+  it('reports a retry-cap park as partial, never as the success the ceiling is not', () => {
+    const limited = childSettleReport(
+      record({
+        status: 'failed',
+        error: 'the retry limit stopped cezar auto-continuing before the task finished — continue it to keep going',
+        dispatch: { rootRunId: 'm', parentRunId: 'p', retryLimit: 1, retryLimitReached: true },
+      }),
+      { resumeNotes: 'half the migration done' },
+    );
+    expect(limited.report.status).toBe('partial');
+    expect(limited.report.result).toContain('retry limit stopped cezar');
+    expect(limited.text).toContain('status partial (cezar: failed)');
+  });
+
+  it('leaves a child that names a retry limit without hitting it on the ordinary status mapping', () => {
+    const completed = childSettleReport(
+      record({ status: 'done', dispatch: { rootRunId: 'm', parentRunId: 'p', retryLimit: 1 } }),
+    );
+    expect(completed.report.status).toBe('done');
+  });
 });
 
 describe('pending reports', () => {
@@ -335,8 +360,36 @@ describe('scopeVerdict', () => {
   });
 
   it('does not read prose as paths, and says so', () => {
-    expect(scopeVerdict('only the login module', ['src/a.ts'])).toBe('scope check: not checked — the declared scope names no paths');
+    expect(scopeVerdict('only the login module', ['src/a.ts'])).toBe(
+      'scope check: not checked — the declared scope names no unambiguous paths',
+    );
     expect(scopeVerdict('src/a/', [])).toBe('scope check: no changed files');
+  });
+
+  it('keeps a bare directory token, so a mixed scope does not lose half of itself', () => {
+    expect(scopeVerdict('docs, packages/web/src/', ['docs/readme.md', 'packages/web/src/a.ts'])).toBe(
+      'scope check: all 2 changed files inside the declared scope',
+    );
+    expect(scopeVerdict('docs', ['docs/readme.md'])).toBe('scope check: all 1 changed file inside the declared scope');
+  });
+
+  it('refuses an outside verdict when no token clearly names a path — a correct change is never flagged', () => {
+    // "and/or" parses as a slash token, and none of the words names a real path: every file reading
+    // outside is a parse failure, not a finding.
+    expect(scopeVerdict('and/or the auth module', ['src/auth/login.ts'])).toBe(
+      'scope check: not checked — the declared scope names no unambiguous paths',
+    );
+    expect(scopeVerdict('docs', ['src/a.ts'])).toBe('scope check: not checked — the declared scope names no unambiguous paths');
+  });
+
+  it('still reports an unambiguous all-outside verdict', () => {
+    expect(scopeVerdict('src/', ['other/a.ts', 'other/b.ts'])).toBe(
+      'scope check: 2 of 2 changed files outside the declared scope: other/a.ts, other/b.ts',
+    );
+    // Singular when one file is in play — "1 of 1 changed files" reads as a bug of its own.
+    expect(scopeVerdict('src/', ['other/a.ts'])).toBe(
+      'scope check: 1 of 1 changed file outside the declared scope: other/a.ts',
+    );
   });
 
   it('bounds the listing', () => {
