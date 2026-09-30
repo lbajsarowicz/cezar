@@ -572,7 +572,7 @@ describe('useSkillsUpdate', () => {
     expect((interval as (current: typeof query) => number | false)(query)).toBe(false)
   })
 
-  it('stops asking once a follow-up read still answers idle', async () => {
+  it('keeps asking while no check has completed, then stands down at the cap', async () => {
     fetchMock.mockImplementation(async () => json({
       status: 'idle',
       available: false,
@@ -591,15 +591,21 @@ describe('useSkillsUpdate', () => {
       ),
     })
     await waitFor(() => expect(result.current.data?.status).toBe('idle'))
-    await act(() => client.refetchQueries({ queryKey: key }))
 
     const query = client.getQueryCache().find({ queryKey: key })
-    const interval = query?.observers[0]?.options.refetchInterval as (current: typeof query) => number | false
-    expect(query?.state.dataUpdateCount).toBe(2)
-    expect(interval(query)).toBe(false)
+    const interval = query?.observers[0]?.options.refetchInterval as (current: unknown) => number | false
+    const idle = result.current.data!
+    const at = (dataUpdateCount: number, data = idle) => interval({ state: { data, dataUpdateCount } })
 
-    client.setQueryData(key, { ...result.current.data!, status: 'checking' })
-    expect(interval(query)).toBe(60_000)
+    // One idle read is not enough: the check the first GET started can still be queued behind
+    // another project's on the server, and `idle` only means it has not finished.
+    expect(at(2)).toBe(60_000)
+    // Bounded: once idle has been answered this often, the poll stands down and the reconnect /
+    // tab-return reconcile owns the update.
+    expect(at(6)).toBe(false)
+
+    expect(at(7, { ...idle, status: 'checking' })).toBe(60_000)
+    expect(at(7, { ...idle, status: 'current' })).toBe(false)
   })
 })
 

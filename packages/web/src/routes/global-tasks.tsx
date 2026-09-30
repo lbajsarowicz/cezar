@@ -771,7 +771,7 @@ function TaskTable({
                 only one with NO width and therefore the only one that grows on what they give
                 up. A cross-project list is scanned by title; everything else is the answer to a
                 question you ask about a row you already found. */}
-            <tr>{headers}</tr>
+            <tr aria-rowindex={tableWindow.windowed ? 1 : undefined}>{headers}</tr>
           </thead>
           <tbody ref={tableWindow.anchorRef} className="[&>tr:last-child>td]:border-b-0">
             <RowSpacer height={tableWindow.padTop} colSpan={columnCount} />

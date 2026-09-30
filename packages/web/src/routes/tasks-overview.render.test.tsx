@@ -47,12 +47,19 @@ function overview(list: RunRecord[], now = NOW) {
 }
 
 const tableRows = () => document.querySelectorAll('[data-slot="task-table-row"]')
+const cards = () => document.querySelectorAll('[data-slot="task-card"]')
 const rowRenders = vi.mocked(deriveAttention)
 
 beforeEach(() => {
   rowRenders.mockClear()
+  // virtua measures with a ResizeObserver; jsdom has none and lays nothing out — it mounts the
+  // virtualized tier, but windows down to zero items.
+  vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} })
 })
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
 
 describe('tasks table — cost of a long list', () => {
   it('re-renders only the row whose run changed', () => {
@@ -94,5 +101,19 @@ describe('tasks table — cost of a long list', () => {
     render(overview(runs(60)))
     expect(tableRows()).toHaveLength(60)
     expect(document.querySelector('[data-row-spacer]')).toBeNull()
+  })
+
+  it('mounts every card under the card-list threshold', () => {
+    render(overview(runs(60)))
+    expect(document.querySelector('[data-slot="task-cards"]')?.getAttribute('data-virtualized')).toBe('false')
+    expect(cards()).toHaveLength(60)
+  })
+
+  it('switches the card list to virtua past the threshold', () => {
+    render(overview(runs(150)))
+    // The `<md` tier vitest cannot lay out: the switch to the virtualized list is what is pinned
+    // here, not the windowing itself (jsdom has no ResizeObserver layout to window by).
+    expect(document.querySelector('[data-slot="task-cards"]')?.getAttribute('data-virtualized')).toBe('true')
+    expect(cards().length).toBeLessThan(150)
   })
 })

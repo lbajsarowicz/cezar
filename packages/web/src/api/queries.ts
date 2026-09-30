@@ -1369,6 +1369,10 @@ export function useAgentProfiles() {
   })
 }
 
+/** Idle reads a skills snapshot gets before its poll stands down — five minutes at the cadence
+ *  below, enough to cover a check queued behind a handful of others. */
+const SKILLS_UPDATE_IDLE_READ_LIMIT = 6
+
 export function useSkillsUpdate(projectId: string, enabled = true) {
   return useQuery({
     queryKey: workspaceQueryKeys.skillsUpdate(projectId),
@@ -1379,13 +1383,15 @@ export function useSkillsUpdate(projectId: string, enabled = true) {
     // response converges. Checks may legitimately take tens of seconds, so a one-minute cadence
     // avoids repeatedly challenging authenticated remote sessions while still converging after
     // a long-running operation. The initial mount remains the session's one automatic check.
-    // `idle` is transient only until the check that first GET started lands: one follow-up read
-    // collects it, and a server still answering `idle` after that is not asked every minute. A
-    // check the server starts later is picked up by the reconcile on reconnect and tab return.
+    // `idle` means no check has completed yet (`checkedAt` null), and the check the first GET
+    // started can queue behind another project's on the server, so a single follow-up read is not
+    // enough to catch it. Idle reads are capped rather than unbounded: after that the reconcile
+    // on reconnect and on tab return owns the update, so the poll cannot run all session.
     refetchInterval: (query) => {
       const status = query.state.data?.status
       if (status === undefined || status === 'checking' || status === 'updating') return 60_000
-      return status === 'idle' && query.state.dataUpdateCount < 2 ? 60_000 : false
+      if (status !== 'idle') return false
+      return query.state.dataUpdateCount < SKILLS_UPDATE_IDLE_READ_LIMIT ? 60_000 : false
     },
   })
 }

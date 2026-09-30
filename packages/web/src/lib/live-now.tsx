@@ -18,7 +18,7 @@ export function LiveNowProvider({
   now?: number
   children: React.ReactNode
 }) {
-  const live = useNow(intervalMs)
+  const live = useNow(intervalMs, now === undefined)
   return <NowContext.Provider value={now ?? live}>{children}</NowContext.Provider>
 }
 

@@ -68,4 +68,18 @@ describe('useWindowedRows', () => {
     expect(before).toBe(88)
     expect(latest?.start).toBe(68)
   })
+
+  it('keeps a window of rows mounted when the count shrinks under a deep scroll position', () => {
+    // Scrolled past where the shorter list ends: clamping `start` straight to the new count would
+    // leave rows 120..120 — a tall spacer with no rows until the next scroll or observer tick.
+    anchorTop = -200 * TABLE_ROW_HEIGHT_PX
+    const view = render(<Table count={300} />)
+    expect(latest?.start).toBe(188)
+
+    act(() => view.rerender(<Table count={120} />))
+
+    expect(latest?.start).toBe(96)
+    expect(latest?.end).toBe(120)
+    expect((latest?.end ?? 0) - (latest?.start ?? 0)).toBeGreaterThan(0)
+  })
 })

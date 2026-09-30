@@ -270,7 +270,7 @@ export function TasksOverview({
                     })}
                   </colgroup>
                   <thead>
-                    <tr>
+                    <tr aria-rowindex={tableWindow.windowed ? 1 : undefined}>
                       {columns.map((column) => (
                         <TaskColumnHeader
                           key={column.id}

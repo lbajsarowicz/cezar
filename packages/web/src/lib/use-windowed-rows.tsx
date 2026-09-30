@@ -69,15 +69,26 @@ export function useWindowedRows<T extends HTMLElement>(count: number, rowHeight 
       )
     }
     measure()
+    // Scroll fires far faster than a repaint on some engines; one window update per frame is all
+    // the window can use, so coalesce.
+    let frame = 0
+    const onScroll = () => {
+      if (frame !== 0) return
+      frame = requestAnimationFrame(() => {
+        frame = 0
+        measure()
+      })
+    }
     const target: HTMLElement | Window = scroller ?? window
-    target.addEventListener('scroll', measure, { passive: true })
+    target.addEventListener('scroll', onScroll, { passive: true })
     window.addEventListener('resize', measure)
     // Content above this table (another group on /tasks) can grow without a scroll event and
     // shift the table under a stale window.
     const resize = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : undefined
     for (const content of scroller ? Array.from(scroller.children) : [document.body]) resize?.observe(content)
     return () => {
-      target.removeEventListener('scroll', measure)
+      if (frame !== 0) cancelAnimationFrame(frame)
+      target.removeEventListener('scroll', onScroll)
       window.removeEventListener('resize', measure)
       resize?.disconnect()
     }
@@ -86,8 +97,11 @@ export function useWindowedRows<T extends HTMLElement>(count: number, rowHeight 
   if (!windowed) {
     return { anchorRef, windowed, start: 0, end: count, padTop: 0, padBottom: 0, ariaRowCount: undefined, ariaRowIndex: noRowIndex }
   }
-  const start = Math.min(range.start, count)
-  const end = Math.min(Math.max(range.end, start), count)
+  // Keep a full window's worth of rows after the count shrinks: clamping `start` straight to the
+  // new count would leave an empty slice (spacers only) until the next scroll or observer tick.
+  const windowSize = Math.max(1, range.end - range.start)
+  const start = Math.max(0, Math.min(range.start, count - windowSize))
+  const end = Math.min(Math.max(range.end, start + windowSize), count)
   return {
     anchorRef,
     windowed,
