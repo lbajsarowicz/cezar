@@ -8,14 +8,14 @@ Scope: workflow idle timer; workspace resource schema/semaphore and API contract
 
 ### Phase 1: Configuration and lifecycle
 
-- [ ] 1.1 Add optional `idleTimeoutMinutes` resource defaults, bounds, API contract, and semaphore cache/getter.
-- [ ] 1.2 Replace the workflow constant use with the cached setting and preserve timer expiry behavior; test new-run and continuation park paths.
+- [x] 1.1 Add optional `idleTimeoutMinutes` resource defaults, bounds, API contract, and semaphore cache/getter. — ccc8939e
+- [x] 1.2 Replace the workflow constant use with the cached setting and preserve timer expiry behavior; test new-run and continuation park paths. — ccc8939e
 
 ### Phase 2: Operator surface and verification
 
-- [ ] 2.1 Add the timeout control and explanatory copy to Global Settings → Resources with focused UI tests.
-- [ ] 2.2 Run focused regression/config/API/UI tests and prove the regression test is red against the pre-fix implementation.
-- [ ] 2.3 Run the full configured validation gate, review diff, and document compatibility/evidence.
+- [x] 2.1 Add the timeout control and explanatory copy to Global Settings → Resources with focused UI tests. — ccc8939e
+- [x] 2.2 Run focused regression/config/API/UI tests and prove the regression test is red against the pre-fix implementation. — ccc8939e
+- [x] 2.3 Run the full configured validation gate, review diff, and document compatibility/evidence. — ccc8939e
 
 ## Risks
 
@@ -30,11 +30,11 @@ Source doc: `.ai/specs/2026-07-24-long-running-waiting-sessions.md`
 
 ### Phase 1: Configuration and lifecycle
 
-- [ ] 1.1 Add optional `idleTimeoutMinutes` resource defaults, bounds, API contract, and semaphore cache/getter.
-- [ ] 1.2 Replace the workflow constant use with the cached setting and preserve timer expiry behavior; test new-run and continuation park paths.
+- [x] 1.1 Add optional `idleTimeoutMinutes` resource defaults, bounds, API contract, and semaphore cache/getter. — ccc8939e
+- [x] 1.2 Replace the workflow constant use with the cached setting and preserve timer expiry behavior; test new-run and continuation park paths. — ccc8939e
 
 ### Phase 2: Operator surface and verification
 
-- [ ] 2.1 Add the timeout control and explanatory copy to Global Settings → Resources with focused UI tests.
-- [ ] 2.2 Run focused regression/config/API/UI tests and prove the regression test is red against the pre-fix implementation.
-- [ ] 2.3 Run the full configured validation gate, review diff, and document compatibility/evidence.
+- [x] 2.1 Add the timeout control and explanatory copy to Global Settings → Resources with focused UI tests. — ccc8939e
+- [x] 2.2 Run focused regression/config/API/UI tests and prove the regression test is red against the pre-fix implementation. — ccc8939e
+- [x] 2.3 Run the full configured validation gate, review diff, and document compatibility/evidence. — ccc8939e
