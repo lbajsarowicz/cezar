@@ -281,9 +281,10 @@ export function scopeVerdict(scope: string, changedFiles: readonly string[]): st
     return `scope check: all ${changedFiles.length} changed file${changedFiles.length === 1 ? '' : 's'} inside the declared scope`;
   }
   // An "outside" verdict needs at least one token that clearly names a path. When every token is
-  // prose or a bare word, every file reading outside is a parse failure ("and/or the auth module"),
-  // not a finding — and the parent, told not to re-derive it, would reject correct work.
-  if (outside.length === changedFiles.length && !tokens.some(isUnambiguousPathToken)) {
+  // prose or a bare word, a file reading outside is a parse failure ("and/or the auth module"),
+  // not a finding — and the parent, told not to re-derive it, would reject correct work. This
+  // holds however many files matched, so a partial match cannot promote an ambiguous reading.
+  if (!tokens.some(isUnambiguousPathToken)) {
     return 'scope check: not checked — the declared scope names no unambiguous paths';
   }
   const listed = outside.slice(0, SCOPE_CHECK_LISTED).join(', ');

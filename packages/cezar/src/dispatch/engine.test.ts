@@ -333,7 +333,7 @@ describe('pending reports', () => {
 describe('scopeVerdict', () => {
   it('matches directories, files and globs by prefix, and lists what fell outside', () => {
     expect(scopeVerdict('src/left/', ['src/left/a.ts', 'src/left/b/c.ts'])).toBe('scope check: all 2 changed files inside the declared scope');
-    expect(scopeVerdict('src/left', ['src/left/a.ts', 'src/leftover.ts'])).toBe(
+    expect(scopeVerdict('src/left/', ['src/left/a.ts', 'src/leftover.ts'])).toBe(
       'scope check: 1 of 2 changed files outside the declared scope: src/leftover.ts',
     );
     expect(scopeVerdict('src/left/**, README.md', ['src/left/x.ts', 'README.md', 'src/right/y.ts'])).toBe(
@@ -380,6 +380,23 @@ describe('scopeVerdict', () => {
       'scope check: not checked — the declared scope names no unambiguous paths',
     );
     expect(scopeVerdict('docs', ['src/a.ts'])).toBe('scope check: not checked — the declared scope names no unambiguous paths');
+  });
+
+  it('refuses an outside verdict from an ambiguous partial match too', () => {
+    // A bare word that happens to match one changed path ("docs") does not make the paths it did
+    // not match a trustworthy finding: there is still no unambiguous token to justify "outside".
+    expect(scopeVerdict('docs and the auth module', ['docs/readme.md', 'src/auth/login.ts'])).toBe(
+      'scope check: not checked — the declared scope names no unambiguous paths',
+    );
+    // Same for a directory without a trailing slash: it matches leniently, but is not clear enough
+    // to underwrite an outside verdict — one matched file does not promote it.
+    expect(scopeVerdict('src/left', ['src/left/a.ts', 'src/leftover.ts'])).toBe(
+      'scope check: not checked — the declared scope names no unambiguous paths',
+    );
+    // It still matches inside: a scope that covers every changed file is all-inside, not unchecked.
+    expect(scopeVerdict('src/left', ['src/left/a.ts', 'src/left/b.ts'])).toBe(
+      'scope check: all 2 changed files inside the declared scope',
+    );
   });
 
   it('still reports an unambiguous all-outside verdict', () => {

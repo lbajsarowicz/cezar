@@ -3927,10 +3927,11 @@ export class RunManager {
         this.store.appendEvent(runId, { type: 'lifecycle', message: 'run cancelled' });
         appendHandoffHeartbeat(this.dataDir, runId, `step "${stepId}" complete — status=cancelled`);
       } else {
-        this.store.updateStep(runId, stepId, { status: 'done', finishedAt: finishedAt() });
-        this.store.appendEvent(runId, { type: 'step-end', stepId, status: 'done' });
+        const unfinished = this.retryCappedUnfinished(runId);
+        this.store.updateStep(runId, stepId, { status: unfinished ? 'failed' : 'done', finishedAt: finishedAt() });
+        this.store.appendEvent(runId, { type: 'step-end', stepId, status: unfinished ? 'failed' : 'done' });
         await this.settleSuccess(runId);
-        appendHandoffHeartbeat(this.dataDir, runId, `step "${stepId}" complete — status=done`);
+        appendHandoffHeartbeat(this.dataDir, runId, `step "${stepId}" complete — status=${unfinished ? 'failed' : 'done'}`);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -4232,7 +4233,7 @@ export class RunManager {
           if (state.askPark === 'abandoned') this.finishStep(runId, step.id, 'done', undefined, emit);
           break;
         }
-        this.finishStep(runId, step.id, 'done', undefined, emit);
+        this.finishStep(runId, step.id, this.retryCappedUnfinished(runId) ? 'failed' : 'done', undefined, emit);
         i++;
         continue;
       }
@@ -5089,10 +5090,10 @@ export class RunManager {
    */
   private async settleSuccess(runId: string): Promise<void> {
     const run = this.store.getRun(runId);
-    // A `waiting` run whose retry cap stopped the auto-continue nudge is UNFINISHED: the session
-    // closed (idle timeout, crash, manual close) without the agent ever declaring it done. Settling
-    // it as a success would tell the parent a ceiling hit was a finished task and invite a merge.
-    if (run?.status === 'waiting' && run.dispatch?.retryLimitReached) {
+    // The session closed (idle timeout, crash, manual close) without the agent ever declaring it
+    // done. Settling it as a success would tell the parent a ceiling hit was a finished task and
+    // invite a merge.
+    if (this.retryCappedUnfinished(runId)) {
       this.settleUnfinished(runId);
       return;
     }
@@ -5142,6 +5143,14 @@ export class RunManager {
       autoResumeAttempts: undefined,
     });
     this.store.appendEvent(runId, { type: 'lifecycle', message: `run stopped — ${reason}` });
+  }
+
+  /** A `waiting` run whose retry cap stopped the auto-continue nudge is unfinished. A live session
+   *  that closes in this state fails the step it left, exactly as recovery does, so the cockpit
+   *  never shows a `done` step for work `settleUnfinished` classifies as unfinished. */
+  private retryCappedUnfinished(runId: string): boolean {
+    const run = this.store.getRun(runId);
+    return run?.status === 'waiting' && Boolean(run.dispatch?.retryLimitReached);
   }
 
   /**
