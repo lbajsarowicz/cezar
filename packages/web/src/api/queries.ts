@@ -94,6 +94,7 @@ import { githubRepoBase } from '@/lib/tasks-table'
 import { normalizeTagsForDisplay } from '@/lib/project-tags'
 import type { ContinueOptions } from './client'
 import type {
+  RunsIndexResponse,
   CheckoutProjectInput,
   CreateAgentProfileInput,
   ApiRun,
@@ -391,6 +392,7 @@ export const workspaceQueryKeys = {
   /** One account's auth state — a child of `agentProfiles`, so removing an account drops it too. */
   agentAccountStatus: (routeId: string) =>
     ['workspace', 'agent-profiles', 'status', routeId] as const,
+  skillsUpdateAll: ['workspace', 'skills-update'] as const,
   skillsUpdate: (projectId: string) => ['workspace', 'skills-update', projectId] as const,
   /** cezar's own updater via `GET /api/v1/workspace/self-update` (self-update PoC). */
   selfUpdate: ['workspace', 'self-update'] as const,
@@ -935,7 +937,10 @@ export function useRuns<TData = ApiRun[]>(select?: (runs: ApiRun[]) => TData) {
  * open, and re-opening it seconds later should not re-ask the whole workspace. The active
  * project's rows come from `useRuns()` anyway, so the live half of the list is never this stale.
  */
-export function useRunsIndex(enabled = true, refetchIntervalMs?: number) {
+export function useRunsIndex(
+  enabled = true,
+  refetchIntervalMs?: number | ((data: RunsIndexResponse | undefined) => number | false),
+) {
   return useQuery({
     queryKey: workspaceQueryKeys.runsIndex,
     queryFn: ({ signal }) => getRunsIndex({ signal }),
@@ -948,7 +953,14 @@ export function useRunsIndex(enabled = true, refetchIntervalMs?: number) {
     // dropped socket, a frozen tab, a run that ended while the connection was down), not the only
     // freshness mechanism. Only the global Tasks page (a live view rather than a glance) asks for
     // one; the palette leaves it off and keeps its 30s staleness.
-    ...(refetchIntervalMs === undefined ? {} : { refetchInterval: refetchIntervalMs }),
+    ...(refetchIntervalMs === undefined
+      ? {}
+      : {
+          refetchInterval:
+            typeof refetchIntervalMs === 'function'
+              ? (query: { state: { data: RunsIndexResponse | undefined } }) => refetchIntervalMs(query.state.data)
+              : refetchIntervalMs,
+        }),
     // No `refetchOnWindowFocus` here on purpose, though the tab-comes-back case is real (the
     // interval above does not run in a hidden tab). `global-events.tsx` already reconciles this
     // key on `visibilitychange`, which is the same event with better manners — one reconcile for
@@ -1367,11 +1379,13 @@ export function useSkillsUpdate(projectId: string, enabled = true) {
     // response converges. Checks may legitimately take tens of seconds, so a one-minute cadence
     // avoids repeatedly challenging authenticated remote sessions while still converging after
     // a long-running operation. The initial mount remains the session's one automatic check.
+    // `idle` is transient only until the check that first GET started lands: one follow-up read
+    // collects it, and a server still answering `idle` after that is not asked every minute. A
+    // check the server starts later is picked up by the reconcile on reconnect and tab return.
     refetchInterval: (query) => {
       const status = query.state.data?.status
-      return status === undefined || status === 'idle' || status === 'checking' || status === 'updating'
-        ? 60_000
-        : false
+      if (status === undefined || status === 'checking' || status === 'updating') return 60_000
+      return status === 'idle' && query.state.dataUpdateCount < 2 ? 60_000 : false
     },
   })
 }
@@ -2079,8 +2093,9 @@ export function useReferenceStatuses(
     })),
   })
 
-  const byRef = useMemo(() => {
+  const { byRef, learned } = useMemo(() => {
     const map = new Map<string, ReferenceStatusEntry>()
+    const learned: Array<{ key: string; status: ReferenceStatus; conflicting: boolean | undefined }> = []
     results.forEach((result, index) => {
       const group = groups[index]
       if (!group) return
@@ -2110,11 +2125,7 @@ export function useReferenceStatuses(
             // A server from before the field omits `conflicts` entirely, and that absence is not
             // an answer: leave the memory alone rather than clearing it to "merges cleanly".
             const conflicting = data.conflicts ? data.conflicts.includes(ref.number) : undefined
-            // Written during render on purpose: this is a cache, not state — the write is
-            // idempotent, derived solely from the response, and re-running it (StrictMode's
-            // double invoke) lands on the same value.
-            rememberStatus(key, status)
-            if (conflicting !== undefined) rememberConflict(key, conflicting)
+            learned.push({ key, status, conflicting })
             map.set(key, {
               state: 'ready',
               status,
@@ -2147,9 +2158,17 @@ export function useReferenceStatuses(
         }
       }
     })
-    return map
+    return { byRef: map, learned }
     // `results` is a fresh array identity every render; its DATA is what the map is built from.
   }, [groups, results.map((result) => `${result.dataUpdatedAt}:${result.status}`).join(',')])
+
+  // Committed answers only: a render React throws away must not teach the shared memory.
+  useEffect(() => {
+    for (const { key, status, conflicting } of learned) {
+      rememberStatus(key, status)
+      if (conflicting !== undefined) rememberConflict(key, conflicting)
+    }
+  }, [learned])
 
   return useCallback(
     (ref: ReferenceStatusRequest): ReferenceStatusEntry => {

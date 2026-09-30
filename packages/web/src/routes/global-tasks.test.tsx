@@ -1134,3 +1134,57 @@ describe('global tasks page', () => {
     ).toBeTruthy()
   })
 })
+
+describe('global tasks page — cost of a long list', () => {
+  const many = (count: number, over: Partial<RunIndexEntry> = {}): RunIndexEntry[] =>
+    Array.from({ length: count }, (_, index) => ({
+      projectId: 'api',
+      id: `bulk-${index}`,
+      title: `Bulk task ${index}`,
+      status: 'done' as const,
+      createdAt: new Date(Date.parse('2026-07-14T10:00:00Z') - index * 60_000).toISOString(),
+      archived: false,
+      workflow: 'quick-task',
+      ...over,
+    }))
+
+  const runsIndexInterval = (client: ReturnType<typeof createQueryClient>) => {
+    const query = client.getQueryCache().find({ queryKey: workspaceQueryKeys.runsIndex })
+    const interval = query?.observers[0]?.options.refetchInterval
+    return typeof interval === 'function' ? interval(query as never) : interval
+  }
+
+  it('mounts only the rows near the viewport once a table passes the window threshold', async () => {
+    stubFetch({ runs: many(150) })
+    renderPage()
+    await waitFor(() => expect(rowIds().length).toBeGreaterThan(0))
+    expect(rowIds().length).toBeLessThan(150)
+    expect(rowIds()[0]).toBe('bulk-0')
+    expect(document.querySelector('[data-row-spacer]')).not.toBeNull()
+    expect(document.querySelector('[data-slot="global-tasks-table"] table')?.getAttribute('aria-rowcount')).toBe('151')
+    expect(document.querySelector('[data-slot="global-task-row"]')?.getAttribute('aria-rowindex')).toBe('2')
+  })
+
+  it('mounts every row of a table under the threshold', async () => {
+    stubFetch({ runs: many(60) })
+    renderPage()
+    await waitFor(() => expect(rowIds()).toHaveLength(60))
+    expect(document.querySelector('[data-row-spacer]')).toBeNull()
+  })
+
+  it('does not poll the index while nothing on it carries a live usage sample', async () => {
+    stubFetch({ runs: many(3) })
+    const client = createQueryClient()
+    renderPage(client)
+    await waitFor(() => expect(rowIds()).toHaveLength(3))
+    expect(runsIndexInterval(client)).toBe(false)
+  })
+
+  it('keeps polling the index while a row carries a live usage sample — its CPU and Mem cells read it', async () => {
+    stubFetch({ runs: many(3, { status: 'running', usage: { cpuPct: 5, rssBytes: 1024, procCount: 1 } }) })
+    const client = createQueryClient()
+    renderPage(client)
+    await waitFor(() => expect(rowIds()).toHaveLength(3))
+    expect(runsIndexInterval(client)).toBe(15_000)
+  })
+})

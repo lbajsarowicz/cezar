@@ -1,6 +1,6 @@
 import { QueryClientProvider } from '@tanstack/react-query'
-import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import { act, cleanup, render, renderHook, screen, waitFor } from '@testing-library/react'
+import { Component, type ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApiError } from './client'
@@ -28,7 +28,9 @@ import {
   useRuns,
   useSkills,
   useSkillsUpdate,
+  useReferenceStatuses,
   workspaceQueryKeys,
+  __clearRememberedStatusesForTests,
 } from './queries'
 
 const fetchMock = vi.fn<typeof fetch>()
@@ -568,6 +570,83 @@ describe('useSkillsUpdate', () => {
 
     client.setQueryData(key, { ...result.current.data!, status: 'available' })
     expect((interval as (current: typeof query) => number | false)(query)).toBe(false)
+  })
+
+  it('stops asking once a follow-up read still answers idle', async () => {
+    fetchMock.mockImplementation(async () => json({
+      status: 'idle',
+      available: false,
+      autoUpdateEnabled: false,
+      inherited: false,
+      checkedAt: null,
+      updatedAt: null,
+      scopes: [],
+      needsUpgradeNotes: false,
+    }))
+    const client = createQueryClient()
+    const key = workspaceQueryKeys.skillsUpdate('boot')
+    const { result } = renderHook(() => useSkillsUpdate('boot'), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    })
+    await waitFor(() => expect(result.current.data?.status).toBe('idle'))
+    await act(() => client.refetchQueries({ queryKey: key }))
+
+    const query = client.getQueryCache().find({ queryKey: key })
+    const interval = query?.observers[0]?.options.refetchInterval as (current: typeof query) => number | false
+    expect(query?.state.dataUpdateCount).toBe(2)
+    expect(interval(query)).toBe(false)
+
+    client.setQueryData(key, { ...result.current.data!, status: 'checking' })
+    expect(interval(query)).toBe(60_000)
+  })
+})
+
+describe('useReferenceStatuses', () => {
+  it('remembers nothing from a render React throws away', async () => {
+    __clearRememberedStatusesForTests()
+    fetchMock.mockImplementation(async () => json({ available: true, prs: { 7: 'draft' }, issues: {}, recheckAfterMs: null }))
+    const ref = { projectId: 'p1', kind: 'PR' as const, number: 7 }
+    function Discarded() {
+      const lookup = useReferenceStatuses([ref])
+      if (lookup(ref).state === 'ready') throw new Error('discarded render')
+      return null
+    }
+    class Boundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+      override state = { failed: false }
+      static getDerivedStateFromError() {
+        return { failed: true }
+      }
+      override render() {
+        return this.state.failed ? <p>failed</p> : this.props.children
+      }
+    }
+    const Wrapper = wrapper()
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    render(
+      <Wrapper>
+        <Boundary>
+          <Discarded />
+        </Boundary>
+      </Wrapper>,
+    )
+    await screen.findByText('failed')
+    quiet.mockRestore()
+
+    const { result } = renderHook(() => useReferenceStatuses([ref], false), { wrapper: wrapper() })
+    expect(result.current(ref)).not.toHaveProperty('status')
+  })
+
+  it('remembers a committed answer for the next surface that has none yet', async () => {
+    __clearRememberedStatusesForTests()
+    fetchMock.mockImplementation(async () => json({ available: true, prs: { 8: 'draft' }, issues: {}, recheckAfterMs: null }))
+    const ref = { projectId: 'p1', kind: 'PR' as const, number: 8 }
+    const first = renderHook(() => useReferenceStatuses([ref]), { wrapper: wrapper() })
+    await waitFor(() => expect(first.result.current(ref).state).toBe('ready'))
+
+    const { result } = renderHook(() => useReferenceStatuses([ref], false), { wrapper: wrapper() })
+    expect(result.current(ref)).toMatchObject({ status: 'draft' })
   })
 })
 
