@@ -830,15 +830,23 @@ export class RunStore extends EventEmitter {
    *  exactly the pre-#945 behavior. */
   private repoHandle: RepoHandle | null | undefined;
 
-  private constructor(private readonly dataDir: string) {
+  private constructor(private readonly dataDir: string, private readonly writable = true) {
     super();
     this.setMaxListeners(100);
   }
 
   /** See `reconcileLoadedRun` for what `keepLive` (#367) decides about live-looking rows. */
   static open(dataDir: string, opts?: { keepLive?: boolean }): RunStore {
-    mkdirSync(join(dataDir, 'runs'), { recursive: true });
-    const store = new RunStore(dataDir);
+    let writable = true;
+    try {
+      mkdirSync(join(dataDir, 'runs'), { recursive: true });
+    } catch (err) {
+      // A read-only checkout still boots: the store serves from memory for this session.
+      writable = false;
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[cez] ${dataDir} is not writable (${message}) — run data stays in memory for this session`);
+    }
+    const store = new RunStore(dataDir, writable);
     const indexPath = join(dataDir, 'runs.json');
     if (existsSync(indexPath)) {
       try {
@@ -1253,7 +1261,7 @@ export class RunStore extends EventEmitter {
     const full: RunEvent = this.redact({ ...event, seq, ts: new Date().toISOString() }, runId);
     // Sync append keeps event order without a write queue; local NDJSON
     // appends at agent-event rates are effectively free.
-    appendFileSync(this.eventsPath(runId), `${JSON.stringify(full)}\n`, 'utf8');
+    if (this.writable) appendFileSync(this.eventsPath(runId), `${JSON.stringify(full)}\n`, 'utf8');
     this.emit('event', { runId, event: full });
 
     // The janitor trick: agents print the PR URL after `gh pr create` — the
@@ -1637,6 +1645,10 @@ export class RunStore extends EventEmitter {
   }
 
   private saveNow(throwOnError = false): void {
+    if (!this.writable) {
+      if (throwOnError) throw new Error('Could not persist automation run provenance; the launch was not confirmed.');
+      return;
+    }
     const indexPath = join(this.dataDir, 'runs.json');
     const tmpPath = `${indexPath}.tmp`;
     try {
