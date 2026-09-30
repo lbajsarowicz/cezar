@@ -20,8 +20,10 @@ Scope: workflow idle timer; workspace resource schema/semaphore and API contract
 ## Evidence
 
 - PR #1176: https://github.com/open-mercato/cezar/pull/1176
-- Head: `0d670be42e2e98509524bb97a0b09f6b89edeedc`
-- Focused tests and typecheck/build/package gates pass; full `npm test` has eight unrelated environment-sensitive failures documented in the PR.
+- Head: `825ba463744c2d80db87b1d5d339e9080a157514` (implementation correction; final evidence commit follows)
+- Focused regression proof: `npm run test -w @open-mercato/cezar -- src/workflows/run.test.ts -t '#992'` (5 passed), `npm run test -w @open-mercato/cezar-web -- src/api/client.test.ts src/routes/settings/resources-section.test.tsx` (100 passed), and `npm run typecheck` (pass). The custom-positive test was red at 15 minutes against the old hard-coded timer and green at the configured 30-minute delay.
+- Browser QA passed on Resources: 30 persisted through blur and reload; explicit 0 saved as disabled; 15 restored and persisted through reload. Inline screenshots are attached to PR #1176 from dedicated branch `qa-evidence-pr-1176`.
+- Full configured validation was run; the remaining failures are environment-sensitive task-context tests documented in the PR, with the focused suite passing under the controlled test environment.
 
 ## Risks
 
@@ -44,3 +46,9 @@ Source doc: `.ai/specs/2026-07-24-long-running-waiting-sessions.md`
 - [x] 2.1 Add the timeout control and explanatory copy to Global Settings → Resources with focused UI tests. — ccc8939e
 - [x] 2.2 Run focused regression/config/API/UI tests and prove the regression test is red against the pre-fix implementation. — ccc8939e
 - [x] 2.3 Run the full configured validation gate, review diff, and document compatibility/evidence. — ccc8939e
+
+### Correction and QA follow-up
+
+- [x] 3.1 Preserve explicit `null` in client resource normalization and add absent/null/0/positive regression coverage. — ee6a3679
+- [x] 3.2 Prove a configured positive timeout through the parked lifecycle (red against hard-coded 15 minutes, green at configured 30 minutes). — 825ba463
+- [x] 3.3 Capture Resources persistence/disabled browser evidence and attach screenshots inline to PR #1176. — 2026-09-30 QA
