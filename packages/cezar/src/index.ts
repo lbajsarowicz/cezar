@@ -31,7 +31,11 @@ Usage:
                             command on PATH that updates itself from the cockpit)
   cezar update              update the managed install to the channel's newest version
                             (--channel stable|nightly, --version <x> to pin or downgrade)
-  cezar versions            list installed versions (\`cezar use <id>\` switches)
+  cezar versions            list installed versions and cezar worktrees (\`cezar use <id>\` switches)
+  cezar link [<dir>]        run a cezar checkout/worktree (default: cwd) as a version — a
+                            link, not a copy, so rebuilds are live (--use to switch to it now);
+                            the desktop app runs it after a restart or from Cezar ▸ Versions
+  cezar unlink <id>         forget a linked checkout (the checkout itself is untouched)
 
 Options:
   -p, --port <n>              cockpit port (default 4321; server-install: this
@@ -98,6 +102,7 @@ async function main(): Promise<void> {
       channel: { type: 'string' },
       version: { type: 'string' },
       'no-modify-path': { type: 'boolean', default: false },
+      use: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: true,
@@ -182,7 +187,9 @@ async function main(): Promise<void> {
     case 'install':
     case 'update':
     case 'versions':
-    case 'use': {
+    case 'use':
+    case 'link':
+    case 'unlink': {
       // Managed install (self-update PoC): no server, no repo — only ~/.cezar and the registry.
       const { runSelfUpdateCommand } = await import('./self-update/cli.ts');
       process.exitCode = await runSelfUpdateCommand(command, positionals.slice(1), {
@@ -190,6 +197,7 @@ async function main(): Promise<void> {
         channel: values.channel,
         version: values.version,
         modifyPath: !values['no-modify-path'],
+        use: Boolean(values.use),
       });
       return;
     }
