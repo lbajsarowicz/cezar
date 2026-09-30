@@ -19,7 +19,7 @@ import type { RunRecord } from '../runs/store.ts';
 /**
  * Children in flight under ONE parent — the CONTRACT's value, re-exported rather than restated.
  * The schema bounds a user's `inFlight` by it (`dispatchIntentSchema`), `dispatch()` enforces it,
- * and `DISPATCH_PROMPT` tells the agent what it is: three enforcement points for one brake, and a
+ * and `cez task --help` tells the agent what it is: three enforcement points for one brake, and a
  * second literal `4` here is how they drift.
  */
 export const MAX_CHILDREN_IN_FLIGHT = DISPATCH_MAX_IN_FLIGHT;
@@ -111,7 +111,9 @@ export function childTaskEnvelope(
   if (child.max_cost !== undefined) lines.push(`- Max cost: ${usd(child.max_cost)}`);
   if (child.success_criteria) lines.push(`- Success criteria: ${child.success_criteria}`);
   if (child.required_evidence) lines.push(`- Required evidence: ${child.required_evidence}`);
-  if (child.retry_limit !== undefined) lines.push(`- Retry limit: ${child.retry_limit}`);
+  if (child.retry_limit !== undefined) {
+    lines.push(`- Retry limit: ${child.retry_limit} (cezar continues you after an unfinished turn at most ${child.retry_limit} time${child.retry_limit === 1 ? '' : 's'}, then parks you)`);
+  }
   if (parent.branch) lines.push(`- Parent branch (your fork point): ${parent.branch}`);
   lines.push(`- Ordered by: run ${parent.id}`);
   lines.push(...extraLines);
@@ -200,14 +202,63 @@ export function childSettleReport(
   if (child.diffStat) {
     parts.push(`diff ${child.diffStat.files} files, +${child.diffStat.adds} -${child.diffStat.dels}`);
   }
+  if (child.dispatch?.scopeCheck) parts.push(child.dispatch.scopeCheck);
   const text = `Report from task "${child.title}" (${where}): ${parts.join('; ')}`;
   return { text, report };
 }
 
-/** Append a report to a parent's pending list, keeping the newest `MAX_PENDING_REPORTS`. */
+/** Append a report to a parent's pending list, keeping the newest `MAX_PENDING_REPORTS` and
+ *  counting the ones trimmed off, so the flushed block can say they exist. */
 export function withPendingReport(dispatch: RunDispatch, entry: DispatchPendingReport): RunDispatch {
-  const pendingReports = [...(dispatch.pendingReports ?? []), entry].slice(-MAX_PENDING_REPORTS);
-  return { ...dispatch, pendingReports };
+  const all = [...(dispatch.pendingReports ?? []), entry];
+  const dropped = Math.max(0, all.length - MAX_PENDING_REPORTS);
+  const droppedReports = (dispatch.droppedReports ?? 0) + dropped;
+  return { ...dispatch, pendingReports: all.slice(-MAX_PENDING_REPORTS), ...(droppedReports ? { droppedReports } : {}) };
+}
+
+/** A scope token that names a path rather than prose: it has a separator, a wildcard or an
+ *  extension. `scope` is free text, and "only the auth module" must not read as three paths. */
+function scopePathTokens(scope: string): string[] {
+  return scope
+    .split(/[\s,;]+/)
+    .map(scopePathToken)
+    .filter((token) => token.length > 0 && (/[/*?]/.test(token) || /\.[A-Za-z0-9]+$/.test(token)));
+}
+
+/** A bare root ("/", ".", "*") means the whole repository; otherwise a token loses the quoting
+ *  and sentence punctuation around it and its leading "/" or "./", because `git diff --name-only`
+ *  paths are repository-relative. */
+function scopePathToken(raw: string): string {
+  const quoted = raw.replace(/^[`'"(]+|[`'")]+$/g, '');
+  if (/^(\.\/?|\/|\*)$/.test(quoted)) return '*';
+  return quoted.replace(/[`'").,:;]+$/, '').replace(/^\.?\/+/, '');
+}
+
+/** Everything before the first glob metacharacter: matching by that prefix can only err towards
+ *  "inside", so a correct change is never reported as out of scope. */
+function literalPrefix(token: string): string {
+  const wildcard = token.search(/[*?[{]/);
+  return wildcard < 0 ? token : token.slice(0, wildcard);
+}
+
+const SCOPE_CHECK_LISTED = 5;
+
+/** The engine's own files-vs-scope verdict for a settled child, as the one line its report carries. */
+export function scopeVerdict(scope: string, changedFiles: readonly string[]): string {
+  const tokens = scopePathTokens(scope);
+  if (tokens.length === 0) return 'scope check: not checked — the declared scope names no paths';
+  if (changedFiles.length === 0) return 'scope check: no changed files';
+  const inside = (file: string): boolean =>
+    tokens.some((token) => {
+      const prefix = literalPrefix(token);
+      if (prefix !== token || token.endsWith('/')) return file.startsWith(prefix);
+      return file === token || file.startsWith(`${token}/`);
+    });
+  const outside = changedFiles.filter((file) => !inside(file));
+  if (outside.length === 0) return `scope check: all ${changedFiles.length} changed file${changedFiles.length === 1 ? '' : 's'} inside the declared scope`;
+  const listed = outside.slice(0, SCOPE_CHECK_LISTED).join(', ');
+  const more = outside.length > SCOPE_CHECK_LISTED ? ` and ${outside.length - SCOPE_CHECK_LISTED} more` : '';
+  return `scope check: ${outside.length} of ${changedFiles.length} changed files outside the declared scope: ${listed}${more}`;
 }
 
 /**
@@ -215,13 +266,17 @@ export function withPendingReport(dispatch: RunDispatch, entry: DispatchPendingR
  * Rendered as prose rather than JSON for the same reason the delivered message is:
  * a commander reads its children's reports, it does not parse them.
  */
-export function pendingReportsBlock(reports: readonly DispatchPendingReport[]): string | undefined {
+export function pendingReportsBlock(reports: readonly DispatchPendingReport[], dropped = 0): string | undefined {
   if (reports.length === 0) return undefined;
   const lines = reports.map((entry) => {
     const parts = [`status ${entry.report.status}`, entry.report.result];
     if (entry.report.evidence.length) parts.push(`evidence: ${entry.report.evidence.join(' · ')}`);
     if (entry.report.errors.length) parts.push(`errors: ${entry.report.errors.join(' · ')}`);
+    if (entry.scopeCheck) parts.push(entry.scopeCheck);
     return `- "${entry.title}" (${entry.fromRunId}, ${entry.at}): ${parts.join('; ')}`;
   });
+  if (dropped > 0) {
+    lines.unshift(`- ${dropped} older report${dropped === 1 ? ' is' : 's are'} not repeated here — read units/*/report.md in the tree directory`);
+  }
   return `## Reports from your dispatched tasks\n${lines.join('\n')}`;
 }

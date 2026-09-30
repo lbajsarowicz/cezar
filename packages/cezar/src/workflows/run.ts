@@ -50,7 +50,7 @@ import { materializeSkillDir } from '../skills-remote.ts';
 import { seedAgentConfigLocalLayer } from '../agent-config/seed.ts';
 import { readAgentModelProvider } from '../agent-config/models.ts';
 import { loadConfig, resolveWorktreeRetention } from '../config.ts';
-import { autosaveCommit, createWorktree, resolveBaseRef, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
+import { autosaveCommit, createWorktree, resolveBaseRef, worktreeChangedFiles, worktreeDiff, worktreeShortstat } from '../git-worktree.ts';
 import { getHeadCommit, getRepoInfo } from '../server/git.ts';
 import { loadWorkflows } from './load.ts';
 import type { QueuedMessage, RunRecord, RunStore, StepState } from '../runs/store.ts';
@@ -59,7 +59,7 @@ import type { QueuedMessage, RunRecord, RunStore, StepState } from '../runs/stor
 // takes byte-for-byte the path it took before this feature existed.
 import type { DispatchInput, DispatchIntent, DispatchReport, RunDispatch } from '@open-mercato/cezar-contract';
 import { resolveCapabilities } from '../server/capabilities.ts';
-import { composeDispatchPrompt } from '../dispatch/prompts.ts';
+import { composeChildDispatchPrompt, dispatchSessionPrompt } from '../dispatch/prompts.ts';
 import {
   appendLedger,
   inboxDigest,
@@ -85,6 +85,7 @@ import {
   isTerminalStatus,
   pendingReportsBlock,
   remainingBudgetUsd,
+  scopeVerdict,
   usd,
   withPendingReport,
 } from '../dispatch/engine.ts';
@@ -1871,9 +1872,7 @@ export class RunManager {
    */
   private prepareDispatchSession(runId: string, state: ActiveRun): void {
     if (!this.dispatchReachable()) return;
-    const dispatch = this.store.getRun(runId)?.dispatch;
-    // The intent block belongs to the ROOT the user started; a child reads its order instead.
-    state.dispatchPrompt = composeDispatchPrompt(dispatch?.kind, dispatch?.parentRunId ? undefined : dispatch?.intent);
+    state.dispatchPrompt = dispatchSessionPrompt(this.store.getRun(runId)?.dispatch);
   }
 
   /**
@@ -1881,10 +1880,13 @@ export class RunManager {
    * the short prompt part that lets a task recognise "whenever a PR is opened, do X" as an
    * automation and create one with `cez automation`. Gated on `automationsReachable` — the flag
    * AND the transport — so a headless run, or a cockpit with `CEZ_AUTOMATIONS` unset, composes
-   * nothing and behaves exactly as it did before the feature existed.
+   * nothing and behaves exactly as it did before the feature existed. A dispatched child has an
+   * order to carry out, and a task an automation launched runs unattended, so neither gets it.
    */
-  private prepareAutomationsSession(state: ActiveRun): void {
-    state.automationsPrompt = automationsReachable() ? AUTOMATIONS_PROMPT : undefined;
+  private prepareAutomationsSession(runId: string, state: ActiveRun): void {
+    const record = this.store.getRun(runId);
+    const relevant = !record?.dispatch?.parentRunId && !record?.automation && !record?.automationTrigger;
+    state.automationsPrompt = relevant && automationsReachable() ? AUTOMATIONS_PROMPT : undefined;
   }
 
   /**
@@ -1896,9 +1898,9 @@ export class RunManager {
     const dispatch = this.dispatchOf(runId);
     const pending = dispatch?.pendingReports;
     if (!dispatch || !pending?.length) return undefined;
-    const { pendingReports: _flushed, ...rest } = dispatch;
+    const { pendingReports: _flushed, droppedReports, ...rest } = dispatch;
     this.store.updateRun(runId, { dispatch: rest });
-    return pendingReportsBlock(pending);
+    return pendingReportsBlock(pending, droppedReports);
   }
 
   /** Drop the one pending entry a LIVE delivery has just accepted (matched on run AND instant). */
@@ -2132,7 +2134,7 @@ export class RunManager {
       // The tree directory lines are composed against the id the run is ABOUT to get: `startRun`
       // mints it, so the envelope is finished below once it exists.
       task: childTaskEnvelope(input, { id: parentId, branch: parent.branch }, ['{{TREE_PATHS}}']),
-      systemPrompt: composeDispatchPrompt(input.kind),
+      systemPrompt: composeChildDispatchPrompt(input.kind),
       runner: input.runner ?? intent?.runner ?? parent.runner,
       ...(input.model ?? intent?.model ?? parent.model ? { model: input.model ?? intent?.model ?? parent.model } : {}),
       autonomous: true,
@@ -2142,6 +2144,8 @@ export class RunManager {
         ...(input.kind && input.kind !== 'implement' ? { kind: input.kind } : {}),
         ...(input.review_of?.length ? { reviewOf: input.review_of } : {}),
         ...(budget.budgetUsd !== undefined ? { budgetUsd: budget.budgetUsd } : {}),
+        ...(input.scope ? { scope: input.scope } : {}),
+        ...(input.retry_limit !== undefined ? { retryLimit: input.retry_limit } : {}),
       },
     });
     // The task list shows the order's own title rather than the first line of the envelope, and
@@ -2247,8 +2251,9 @@ export class RunManager {
       const resumeNotes = handoffSectionExcerpt(readHandoff(this.dataDir, runId), '## Resume notes');
       const { text, report } = childSettleReport(child, { resumeNotes });
       const at = new Date().toISOString();
+      const scopeCheck = child.dispatch?.scopeCheck;
       this.updateDispatch(parentId, (dispatch) =>
-        withPendingReport(dispatch, { fromRunId: child.id, title: child.title, report, at }),
+        withPendingReport(dispatch, { fromRunId: child.id, title: child.title, report, at, ...(scopeCheck ? { scopeCheck } : {}) }),
       );
       const rootRunId = child.dispatch?.rootRunId ?? parent.dispatch.rootRunId;
       try {
@@ -3527,7 +3532,7 @@ export class RunManager {
     // that skipped this would resume a task with no dispatch prompt and no way to dispatch:
     // a run that quietly degrades into an ordinary task.
     this.prepareDispatchSession(runId, state);
-    this.prepareAutomationsSession(state);
+    this.prepareAutomationsSession(runId, state);
 
     // Cancellation may have retired this continuation while its async preparation was running.
     // Do not let the late promise make a durably cancelled run look active again.
@@ -4101,7 +4106,7 @@ export class RunManager {
     // role's prompt a spawn will need). This is the FIRST of the two construction sites; the
     // twin is in `runContinuation`.
     this.prepareDispatchSession(runId, state);
-    this.prepareAutomationsSession(state);
+    this.prepareAutomationsSession(runId, state);
     const retriesUsed = new Map<string, number>();
     let checkFailure: string | null = null;
     let runError: string | null = null;
@@ -5059,6 +5064,11 @@ export class RunManager {
     if (run?.worktreePath && existsSync(run.worktreePath)) {
       const diff = await worktreeDiff(run.worktreePath, run.baseBranch ?? 'HEAD');
       const hasDiff = diff.trim().length > 0 && !diff.startsWith('(diff failed');
+      const scope = run.dispatch?.parentRunId ? run.dispatch.scope : undefined;
+      if (scope) {
+        const files = await worktreeChangedFiles(run.worktreePath, run.baseBranch ?? 'HEAD');
+        if (files) this.updateDispatch(runId, (dispatch) => ({ ...dispatch, scopeCheck: scopeVerdict(scope, files) }));
+      }
       const config = await loadConfig(this.repoRoot);
       review = hasDiff && reviewGateEnabled(config) && run.autonomous !== true;
     }
@@ -5265,6 +5275,15 @@ export class RunManager {
     if (dispatchTurn.dispatched || dispatchTurn.overBudget) return false;
     if (dispatchTurn.hasDispatch && ask) return false;
     if ((state.autoContinues ?? 0) >= MAX_AUTO_CONTINUES) return false;
+    const retryLimit = this.dispatchOf(runId)?.retryLimit;
+    if (retryLimit !== undefined && (state.autoContinues ?? 0) >= retryLimit) {
+      this.store.appendEvent(runId, {
+        type: 'note',
+        stepId,
+        message: `retry limit reached — its order allows ${retryLimit} auto-continue${retryLimit === 1 ? '' : 's'}, so the run parks instead of continuing on its own`,
+      });
+      return false;
+    }
     if (state.cancelled) return false;
     // A question repeated verbatim after a nudge is not a preference the agent can settle on
     // its own — it is a blocker (the cockpit refused `cez task create`, a login is missing) that
