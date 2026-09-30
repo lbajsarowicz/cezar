@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 export const CHECK_OUTPUT_CAP = 20_000;
 /** Mirrors the agent runners' own run timeout. */
@@ -8,6 +8,8 @@ const HEAD_SHARE = 0.25;
 const MARKER_RESERVE = 64;
 const ORPHAN_GRACE_MS = 5_000;
 const KILL_GRACE_MS = 2_000;
+/** After SIGKILL, how long to wait for the output pipe to close before settling without it. */
+const HARD_SETTLE_MS = 500;
 
 /**
  * Captured check output bounded to `cap` chars: the first quarter and the last three quarters
@@ -97,8 +99,18 @@ export interface CheckResult {
 export const COMMAND_NOT_FOUND_HINT =
   'exit code 127 means a command was not found: checks run without login profiles and with a scrubbed environment, so start cezar from a shell whose PATH has the tool, or forward a missing variable with CEZ_ENV_PASSTHROUGH';
 
+/**
+ * Any non-zero exit may be the scrubbed environment: a check that reads a variable the host has
+ * (a test database URL, a registry token) fails with a tool's own error, which never names the
+ * dropped variable. The hint is attached to every failure so the cause is visible then, not only
+ * on the rare exit 127.
+ */
+export const ENV_PASSTHROUGH_HINT =
+  'checks run with a scrubbed environment (no login profile, no backend credentials): if this failed because a variable was missing, forward it with CEZ_ENV_PASSTHROUGH=NAME (or restore everything with CEZ_AGENT_ENV_FULL=1)';
+
 export function checkExitHint(result: CheckResult): string | undefined {
-  return !result.timedOut && result.exitCode === 127 ? COMMAND_NOT_FOUND_HINT : undefined;
+  if (result.timedOut || result.exitCode === 0) return undefined;
+  return result.exitCode === 127 ? COMMAND_NOT_FOUND_HINT : ENV_PASSTHROUGH_HINT;
 }
 
 export function formatCheckFailure(command: string, result: CheckResult, timeoutMs: number): string {
@@ -119,14 +131,17 @@ const liveGroups = new Set<number>();
 let exitHookInstalled = false;
 
 /**
- * SIGKILLs the process group of every check still running. A check lives in its own group, so
- * the terminal's Ctrl-C or hangup no longer reaches it; cezar's shutdown and process exit call
- * this instead. Synchronous, so it is safe inside an `exit` handler.
+ * SIGKILLs the process of every check still running. A check lives in its own group, so the
+ * terminal's Ctrl-C or hangup no longer reaches it; cezar's shutdown and process exit call this
+ * instead. On POSIX the whole group is signalled; on Windows the tree goes through
+ * `taskkill /T /F`. Synchronous, so it is safe inside an `exit` handler.
  */
 export function killLiveChecks(): void {
+  const onWindows = process.platform === 'win32';
   for (const pid of liveGroups) {
     try {
-      process.kill(-pid, 'SIGKILL');
+      if (onWindows) spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
+      else process.kill(-pid, 'SIGKILL');
     } catch {
       // group already gone
     }
@@ -158,9 +173,9 @@ export function runCheckCommand(opts: {
     detached: posix,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const group = posix ? child.pid : undefined;
-  if (group !== undefined) {
-    liveGroups.add(group);
+  const pid = child.pid;
+  if (pid !== undefined) {
+    liveGroups.add(pid);
     if (!exitHookInstalled) {
       exitHookInstalled = true;
       process.once('exit', killLiveChecks);
@@ -168,62 +183,95 @@ export function runCheckCommand(opts: {
   }
   const output = new CheckOutputBuffer();
   let timedOut = false;
-  let closed = false;
+  let settled = false;
+  let exitCode: number | null = null;
+  let timer: NodeJS.Timeout | undefined;
+  let orphanTimer: NodeJS.Timeout | undefined;
+  let escalation: NodeJS.Timeout | undefined;
+  let hardSettle: NodeJS.Timeout | undefined;
+  let resolveResult: (result: CheckResult) => void = () => undefined;
+  const result = new Promise<CheckResult>((resolve) => {
+    resolveResult = resolve;
+  });
+
+  const untrack = () => {
+    if (pid !== undefined) liveGroups.delete(pid);
+  };
+  const clearTimers = () => {
+    clearTimeout(timer);
+    clearTimeout(orphanTimer);
+    clearTimeout(escalation);
+    clearTimeout(hardSettle);
+  };
+  // `close` never fires while an escaped descendant holds the pipes, so settling there has to
+  // release them itself: an undestroyed stdio pipe keeps cezar's event loop alive (headless
+  // `cezar run` then hangs after its final status) and keeps feeding a completed check's output.
+  const releasePipes = () => {
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  };
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    untrack();
+    clearTimers();
+    releasePipes();
+    const text = output.text().trim() || '(no output)';
+    resolveResult({ ok: exitCode === 0 && !timedOut, exitCode: exitCode ?? -1, output: text, timedOut });
+  };
 
   const signalGroup = (signal: NodeJS.Signals) => {
-    if (closed || child.pid === undefined) return;
+    if (settled || pid === undefined) return;
     try {
-      process.kill(-child.pid, signal);
+      process.kill(-pid, signal);
     } catch {
       child.kill(signal);
     }
   };
-  let escalation: NodeJS.Timeout | undefined;
   const killTree = () => {
-    if (closed || child.pid === undefined) return;
+    if (settled || pid === undefined) return;
     if (posix) {
       signalGroup('SIGTERM');
       escalation ??= setTimeout(() => signalGroup('SIGKILL'), KILL_GRACE_MS);
       escalation.unref?.();
     } else {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }).on('error', () => {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' }).on('error', () => {
         child.kill('SIGKILL');
       });
     }
+    // A process that left the group for its own session (`setsid`) answers no signal and keeps the
+    // output pipe open, so `close` may never fire; settle anyway once the kill grace has passed.
+    hardSettle ??= setTimeout(finish, KILL_GRACE_MS + HARD_SETTLE_MS);
+    hardSettle.unref?.();
   };
 
-  const result = new Promise<CheckResult>((resolve) => {
-    const timer = setTimeout(() => {
-      timedOut = true;
-      killTree();
-    }, timeoutMs);
-    timer.unref?.();
-    const collect = (chunk: string) => output.append(chunk);
-    child.stdout?.setEncoding('utf8').on('data', collect);
-    child.stderr?.setEncoding('utf8').on('data', collect);
-    // A process the command backgrounded keeps our pipes open after bash exits, and `close`
-    // would then wait on it until the timeout.
-    let orphanTimer: NodeJS.Timeout | undefined;
-    child.on('exit', () => {
-      orphanTimer = setTimeout(killTree, ORPHAN_GRACE_MS);
-      orphanTimer.unref?.();
-    });
-    child.on('error', (err) => {
-      closed = true;
-      if (group !== undefined) liveGroups.delete(group);
-      clearTimeout(timer);
-      resolve({ ok: false, exitCode: -1, output: `failed to spawn: ${err.message}`, timedOut: false });
-    });
-    child.on('close', (code) => {
-      closed = true;
-      if (group !== undefined) liveGroups.delete(group);
-      clearTimeout(timer);
-      clearTimeout(orphanTimer);
-      clearTimeout(escalation);
-      const text = output.text().trim() || '(no output)';
-      resolve({ ok: code === 0 && !timedOut, exitCode: code ?? -1, output: text, timedOut });
-    });
+  child.stdout?.setEncoding('utf8').on('data', (chunk: string) => output.append(chunk));
+  child.stderr?.setEncoding('utf8').on('data', (chunk: string) => output.append(chunk));
+  child.on('exit', (code) => {
+    exitCode = code;
+    // The group stays tracked until `finish`: bash exiting does not end the group, and a process
+    // it backgrounded that still holds the pipe has to remain reachable by killLiveChecks.
+    orphanTimer = setTimeout(killTree, ORPHAN_GRACE_MS);
+    orphanTimer.unref?.();
   });
+  child.on('error', (err) => {
+    if (settled) return;
+    settled = true;
+    untrack();
+    clearTimers();
+    releasePipes();
+    resolveResult({ ok: false, exitCode: -1, output: `failed to spawn: ${err.message}`, timedOut: false });
+  });
+  child.on('close', (code) => {
+    exitCode = code;
+    finish();
+  });
+
+  timer = setTimeout(() => {
+    timedOut = true;
+    killTree();
+  }, timeoutMs);
+  timer.unref?.();
 
   return { result, kill: killTree };
 }

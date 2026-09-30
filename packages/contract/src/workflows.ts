@@ -45,6 +45,9 @@ export const workflowStepDefSchema = z
   })
   .refine((s) => Boolean(s.command) !== Boolean(s.prompt ?? s.skill), {
     message: 'a step is either an agent step (prompt/skill) or a check step (command), not both',
+  })
+  .refine((s) => s.timeoutMs === undefined || Boolean(s.command), {
+    message: 'timeoutMs applies only to a check step (command)',
   });
 export type WorkflowStepDef = z.infer<typeof workflowStepDefSchema>;
 

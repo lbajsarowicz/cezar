@@ -8,9 +8,12 @@ import {
   CHECK_OUTPUT_CAP,
   COMMAND_NOT_FOUND_HINT,
   CheckOutputBuffer,
+  ENV_PASSTHROUGH_HINT,
   formatCheckFailure,
+  killLiveChecks,
   runCheckCommand,
   stripAnsi,
+  type CheckResult,
 } from './check-step.ts';
 
 const lines = (n: number, prefix = 'line') => Array.from({ length: n }, (_, i) => `${prefix} ${i}\n`).join('');
@@ -77,7 +80,13 @@ describe('stripAnsi', () => {
 describe('formatCheckFailure', () => {
   it('names the command and exit code and strips ANSI from the output', () => {
     const text = formatCheckFailure('npm test', { ok: false, exitCode: 1, output: '\u001b[31mboom\u001b[0m', timedOut: false }, 1000);
-    expect(text).toBe('$ npm test\n(exit code 1)\n\nboom');
+    expect(text).toBe(`$ npm test\n(exit code 1)\n${ENV_PASSTHROUGH_HINT}\n\nboom`);
+  });
+
+  it('hints at CEZ_ENV_PASSTHROUGH on any failure, so a dropped variable is not silent', () => {
+    const text = formatCheckFailure('npm test', { ok: false, exitCode: 3, output: 'ECONNREFUSED', timedOut: false }, 1000);
+    expect(text).toContain(ENV_PASSTHROUGH_HINT);
+    expect(ENV_PASSTHROUGH_HINT).toContain('CEZ_ENV_PASSTHROUGH');
   });
 
   it('points a command-not-found exit at PATH and CEZ_ENV_PASSTHROUGH', () => {
@@ -156,6 +165,115 @@ describe('runCheckCommand', () => {
       const cwd = tmp();
       const result = await runCheckCommand({ command: 'sleep 600 & echo done', cwd, env: process.env }).result;
       expect(result).toMatchObject({ ok: true, output: 'done', timedOut: false });
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'killLiveChecks still reaches a backgrounded process after bash exits',
+    async () => {
+      const cwd = tmp();
+      const pidFile = join(cwd, 'bg.pid');
+      const check = runCheckCommand({ command: `sleep 30 & echo $! > ${pidFile}`, cwd, env: process.env });
+      const deadline = Date.now() + 5000;
+      while (!existsSync(pidFile) || !readFileSync(pidFile, 'utf8').trim()) {
+        if (Date.now() > deadline) throw new Error('pid file never written');
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      // Let bash's exit event settle, so the group is exactly where it is between that exit and
+      // the 5 s orphan reap — still within the window cezar's exit-time kill has to cover.
+      await new Promise((r) => setTimeout(r, 250));
+      killLiveChecks();
+      const bg = Number(readFileSync(pidFile, 'utf8').trim());
+      const goneBy = Date.now() + 1000;
+      while (alive(bg) && Date.now() < goneBy) await new Promise((r) => setTimeout(r, 20));
+      expect(alive(bg)).toBe(false);
+      await check.result;
+    },
+    20_000,
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'settles at its bound when a process left the group and still held the pipe',
+    async () => {
+      const cwd = tmp();
+      const pidFile = join(cwd, 'detached.pid');
+      // `detached: true` makes the grandchild a session/group leader, so the check's group kill
+      // cannot reach it, while it still inherits the check's stdout pipe.
+      const script = [
+        'const { spawn } = require("node:child_process");',
+        'const { writeFileSync } = require("node:fs");',
+        'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { detached: true, stdio: "inherit" });',
+        'child.unref();',
+        `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+        'console.log("done");',
+      ].join(' ');
+      const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+      let result: CheckResult | undefined;
+      try {
+        result = await Promise.race([
+          runCheckCommand({ command, cwd, env: process.env, timeoutMs: 300 }).result,
+          new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error('check never settled')), 8000).unref?.();
+          }),
+        ]);
+      } finally {
+        if (existsSync(pidFile)) {
+          try {
+            process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 'SIGKILL');
+          } catch {
+            // already gone
+          }
+        }
+      }
+      expect(result).toMatchObject({ ok: false, exitCode: 0, timedOut: true });
+    },
+    20_000,
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'releases the output pipes on a hard settle, so a headless run can exit',
+    () => {
+      const dir = tmp();
+      const pidFile = join(dir, 'desc.pid');
+      const hostScript = join(dir, 'host.mts');
+      const module = fileURLToPath(new URL('./check-step.ts', import.meta.url));
+      // The descendant is detached (its own session) and inherits the check's stdout/stderr, so it
+      // survives the group kill and holds the pipes open; the host deliberately never kills it and
+      // never calls process.exit, so the only way the host settles to an empty event loop is if
+      // finishing the check destroyed the pipes.
+      const inner = [
+        'const { spawn } = require("node:child_process");',
+        'const { writeFileSync } = require("node:fs");',
+        'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { detached: true, stdio: "inherit" });',
+        'child.unref();',
+        `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+        'console.log("done");',
+      ].join(' ');
+      writeFileSync(
+        hostScript,
+        [
+          `import { runCheckCommand } from ${JSON.stringify(module)};`,
+          `const command = process.execPath + ' -e ' + JSON.stringify(${JSON.stringify(inner)});`,
+          `await runCheckCommand({ command, cwd: ${JSON.stringify(dir)}, env: process.env, timeoutMs: 300 }).result;`,
+          `console.log('HOST_SETTLED');`,
+        ].join('\n'),
+      );
+      const tsx = fileURLToPath(new URL('../../../../node_modules/.bin/tsx', import.meta.url));
+      let host;
+      try {
+        host = spawnSync(tsx, [hostScript], { encoding: 'utf8', timeout: 12_000 });
+      } finally {
+        if (existsSync(pidFile)) {
+          try {
+            process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 'SIGKILL');
+          } catch {
+            // already gone
+          }
+        }
+      }
+      expect(host.error).toBeUndefined();
+      expect(host.stdout).toContain('HOST_SETTLED');
     },
     30_000,
   );

@@ -2,7 +2,6 @@
 import { parseArgs } from 'node:util';
 import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:net';
-import { constants as osConstants } from 'node:os';
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +43,7 @@ import { WorkspaceSemaphore } from './workspace/semaphore.ts';
 import { runTaskCommand } from './dispatch/task-cli.ts';
 import { runAutomationCommand } from './automations/automation-cli.ts';
 import { killLiveChecks } from './workflows/check-step.ts';
+import { installRunSignalHandlers } from './run-signals.ts';
 
 import { runTrackerConnectionsCommand } from './server/tracker/connections-cli.ts';
 
@@ -492,12 +492,7 @@ async function runCommand(
   await semaphore.refresh();
   const manager = new RunManager(store, repoRoot, { semaphore });
   // Check steps run in their own process group, out of reach of the terminal's Ctrl-C.
-  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-    process.once(signal, () => {
-      killLiveChecks();
-      process.exit(128 + osConstants.signals[signal]);
-    });
-  }
+  installRunSignalHandlers(store);
 
   store.on('event', ({ event }) => {
     switch (event.type) {

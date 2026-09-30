@@ -264,9 +264,13 @@ the least-privilege environment agents get minus their backend credentials and
 per-task temp directory (see `CEZ_ENV_PASSTHROUGH` to forward a variable it
 needs, such as a test database URL). A cezar started from a GUI launcher has no
 login-shell PATH, so a tool installed through nvm or asdf exits 127 there; start
-cezar from a shell instead. A check is killed, together with every process it
-started, after `timeoutMs` (default 30 minutes), and the step fails; cezar also
-kills running checks when it exits.
+cezar from a shell instead. A check's process group is killed after `timeoutMs`
+(default 30 minutes) and the step fails; the group is also killed on cancel and
+when cezar exits, and a process the check backgrounded that still holds the
+output pipe is reaped after 5 seconds. A process that escapes the group into its
+own session is beyond every signal, but the step still fails at the bound. Every
+non-zero exit's failure text names `CEZ_ENV_PASSTHROUGH`; exit 127 also points at
+PATH.
 
 Prefer skills over steps? A workflow can also be written in the portable
 shorthand — an ordered list of skill names, each becoming one agent step:
