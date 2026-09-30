@@ -66,6 +66,15 @@ describe('Codex app-server transport', () => {
     expect(writes.join('')).toContain('"method":"initialized"');
   });
 
+  it('settles a request whose response echoes the id as a string', async () => {
+    const { child } = fakeChild();
+    const rpc = new CodexAppServerRpc(child);
+    const request = rpc.request('thread/start', {});
+    expect(rpc.dispatchResponse({ id: '1', result: { thread: { id: 'th' } } })).toBe(true);
+    await expect(request).resolves.toEqual({ thread: { id: 'th' } });
+    expect(rpc.dispatchResponse({ id: 'ask-1', result: {} })).toBe(false);
+  });
+
   it('rejects a correlated request with the app-server error message', async () => {
     const { child } = fakeChild();
     const rpc = new CodexAppServerRpc(child);

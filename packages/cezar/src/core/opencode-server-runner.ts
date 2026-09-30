@@ -165,10 +165,9 @@ class OpencodeSession implements AgentSession {
     private readonly onEvent: ((event: AgentEvent) => void) | undefined,
     private readonly opts: SessionOptions,
   ) {
-    // Random high port; the actual bound URL is read back from stdout.
-    const port = 40000 + Math.floor(Math.random() * 20000);
+    // Port 0 lets the server pick a free port; the bound URL is read back from stdout.
     try {
-      this.child = nodeSpawn(bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
+      this.child = nodeSpawn(bin, ['serve', '--hostname', '127.0.0.1', '--port', '0'], {
         cwd: spec.cwd,
         env: buildChildEnv({ backend: 'opencode', extraEnv: spec.env }),
       });
@@ -200,7 +199,7 @@ class OpencodeSession implements AgentSession {
     this.child.stderr.on('data', (chunk: string) => stderrChunks.push(chunk));
 
     // The server prints its URL on stdout once listening.
-    const urlReady = this.waitForServerUrl(port);
+    const urlReady = this.waitForServerUrl();
 
     const limitMs = spec.timeoutMs ?? timeoutMs;
     let deadline: NodeJS.Timeout | undefined;
@@ -332,13 +331,12 @@ class OpencodeSession implements AgentSession {
 
   // ---- server lifecycle ---------------------------------------------------
 
-  private waitForServerUrl(fallbackPort: number): Promise<string> {
+  private waitForServerUrl(): Promise<string> {
     return new Promise((resolve, reject) => {
       let buffer = '';
       const timer = setTimeout(() => {
         cleanup();
-        // Nothing parsed — try the port we asked for.
-        resolve(`http://127.0.0.1:${fallbackPort}`);
+        reject(new Error(`opencode serve did not report a listening URL within ${SERVER_START_TIMEOUT_MS / 1000}s`));
       }, SERVER_START_TIMEOUT_MS);
       timer.unref?.();
       const onData = (chunk: string) => {
