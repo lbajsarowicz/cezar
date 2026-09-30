@@ -124,7 +124,14 @@ Notable fields (full doc-comments in the source):
   OpenCode auto-approves every permission. Configurable restrictive modes are
   specified by `2026-07-17-permission-modes` (#475).
 - `sessionId?` / `resume?` — stable session id for interactive takeover and for
-  `--resume` ("Continue" after a run ends).
+  `--resume` ("Continue" after a run ends, and an `onFail.retry` re-run). A
+  runner that declares `strictResume` reopens that id (claude `--resume`, codex
+  `thread/resume`, opencode `GET /session/:id`) and fails the session when it
+  is gone — never a silent fresh one — so the workflow engine may send a
+  resumed retry only the failure and fall back to a fresh session itself. A
+  runner without it (pi, whose missing-session behavior is unverified, and
+  cursor, whose one-shot print mode does not resume at all) gets retries as
+  fresh sessions.
 
 **System prompt channel** — a backend without a dedicated system-prompt input
 must deliver `spec.systemPrompt` as a leading block of the opening user message.
@@ -133,7 +140,7 @@ Use the shared helper so the mapping is uniform:
 ```ts
 prependSystemPrompt(spec.systemPrompt, spec.userPrompt)
 // claude:          --append-system-prompt   (native channel, do NOT prepend)
-// codex / opencode: prepended here
+// codex / opencode: prepended here — new sessions only; a resumed one already holds it
 ```
 
 `ContentBlock` mirrors the Anthropic wire format (`text` | `image` base64) so it
@@ -473,6 +480,11 @@ To be first-class:
    `buildChildEnv` is least-privilege per backend, so a multi-provider runner
    must receive credentials for every provider its own model ids can name
    without widening other backends.
+11. **Resume** — set `strictResume` only once you have verified that
+   `resume: true` either reopens `sessionId` or fails the session when the
+   backend no longer has it. Leave it unset while that is unknown: retries then
+   run as fresh sessions, which costs tokens but cannot lose the task (§1,
+   `AgentRunSpec`).
 
 ## 10. The plan channel (PR #443)
 

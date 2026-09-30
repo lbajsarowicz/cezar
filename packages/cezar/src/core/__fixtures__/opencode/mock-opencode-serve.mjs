@@ -21,7 +21,11 @@
 //   `#drop-then-die` destroy the message POST's socket AND then close the event
 //                 bus: the drop was real, and the runner has to say so.
 // `MOCK_NO_EVENT_BUS=1` in the environment makes `GET /event` 404 instead, for
-// the no-event-bus fallback.
+// the no-event-bus fallback. `GET /session/ses_mock_1` answers like the real
+// server reopening a stored session; any other id is a 404. With
+// `MOCK_OPENCODE_PROMPTS_FILE=<path>` every prompt text is appended (one JSON
+// string per line) so a test can assert exactly what reached the session.
+import { appendFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
 const args = process.argv.slice(2);
@@ -80,6 +84,17 @@ const server = createServer((req, res) => {
       res.end(JSON.stringify({ id: SESSION_ID, title: 'cezar task' }));
       return;
     }
+    if (req.method === 'GET' && url.startsWith('/session/') && !url.slice('/session/'.length).includes('/')) {
+      const id = decodeURIComponent(url.slice('/session/'.length));
+      if (id === SESSION_ID) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: SESSION_ID, title: 'cezar task' }));
+      } else {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ name: 'NotFoundError', data: { message: `Session not found: ${id}` } }));
+      }
+      return;
+    }
     if (req.method === 'POST' && url === `/session/${SESSION_ID}/message`) {
       turn += 1;
       const MESSAGE_ID = messageId();
@@ -90,6 +105,7 @@ const server = createServer((req, res) => {
           return '';
         }
       })();
+      if (process.env.MOCK_OPENCODE_PROMPTS_FILE) appendFileSync(process.env.MOCK_OPENCODE_PROMPTS_FILE, `${JSON.stringify(promptText)}\n`);
       const script = promptText.includes('#drop-then-die')
         ? 'drop-then-die'
         : promptText.includes('#drop-post')

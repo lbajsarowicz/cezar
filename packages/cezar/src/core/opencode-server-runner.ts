@@ -57,10 +57,11 @@ export const TURN_IDLE_GRACE_MS = 5_000;
  * the opencode TUI talks to) with an SSE event stream. One server per session,
  * bound to the run's `cwd` (worktree), gives OpenCode the same multi-turn shape
  * as the Claude runner: each `sendMessage` posts another prompt to the same
- * session (history is kept server-side) and `session/abort` cancels. "Continue"
- * starts a fresh server and a fresh session — `bootstrap()` always `POST
- * /session` and does not read `spec.sessionId`; resuming a server-side session
- * id is not implemented.
+ * session (history is kept server-side) and `session/abort` cancels. A session
+ * outlives its server — opencode keeps it in its own storage — so "Continue"
+ * (`spec.resume`) boots a fresh server and reopens `spec.sessionId` with `GET
+ * /session/:id`; a session that is gone fails loudly, like a missing claude
+ * conversation or codex thread does.
  *
  * Auth = the host's opencode config/logins. The agent runs autonomously
  * (auto-approved permissions); OpenCode has no per-tool allowlist, so
@@ -68,6 +69,7 @@ export const TURN_IDLE_GRACE_MS = 5_000;
  */
 export class OpencodeServerRunner implements AgentRunner {
   readonly backend = 'opencode' as const;
+  readonly strictResume = true;
 
   private readonly bin: string;
   private readonly timeoutMs: number;
@@ -369,9 +371,16 @@ class OpencodeSession implements AgentSession {
   }
 
   private async bootstrap(): Promise<void> {
-    const created = await this.http('POST', '/session', { title: 'cezar task' });
-    this.sessionId = stringField(created, 'id');
-    if (!this.sessionId) throw new Error('opencode did not return a session id');
+    const resumeId = this.spec.resume ? this.spec.sessionId : undefined;
+    if (resumeId) {
+      const existing = await this.http('GET', `/session/${encodeURIComponent(resumeId)}`, undefined);
+      this.sessionId = stringField(existing, 'id');
+      if (this.sessionId !== resumeId) throw new Error(`opencode could not reopen session ${resumeId}`);
+    } else {
+      const created = await this.http('POST', '/session', { title: 'cezar task' });
+      this.sessionId = stringField(created, 'id');
+      if (!this.sessionId) throw new Error('opencode did not return a session id');
+    }
     this.emit({ type: 'session', sessionId: this.sessionId });
     const sessionId = this.sessionId;
     this.emitUi((state) => opencodeSessionStarted(sessionId, state));
@@ -381,7 +390,8 @@ class OpencodeSession implements AgentSession {
     // lost (a race this await closes; the bundled mock made it visible).
     await this.consumeEvents();
 
-    const first = prependSystemPrompt(this.spec.systemPrompt, this.spec.userPrompt);
+    // A reopened session already holds the system prompt from its own first turn.
+    const first = resumeId ? this.spec.userPrompt : prependSystemPrompt(this.spec.systemPrompt, this.spec.userPrompt);
     await this.prompt(first);
   }
 

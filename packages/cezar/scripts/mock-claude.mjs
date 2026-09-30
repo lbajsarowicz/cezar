@@ -90,6 +90,24 @@ function writeHandoffAndTodo() {
 async function respond(userText, imageCount) {
   turn += 1;
   await sleep(250);
+  // `mock:session-gone` on a `--resume` spawn → the envelope Claude Code emits for a conversation
+  // it no longer has: an `is_error` result carrying the reason in `errors`, then exit 1.
+  // `mock:session-gone-text` also puts the reason into `result`.
+  const resumeAt = process.argv.indexOf('--resume');
+  if (resumeAt >= 0 && userText.includes('mock:session-gone')) {
+    const reason = `No conversation found with session ID: ${process.argv[resumeAt + 1]}`;
+    emit({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      ...(userText.includes('mock:session-gone-text') ? { result: reason } : {}),
+      errors: [reason],
+      usage: { input_tokens: 0, output_tokens: 0 },
+      total_cost_usd: 0,
+    });
+    process.stdout.write('', () => process.exit(1));
+    return new Promise(() => {});
+  }
   // `mock:done` anywhere in the message → the reply ends with the CEZ:DONE
   // completion marker (#347), so the auto-close path is testable dry. `mock:report` implies it:
   // a unit that has reported is finished, and a report with no done marker would leave the child

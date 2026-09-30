@@ -3467,7 +3467,7 @@ export class RunManager {
     // portable context from Cezar's durable record + redacted event stream before this new turn's
     // user-message is appended. This works even when the interrupted agent never wrote HANDOFF.md.
     const portableContext = record && sessionId === undefined
-      ? freshContinuationContext(record, this.store.readEvents(runId))
+      ? freshContinuationContext(record, this.store.readEvents(runId), readHandoff(this.dataDir, runId))
       : undefined;
     // The env is a live ceiling: a run created while the inbox was on must not keep writing
     // follow-ups after it is switched off.
@@ -4322,6 +4322,9 @@ export class RunManager {
      *  paths are appended to `userPrompt` so the agent can operate on the
      *  real files, not just view the inline image blocks. */
     attachments: PersistedAttachment[] = [],
+    /** Set when a retry could not reopen its previous session: run fresh, carrying the tree
+     *  blocks that attempt already flushed. */
+    resumeFallback?: { treeBlocks: string[] },
   ): Promise<string | null> {
     let systemPrompt: string | undefined;
     if (step.skill) {
@@ -4368,13 +4371,13 @@ export class RunManager {
     // A commander recovered after a restart opens its first session holding whatever its children
     // reported while it was gone (spec Q7). Prepended and cleared here, after the slash expansion
     // so a leading `/skill` still matched, and before the failure/attachment suffixes.
-    const treeReports = this.flushPendingReports(runId);
-    const treeInbox = this.flushInbox(runId);
-    const treeBlocks = [treeReports, treeInbox].filter((block): block is string => Boolean(block));
+    const treeBlocks = resumeFallback?.treeBlocks
+      ?? [this.flushPendingReports(runId), this.flushInbox(runId)].filter((block): block is string => Boolean(block));
     if (treeBlocks.length) userPrompt = `${treeBlocks.join('\n\n')}\n\n---\n\n${userPrompt}`;
-    if (checkFailure) {
-      userPrompt += `\n\nA verification command failed after the previous attempt. Fix the cause. Failing output:\n\n${checkFailure}`;
-    }
+    const failureNote = checkFailure
+      ? `A verification command failed after the previous attempt. Fix the cause. Failing output:\n\n${checkFailure}`
+      : undefined;
+    if (failureNote) userPrompt += `\n\n${failureNote}`;
     if (images?.length) {
       emit({
         type: 'note',
@@ -4392,9 +4395,21 @@ export class RunManager {
       userPrompt += `\n\n${pastedAttachmentsText(attachments, this.attachmentLibraryHint(attachments))}`;
     }
 
-    const sessionId = randomUUID();
     const backend = step.runner ?? taskBackend;
+    // A retry reopens the session this step's previous attempt left behind: the agent keeps
+    // what it already read and is sent only the failure, not the whole task again.
+    const previous = failureNote && !resumeFallback
+      ? this.store.getRun(runId)?.steps.find((s) => s.id === step.id)
+      : undefined;
+    let resumeFrom = previous?.sessionId && previous.backend === backend
+      ? { sessionId: previous.sessionId, profileId: previous.profileId }
+      : undefined;
+    const resumePrompt = treeBlocks.length ? `${treeBlocks.join('\n\n')}\n\n---\n\n${failureNote}` : `${failureNote}`;
+    let sessionId = resumeFrom?.sessionId ?? randomUUID();
     this.store.updateStep(runId, step.id, { sessionId, backend });
+    const spokenText: string[] = [];
+    let usedTool = false;
+    let resumeFailure: string | undefined;
 
     const stepRecord = this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
     const startTokens = stepRecord?.tokensUsed ?? 0;
@@ -4404,6 +4419,13 @@ export class RunManager {
     const sink = this.makeUiSink(runId, step.id);
     const onEvent = (event: AgentEvent) => {
       if (state.cancelled || this.active.get(runId) !== state) return;
+      if (event.type === 'text') spokenText.push(event.text);
+      if (event.type === 'tool-call') usedTool = true;
+      if (event.type === 'error') {
+        // Claude echoes an error `result` frame's text as v1 `text`; that is the error, not the agent.
+        const echoed = spokenText.lastIndexOf(event.message);
+        if (echoed >= 0) spokenText.splice(echoed, 1);
+      }
       if (event.type === 'image') {
         const saved = this.persistAttachment(runId, event.mediaType, event.data);
         if (saved) emit({ type: 'image', stepId: step.id, ...saved });
@@ -4666,6 +4688,7 @@ export class RunManager {
     try {
       stepProfile = await this.agentEnvForStep(runId, stepBackend, {
         generateFollowups: followupsEnabled() && input.generateFollowups !== false,
+        recordedProfileId: resumeFrom?.profileId,
       });
     } catch (err) {
       if (err instanceof AgentTempDirError || err instanceof TrackerAgentBindingError) return err.message;
@@ -4674,6 +4697,16 @@ export class RunManager {
     this.store.updateStep(runId, step.id, { profileId: stepProfile.profileId });
 
     const runner = createRunner(stepBackend);
+    // The session lives in its account's config dir, so under any other account it cannot reopen;
+    // and a runner that might quietly open a blank session would lose the task with it.
+    if (resumeFrom && (!runner.strictResume || (resumeFrom.profileId !== undefined && stepProfile.profileId !== resumeFrom.profileId))) {
+      resumeFrom = undefined;
+      sessionId = randomUUID();
+      this.store.updateStep(runId, step.id, { sessionId, backend });
+    }
+    if (resumeFrom) {
+      emit({ type: 'note', stepId: step.id, message: `retrying in this step's previous session — sending only the failure` });
+    }
     let session: AgentSession;
     state.currentStepId = step.id;
     this.beginUsageInvocation(runId, state, step.id);
@@ -4695,7 +4728,7 @@ export class RunManager {
               ? HANDOFF_INSTRUCTIONS
               : HANDOFF_ONLY_INSTRUCTIONS,
           ),
-          userPrompt,
+          userPrompt: resumeFrom ? resumePrompt : userPrompt,
           images,
           cwd: state.cwd,
           allowedTools: step.allowedTools ?? DEFAULT_ALLOWED_TOOLS,
@@ -4709,6 +4742,7 @@ export class RunManager {
           env: stepProfile.env,
           model: backendModel,
           sessionId,
+          ...(resumeFrom ? { resume: true } : {}),
           // Interactive sessions have no wall clock — the idle timer rules.
           //
           // A non-final step keeps its wall clock (`DEFAULT_RUN_TIMEOUT_MS`)
@@ -4743,23 +4777,31 @@ export class RunManager {
     state.interrupt = () => session.interrupt();
     if (session.pid !== undefined) registerRunProcess(runId, session.pid);
 
+    // A reopened session that failed before the agent said or did anything never resumed at all
+    // (a missing claude conversation still answers with an error `result` frame).
+    const unresumed = (message: string): boolean => {
+      if (!resumeFrom || usedTool || spokenText.length > 0 || state.cancelled || this.active.get(runId) !== state) return false;
+      resumeFailure = message;
+      return true;
+    };
     try {
       const result = await session.result;
       if (sessionError) {
         sink.sessionEnded('error', sessionError);
-        return sessionError;
+        if (!unresumed(sessionError)) return sessionError;
+      } else {
+        // v2 counterpart of v1's `done` (spec: the mappers leave session-close
+        // events to the RunManager — only it knows how the session settled).
+        sink.sessionEnded(state.cancelled ? 'cancelled' : 'end_turn');
+        if (!state.cancelled && this.active.get(runId) === state) {
+          this.store.updateStep(runId, step.id, { tokensUsed: startTokens + result.tokensUsed });
+        }
+        return null;
       }
-      // v2 counterpart of v1's `done` (spec: the mappers leave session-close
-      // events to the RunManager — only it knows how the session settled).
-      sink.sessionEnded(state.cancelled ? 'cancelled' : 'end_turn');
-      if (!state.cancelled && this.active.get(runId) === state) {
-        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + result.tokensUsed });
-      }
-      return null;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       sink.sessionEnded('error', message); // alongside v1's fatal `error`
-      return message;
+      if (!unresumed(sessionError ?? message)) return message;
     } finally {
       this.recordUsagePeaks(runId, state);
       this.clearIdleTimer(state);
@@ -4772,6 +4814,23 @@ export class RunManager {
       state.currentStepId = undefined;
       state.interrupt = () => undefined;
     }
+    emit({ type: 'note', stepId: step.id, message: `could not reopen the previous session (${resumeFailure}) — retrying in a fresh session` });
+    return this.runAgentStep(
+      runId,
+      state,
+      step,
+      input,
+      skills,
+      checkFailure,
+      interactive,
+      emit,
+      images,
+      taskBackend,
+      extraSystemPrompt,
+      chainNote,
+      attachments,
+      { treeBlocks },
+    );
   }
 
   /**

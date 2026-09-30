@@ -176,6 +176,8 @@ Breaking: any change that makes an existing file unparseable, silently discarded
 
 Users commit these files (`.ai/cezar/workflows/*.yaml`) and share them across repos — the compact `skills:` form exists specifically to be portable. Protected shape: `name`, `description?`, and `steps` XOR `skills`; per step `id`, `name?`, agent fields (`prompt`, `skill`, `model`, `runner`, `allowedTools`, `bashAllowlist`) XOR check fields (`command`, `onFail: {retry, max}`); the `{{task}}` token; `onFail.retry` referencing an earlier step; the built-in `quick-task` name.
 
+How a retry is delivered is not part of the `onFail` contract, and it changed: the retried agent step used to start a fresh session carrying the whole prompt plus the failing output; it now reopens the session its previous attempt left (same backend and account) and sends only the failing output, falling back to the old fresh-session prompt when the session cannot be reopened. Retry target, `max`, the steps re-run and the failing output the agent sees are unchanged.
+
 Breaking: renaming a key, tightening a refinement so previously valid files fail to load, changing `{{task}}` substitution, changing `onFail` semantics (retry target, `max` default of 2), or removing a `runner` value. Note the loader already degrades per file (bad files are reported in `issues` and skipped, `cezar run` prints `! skipped …`) — but "your existing workflow is now skipped" is still a break. Required path: accept the old spelling alongside the new, and have `POST /api/workflows` keep writing the most portable form.
 
 ## 5. Skills Markdown format (`packages/cezar/src/skills.ts`)
