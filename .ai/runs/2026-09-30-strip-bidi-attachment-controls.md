@@ -18,7 +18,7 @@
 
 ### Phase 1: Regression and fix
 
-- [x] 1.1 Add a regression test covering U+202E and the full required bidi/format ranges; prove it fails before the fix. — pending commit
+- [x] 1.1 Add a regression test covering U+202E and the full required bidi/format ranges; prove it fails before the fix. — 9b38afa8
 - [ ] 1.2 Extend the sanitizer character class minimally and prove the focused tests pass.
 
 ### Phase 2: Validation and handoff
