@@ -28,6 +28,7 @@ interface MonitorState {
   idleTimer?: NodeJS.Timeout;
   monitoringWakeTimer?: NodeJS.Timeout;
   monitoringLivenessTimer?: NodeJS.Timeout;
+  monitoringLivenessAtCap?: boolean;
   monitoringWakeups?: number;
   session?: { open: boolean };
 }
@@ -268,6 +269,72 @@ describe('a parked monitor always has an exit', () => {
     await waitFor(id, (r) => r?.status === 'waiting');
     expect(store.getRun(id)?.askParked).toBe(true);
     expect(notes(id)).toContain(`automatic monitoring wake-up cap reached (${MAX_AUTO_CONTINUES}); parked for your reply`);
+  }, 30_000);
+
+  it('keeps a fallback exit for a capped monitor whose queued child is cancelled without delivering', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+    boot(5);
+    const id = await startMonitor('mock:monitoring-sticky wait on the queued child');
+    const childId = addChild(id, 'queued');
+    const state = stateOf(id);
+    if (!state) throw new Error('no active state');
+    state.monitoringWakeups = MAX_AUTO_CONTINUES;
+
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(store.getRun(id)?.activity).toBe('monitoring');
+    expect(stateOf(id)?.monitoringWakeTimer).toBeUndefined();
+    // The cap spends the interval's exit, so the liveness bound must return as the fallback.
+    expect(stateOf(id)?.monitoringLivenessTimer).toBeDefined();
+
+    // Mirror `cancelOne`'s queued branch: it settles the child and persists the report, never
+    // delivering it and never pumping the manager.
+    store.updateRun(childId, { status: 'cancelled', finishedAt: new Date().toISOString() });
+    (manager as unknown as { reportSettledChildToParent(runId: string): void }).reportSettledChildToParent(childId);
+    expect(
+      store.getRun(id)?.dispatch?.pendingReports?.some((r) => r.fromRunId === childId),
+    ).toBe(true);
+    expect(store.getRun(id)?.activity).toBe('monitoring');
+
+    vi.advanceTimersByTime(MONITORING_LIVENESS_MS);
+    expect(store.getRun(id)?.status).toBe('waiting');
+    expect(store.getRun(id)?.askParked).toBe(true);
+  }, 30_000);
+
+  it('keeps the at-cap fallback when a child outlives the first liveness window and is then cancelled', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+    boot(5);
+    const id = await startMonitor('mock:monitoring-sticky wait on a long child');
+    const childId = addChild(id, 'queued');
+    const state = stateOf(id);
+    if (!state) throw new Error('no active state');
+    state.monitoringWakeups = MAX_AUTO_CONTINUES;
+
+    // The first interval reaches the cap while the child is in flight, so the liveness fallback
+    // is armed at the cap.
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(store.getRun(id)?.activity).toBe('monitoring');
+    expect(stateOf(id)?.monitoringWakeTimer).toBeUndefined();
+    expect(stateOf(id)?.monitoringLivenessTimer).toBeDefined();
+    expect(stateOf(id)?.monitoringLivenessAtCap).toBe(true);
+
+    // The liveness window expires with the child STILL in flight: the re-arm has to keep the cap
+    // allowance, or the interval guard drops it and no timer remains.
+    vi.advanceTimersByTime(MONITORING_LIVENESS_MS);
+    expect(store.getRun(id)?.activity).toBe('monitoring');
+    expect(stateOf(id)?.monitoringLivenessTimer).toBeDefined();
+    expect(stateOf(id)?.monitoringLivenessAtCap).toBe(true);
+
+    // Now the queued child is cancelled without a delivered report.
+    store.updateRun(childId, { status: 'cancelled', finishedAt: new Date().toISOString() });
+    (manager as unknown as { reportSettledChildToParent(runId: string): void }).reportSettledChildToParent(childId);
+    expect(
+      store.getRun(id)?.dispatch?.pendingReports?.some((r) => r.fromRunId === childId),
+    ).toBe(true);
+    expect(store.getRun(id)?.activity).toBe('monitoring');
+
+    vi.advanceTimersByTime(MONITORING_LIVENESS_MS);
+    expect(store.getRun(id)?.status).toBe('waiting');
+    expect(store.getRun(id)?.askParked).toBe(true);
   }, 30_000);
 
   it('hands off through the liveness bound when the in-flight child is cancelled and never reports', async () => {

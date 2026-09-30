@@ -374,6 +374,10 @@ interface ActiveRun {
   monitoringWakeIntervalMinutes?: number;
   monitoringWakeups?: number;
   monitoringLivenessTimer?: NodeJS.Timeout;
+  /** Whether the current liveness timer was armed at the wake-up cap. A capped run may carry the
+   *  liveness bound even with a wake interval configured, and every re-arm from the timer callback
+   *  must keep that allowance — a one-shot option would drop it on the second window. */
+  monitoringLivenessAtCap?: boolean;
   autosaveTimer?: NodeJS.Timeout;
   cancellationTimer?: NodeJS.Timeout;
   /* The screenshot counter lives on `RunManager.queuedImageSeq` (#472), keyed by
@@ -5433,14 +5437,14 @@ export class RunManager {
       if (!state.monitoringLivenessTimer) this.armMonitoringLivenessTimer(runId, state);
       return;
     }
-    // An interval IS the exit, so a configured run must not also carry the liveness bound; see
-    // `armMonitoringLivenessTimer` for why the two cannot coexist.
-    this.clearMonitoringLivenessTimer(state);
     if ((state.monitoringWakeups ?? 0) >= MAX_AUTO_CONTINUES) {
       this.clearMonitoringWakeTimer(state, runId);
       this.monitoringWakeCapReached(runId, state);
       return;
     }
+    // Below the cap an interval IS the exit, so a configured run must not also carry the liveness
+    // bound; see `armMonitoringLivenessTimer` for why the two cannot coexist.
+    this.clearMonitoringLivenessTimer(state);
     if (state.monitoringWakeTimer && state.monitoringWakeIntervalMinutes === minutes) return;
     this.clearMonitoringWakeTimer(state, runId);
     state.monitoringWakeIntervalMinutes = minutes;
@@ -5485,7 +5489,8 @@ export class RunManager {
   /**
    * The wake-up cap is a lifetime budget: only a user message (`sendMessage`) refills it. At the
    * cap a run with a dispatched child still in flight stays parked for that child's report;
-   * any other run is handed to the user.
+   * any other run is handed to the user. That stay must still be bounded: a child that settles
+   * without delivering (cancelled from the queue) would otherwise leave the run with no timer.
    */
   private monitoringWakeCapReached(runId: string, state: ActiveRun): void {
     const awaitsChildren = this.hasInFlightChildren(runId);
@@ -5498,26 +5503,34 @@ export class RunManager {
         });
       }
     }
-    if (awaitsChildren) return;
-    this.parkMonitorAsWaiting(
-      runId,
-      state,
-      `automatic monitoring wake-up cap reached (${MAX_AUTO_CONTINUES}); parked for your reply`,
-    );
+    if (!awaitsChildren) {
+      this.parkMonitorAsWaiting(
+        runId,
+        state,
+        `automatic monitoring wake-up cap reached (${MAX_AUTO_CONTINUES}); parked for your reply`,
+      );
+      return;
+    }
+    // The cap spends the interval's exit, so the liveness bound returns as the last-resort
+    // hand-off. Arm only when none is set, so a routine pump cannot push the deadline out.
+    if (!state.monitoringLivenessTimer) this.armMonitoringLivenessTimer(runId, state, true);
   }
 
-  private armMonitoringLivenessTimer(runId: string, state: ActiveRun): void {
+  private armMonitoringLivenessTimer(runId: string, state: ActiveRun, atCap = false): void {
     this.clearMonitoringLivenessTimer(state);
+    state.monitoringLivenessAtCap = atCap;
     // With a wake interval configured, a wake-up turn re-parks and resets this timer, so at the
     // interval's maximum (60m) the two would fire together and the liveness hand-off would win —
     // disabling the configured re-checks. Liveness therefore bounds only a park-mode (null) run;
-    // an interval-configured run exits on its wake-up cap instead.
-    if (this.semaphore.monitoringWakeIntervalMinutes() !== null) return;
+    // at the wake-up cap (`atCap`) those re-checks no longer fire, so it is an exit again.
+    if (!atCap && this.semaphore.monitoringWakeIntervalMinutes() !== null) return;
     state.monitoringLivenessTimer = setTimeout(() => {
       state.monitoringLivenessTimer = undefined;
       if (!this.monitoring.has(runId) || !state.session?.open || state.cancelled) return;
       if (this.hasInFlightChildren(runId)) {
-        this.armMonitoringLivenessTimer(runId, state);
+        // A child still in flight outlives this window; carry the cap override into the re-arm, or
+        // the interval guard above would leave the run with no timer at all.
+        this.armMonitoringLivenessTimer(runId, state, state.monitoringLivenessAtCap === true);
         return;
       }
       this.parkMonitorAsWaiting(
@@ -5532,6 +5545,7 @@ export class RunManager {
   private clearMonitoringLivenessTimer(state: ActiveRun): void {
     if (state.monitoringLivenessTimer) clearTimeout(state.monitoringLivenessTimer);
     state.monitoringLivenessTimer = undefined;
+    state.monitoringLivenessAtCap = undefined;
   }
 
   private hasInFlightChildren(runId: string): boolean {
