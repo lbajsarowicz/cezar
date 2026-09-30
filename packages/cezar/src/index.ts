@@ -395,14 +395,16 @@ async function serveCommand(
 
   // The worktree sweep only frees disk: neither the listener nor the browser waits for it.
   if (repo) {
-    void sweepStartupWorktrees(repoRoot, store).then(({ orphans, reclaimed }) => {
-      if (orphans.length > 0) {
-        console.log(`  cleaned ${orphans.length} orphaned worktree(s): ${orphans.map((id) => id.slice(0, 8)).join(', ')}`);
-      }
-      if (reclaimed.length > 0) {
-        console.log(`  reclaimed ${reclaimed.length} old worktree(s), branch kept: ${reclaimed.map((id) => id.slice(0, 8)).join(', ')}`);
-      }
-    });
+    void sweepStartupWorktrees(repoRoot, store)
+      .then(({ orphans, reclaimed }) => {
+        if (orphans.length > 0) {
+          console.log(`  cleaned ${orphans.length} orphaned worktree(s): ${orphans.map((id) => id.slice(0, 8)).join(', ')}`);
+        }
+        if (reclaimed.length > 0) {
+          console.log(`  reclaimed ${reclaimed.length} old worktree(s), branch kept: ${reclaimed.map((id) => id.slice(0, 8)).join(', ')}`);
+        }
+      })
+      .catch(() => {});
   }
 
   // Open the browser only once the server actually answers, so the first
@@ -808,18 +810,22 @@ async function buildSelfUpdateService(
   });
 }
 
+let ownManifest: { name: string; version: string } | undefined;
+
 /** Own package manifest — name for the npm-registry update check (#368), version for the banner. */
 function readOwnManifest(): { name: string; version: string } {
+  if (ownManifest) return ownManifest;
   try {
     const here = dirname(fileURLToPath(import.meta.url));
     const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8')) as {
       name?: string;
       version?: string;
     };
-    return { name: pkg.name ?? '@open-mercato/cezar', version: pkg.version ?? '0.0.0' };
+    ownManifest = { name: pkg.name ?? '@open-mercato/cezar', version: pkg.version ?? '0.0.0' };
   } catch {
-    return { name: '@open-mercato/cezar', version: '0.0.0' };
+    ownManifest = { name: '@open-mercato/cezar', version: '0.0.0' };
   }
+  return ownManifest;
 }
 
 function openUrl(url: string): void {

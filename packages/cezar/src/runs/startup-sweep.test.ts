@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
-import { WORKTREES_DIR } from '../git-worktree.ts';
+import { WORKTREES_DIR, createWorktree } from '../git-worktree.ts';
 import { sweepStartupWorktrees } from './startup-sweep.ts';
 import { RunStore } from './store.ts';
 
@@ -48,5 +48,48 @@ describe('sweepStartupWorktrees', () => {
     expect(orphans).toEqual(['orphan-run-id']);
     expect(existsSync(orphanDir)).toBe(false);
     expect(existsSync(liveDir)).toBe(true);
+  }, 30_000);
+
+  it('keeps the worktree of a run another cockpit persisted after this store opened', async () => {
+    const root = await fixtureRepo();
+    const sweepStore = RunStore.open(join(root, '.ai/cezar'));
+    const otherStore = RunStore.open(join(root, '.ai/cezar'));
+    stores.push(sweepStore, otherStore);
+    const created = otherStore.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] });
+    otherStore.flush();
+    const liveDir = join(root, WORKTREES_DIR, created.id);
+    mkdirSync(liveDir, { recursive: true });
+
+    const { orphans } = await sweepStartupWorktrees(root, sweepStore);
+    expect(orphans).toEqual([]);
+    expect(existsSync(liveDir)).toBe(true);
+  }, 30_000);
+
+  it('reclaims over-limit finished worktrees and leaves the newest one in place', async () => {
+    const root = await fixtureRepo();
+    const store = RunStore.open(join(root, '.ai/cezar'));
+    stores.push(store);
+    writeFileSync(join(root, '.ai/cezar', 'config.json'), JSON.stringify({ worktreeRetention: 1 }));
+
+    const oldRun = store.createRun({ title: 'old', workflow: 'quick-task', task: 'old', steps: [] });
+    const newRun = store.createRun({ title: 'new', workflow: 'quick-task', task: 'new', steps: [] });
+    const oldWt = await createWorktree(root, oldRun.id, 'main');
+    const newWt = await createWorktree(root, newRun.id, 'main');
+    store.updateRun(oldRun.id, {
+      status: 'done',
+      finishedAt: '2026-07-01T00:00:00.000Z',
+      worktreePath: oldWt.path,
+    });
+    store.updateRun(newRun.id, {
+      status: 'done',
+      finishedAt: '2026-07-09T00:00:00.000Z',
+      worktreePath: newWt.path,
+    });
+
+    const { orphans, reclaimed } = await sweepStartupWorktrees(root, store);
+    expect(orphans).toEqual([]);
+    expect(reclaimed).toEqual([oldRun.id]);
+    expect(existsSync(oldWt.path)).toBe(false);
+    expect(existsSync(newWt.path)).toBe(true);
   }, 30_000);
 });

@@ -1262,6 +1262,13 @@ export class RunStore extends EventEmitter {
     // Sync append keeps event order without a write queue; local NDJSON
     // appends at agent-event rates are effectively free.
     if (this.writable) appendFileSync(this.eventsPath(runId), `${JSON.stringify(full)}\n`, 'utf8');
+    else {
+      // Nothing reaches disk in a read-only checkout, so the transcript lives here for the
+      // session and `readEvents` serves it back; without this the replay would be empty.
+      const buffered = this.memoryEvents.get(runId);
+      if (buffered) buffered.push(full);
+      else this.memoryEvents.set(runId, [full]);
+    }
     this.emit('event', { runId, event: full });
 
     // The janitor trick: agents print the PR URL after `gh pr create` — the
@@ -1492,6 +1499,9 @@ export class RunStore extends EventEmitter {
 
   private readonly runSecrets = new Map<string, readonly string[]>();
 
+  /** Transcript buffered for this session only while the data dir is read-only. */
+  private readonly memoryEvents = new Map<string, RunEvent[]>();
+
   /** Memory only: register before spawn; retain through the final event drain. */
   registerRunSecrets(runId: string, values: readonly string[]): void {
     if (values.length === 0) return;
@@ -1515,6 +1525,7 @@ export class RunStore extends EventEmitter {
   }
 
   readEvents(runId: string): RunEvent[] {
+    if (!this.writable) return this.memoryEvents.get(runId) ?? [];
     try {
       const raw = readFileSync(this.eventsPath(runId), 'utf8');
       return raw
@@ -1547,6 +1558,7 @@ export class RunStore extends EventEmitter {
         // best effort — the index is authoritative
       }
       this.seqs.delete(id);
+      this.memoryEvents.delete(id);
       this.scheduleSave();
       this.emit('deleted', id);
     }

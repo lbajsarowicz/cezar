@@ -2211,6 +2211,10 @@ describe('RunStore — read-only data dir (zero-config degradation)', () => {
         expect(() => store.appendEvent(run.id, { type: 'text', text: 'again' })).not.toThrow();
         store.flush();
         expect(store.getRun(run.id)?.id).toBe(run.id);
+        expect(store.readEvents(run.id).map((event) => (event as { text?: string }).text)).toEqual([
+          'hello',
+          'again',
+        ]);
         expect(warn).toHaveBeenCalledTimes(1);
       } finally {
         warn.mockRestore();
