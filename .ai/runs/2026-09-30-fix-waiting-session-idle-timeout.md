@@ -17,6 +17,12 @@ Scope: workflow idle timer; workspace resource schema/semaphore and API contract
 - [x] 2.2 Run focused regression/config/API/UI tests and prove the regression test is red against the pre-fix implementation. — ccc8939e
 - [x] 2.3 Run the full configured validation gate, review diff, and document compatibility/evidence. — ccc8939e
 
+## Evidence
+
+- PR #1176: https://github.com/open-mercato/cezar/pull/1176
+- Head: `0d670be42e2e98509524bb97a0b09f6b89edeedc`
+- Focused tests and typecheck/build/package gates pass; full `npm test` has eight unrelated environment-sensitive failures documented in the PR.
+
 ## Risks
 
 - A missing or invalid setting must keep the 15-minute safeguard.
