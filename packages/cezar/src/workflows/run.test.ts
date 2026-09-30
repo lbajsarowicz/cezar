@@ -1338,7 +1338,7 @@ describe('CEZ:ASK parks as waiting and emits ask.requested (#473)', () => {
     expect(questions[0]!.options).toHaveLength(2);
   }, 30_000);
 
-  it('uses the configured plain-wait timeout and preserves the expiry safeguard (#992)', () => {
+  it('preserves the default 15-minute plain-wait expiry safeguard (#992)', () => {
     vi.useFakeTimers();
     const record = store.createRun({
       title: 'idle timeout',
@@ -1364,7 +1364,33 @@ describe('CEZ:ASK parks as waiting and emits ask.requested (#473)', () => {
     vi.useRealTimers();
   });
 
-  it('uses a positive configured timeout at both new-run and continuation parks (#992)', async () => {
+  it('honors a configured 30-minute timeout instead of the old hard-coded 15 (#992)', () => {
+    manager.dispose();
+    manager = new RunManager(store, repoRoot, {
+      semaphore: new WorkspaceSemaphore({ initial: { idleTimeoutMinutes: 30 } }),
+    });
+    const record = store.createRun({
+      title: 'configured idle timeout',
+      workflow: 'quick-task',
+      task: 'configured idle timeout',
+      steps: [{ id: 'task', name: 'Task', kind: 'agent' }],
+    });
+    const ended = vi.fn();
+    const state = { cancelled: false, session: { open: true, end: ended } } as never;
+    const internals = manager as unknown as {
+      armIdleTimer: (runId: string, state: never) => void;
+    };
+    vi.useFakeTimers();
+    internals.armIdleTimer(record.id, state);
+    vi.advanceTimersByTime(15 * 60_000);
+    expect(ended).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(15 * 60_000);
+    expect(ended).toHaveBeenCalledOnce();
+    expect(readEvents(record.id).some((event) => event.message === 'session closed after 30m of inactivity')).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('keeps the configured timeout armed at both new-run and reply continuation parks (#992)', async () => {
     manager.dispose();
     manager = new RunManager(store, repoRoot, {
       semaphore: new WorkspaceSemaphore({ initial: { idleTimeoutMinutes: 30 } }),
