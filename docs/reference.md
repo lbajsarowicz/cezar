@@ -29,7 +29,10 @@ Three words, no jargon — **task**, **skill**, **chain**:
   `.ai/cezar/skills/`, or pull them from a shared **team skills repo** (a bare
   git clone cached globally in `~/.cache/cez/`). A workflow step references one by
   `skill: <name>` and its body becomes the agent's extra system prompt — so you
-  shape *how* the agent reasons without touching code.
+  shape *how* the agent reasons without touching code. A `SKILL.md` directory
+  skill is handed to Claude Code, Codex and OpenCode as a path instead: cezar
+  copies the project's skills into the task's worktree and the agent loads the
+  body with its own skill tool.
 - 🔗 **Chains (workflows)** stitch steps into a pipeline: agent steps plus shell
   checks, with bounded `onFail` retry loops. Write the YAML yourself, build one by
   drag-ordering skills in the **Workflows** tab, or press **Plan first** and let the

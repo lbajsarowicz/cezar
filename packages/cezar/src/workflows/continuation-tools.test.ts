@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -239,6 +239,24 @@ describe('a resumed session keeps its workflow step tools', () => {
     expect(spec.sessionId).toBe('sess-2');
     expect(spec.allowedTools).toEqual(TOOLS);
     expect(spec.bashAllowlist).toEqual(BASH);
+    await settled(id);
+  });
+
+  it("Continue grants the directory of the owning step's path-delivered skill", async () => {
+    // A directory skill outside `.agents/skills` is delivered as an absolute path the resumed
+    // session already holds, so the continuation needs the same grant the first spawn had.
+    mkdirSync(join(repoRoot, '.ai/skills/demo-dir'), { recursive: true });
+    writeFileSync(join(repoRoot, '.ai/skills/demo-dir/SKILL.md'), '---\nname: demo-dir\n---\nbody\n');
+    const def: WorkflowDef = {
+      name: 'skilled-task',
+      source: 'file',
+      steps: [{ id: 'work', name: 'Work', prompt: '{{task}}', skill: 'demo-dir' }],
+    };
+    const id = terminalRun({ def, steps: [{ id: 'work', sessionId: 'sess-1', backend: 'claude' }] });
+
+    expect(manager!.continueRun(id, { text: 'keep going' })).toEqual({ ok: true });
+    const spec = await specAt(0);
+    expect(spec.additionalDirectories).toContain(join(repoRoot, '.ai/skills/demo-dir'));
     await settled(id);
   });
 

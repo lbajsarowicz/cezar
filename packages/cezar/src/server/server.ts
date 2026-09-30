@@ -77,7 +77,7 @@ import {
   type WorkflowDef,
 } from '../workflows/types.ts';
 import { planChain, slugify } from '../planner.ts';
-import { discoverSkills } from '../skills.ts';
+import { discoverSkills, invalidateSkillsCache } from '../skills.ts';
 import { SkillsUpdateConflictError, SkillsUpdateCoordinator, SkillsUpdateService, type SkillsUpdateState } from '../skills-update.ts';
 import { getTeamSkillsCached, refreshTeamSkills, waitForTeamSkills } from '../skills-remote.ts';
 import { appendHandoffHeartbeat, handoffProgressExcerpt, readHandoff } from '../handoff.ts';
@@ -3164,6 +3164,7 @@ export function createApp(deps: ServerDeps) {
     // team entries stay as they were (or absent).
     .post('/skills/refresh', async (c) => {
       const { root: repoRoot } = c.get('project');
+      invalidateSkillsCache(repoRoot);
       await refreshTeamSkills(repoRoot);
       return c.json(await discoverSkills(repoRoot));
     });
@@ -5953,7 +5954,12 @@ export function createApp(deps: ServerDeps) {
 
 export function startServer(deps: ServerDeps, port: number): ServerType {
   const workspaceEvents = deps.workspaceEvents ?? new WorkspaceEventBus();
-  const skillsUpdate = deps.skillsUpdate ?? new SkillsUpdateService({ invalidateCatalog: refreshTeamSkills });
+  const skillsUpdate = deps.skillsUpdate ?? new SkillsUpdateService({
+    invalidateCatalog: (repoRoot) => {
+      invalidateSkillsCache(repoRoot);
+      return refreshTeamSkills(repoRoot);
+    },
+  });
   // The subscription hub rides the same HTTP server (one port, zero config):
   // createApp registers the topics, the `upgrade` hook below owns the socket.
   const socketHub = deps.socketHub ?? createSocketHub();

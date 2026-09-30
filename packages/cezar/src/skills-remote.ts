@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
+import { cp, lstat, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { loadConfig, type SkillsRepoSource } from './config.ts';
@@ -367,6 +367,80 @@ export async function materializeSkillDir(repoRoot: string, skill: Skill): Promi
   return true;
 }
 
+/* Claude Code reads `.claude/skills`, Codex reads `.agents/skills`, OpenCode reads both. */
+const PROJECT_SKILL_MIRRORS = ['.agents/skills', '.claude/skills'];
+const COPYABLE_SOURCES: ReadonlySet<Skill['source']> = new Set(['cezar', 'ai', 'agents']);
+
+/**
+ * Copy every discovered project directory skill (`<name>/SKILL.md`) into a task worktree's
+ * native skill dirs, so each agent CLI discovers it there and loads the body on demand. A copy,
+ * not a link: an agent that edits a skill edits its own worktree copy and can never write the
+ * main checkout through it. A destination is written only when `git check-ignore` in the
+ * worktree says it is already ignored, which keeps it out of the diff, autosave commits and
+ * `git status` without writing the `info/exclude` the main checkout shares. A copy whose
+ * `SKILL.md` matches the source in size and mtime is left as is, and so is one edited after it
+ * was copied; a copy of the same skill whose source changed since is refreshed; any other
+ * existing path is never touched.
+ * Returns the repo-relative paths written.
+ */
+export async function copyProjectSkills(cwd: string, skills: readonly Skill[]): Promise<string[]> {
+  const candidates: Array<{ rel: string; source: string; name: string }> = [];
+  for (const skill of skills) {
+    if (!COPYABLE_SOURCES.has(skill.source) || basename(skill.path) !== 'SKILL.md') continue;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(skill.name)) continue;
+    for (const mirror of PROJECT_SKILL_MIRRORS) {
+      candidates.push({ rel: `${mirror}/${skill.name}`, source: dirname(skill.path), name: skill.name });
+    }
+  }
+  const pending = (
+    await Promise.all(candidates.map(async (candidate) => ((await copyNeeded(cwd, candidate)) ? candidate : null)))
+  ).filter((candidate): candidate is (typeof candidates)[number] => candidate !== null);
+  if (pending.length === 0) return [];
+  const probe = await git(['check-ignore', '--', ...pending.map((c) => c.rel)], LIST_TIMEOUT_MS, cwd);
+  const ignored = new Set(probe.stdout.split('\n').filter(Boolean));
+  const copied: string[] = [];
+  for (const { rel, source } of pending) {
+    if (!ignored.has(rel)) continue;
+    const dest = join(cwd, rel);
+    try {
+      await mkdir(dirname(dest), { recursive: true });
+      await cp(source, dest, { recursive: true, dereference: true, force: true, preserveTimestamps: true });
+      copied.push(rel);
+    } catch {
+      // best-effort: the prompt still names the skill's absolute path
+    }
+  }
+  return copied;
+}
+
+async function copyNeeded(cwd: string, candidate: { rel: string; source: string; name: string }): Promise<boolean> {
+  const dest = join(cwd, candidate.rel);
+  const destStat = await lstat(dest).catch(() => null);
+  if (destStat === null) return true;
+  if (!destStat.isDirectory()) return false;
+  const [src, copy] = await Promise.all([
+    stat(join(candidate.source, 'SKILL.md')).catch(() => null),
+    lstat(join(dest, 'SKILL.md')).catch(() => null),
+  ]);
+  if (src === null || copy === null || !copy.isFile()) return false;
+  // `utimes` keeps microseconds at best, so a preserved mtime can differ from its source's below 1 ms.
+  const sourceNewerBy = src.mtimeMs - copy.mtimeMs;
+  if (src.size === copy.size && Math.abs(sourceNewerBy) < 1) return false;
+  return sourceNewerBy >= 1 && skillFileName(join(dest, 'SKILL.md')) === candidate.name;
+}
+
+/** The name a `SKILL.md` declares, falling back to its directory name as discovery does. */
+export function skillFileName(file: string): string | undefined {
+  try {
+    const { frontmatter } = parseFrontmatter(readFileSync(file, 'utf8'));
+    return typeof frontmatter.name === 'string' && frontmatter.name.trim()
+      ? frontmatter.name.trim()
+      : basename(dirname(file));
+  } catch {
+    return undefined;
+  }
+}
+
 /** Append a pattern to git's `info/exclude` (idempotent, non-fatal). */
 async function excludeFromGit(repoRoot: string, pattern: string): Promise<void> {
   try {
@@ -428,14 +502,40 @@ export function shouldPassiveFetch(opts: {
 // project resolves its own `.ai/cezar/config.json` → `skillsRepos`, so one
 // project's team-skill list must never be served under another project's scope.
 const teamSkillsByRoot = new Map<string, Skill[]>();
-const firstLoadByRoot = new Map<string, Promise<Skill[]>>();
+interface TeamSkillsLoad {
+  promise: Promise<Skill[]>;
+  startedAt: number;
+  settled: boolean;
+}
+const loadByRoot = new Map<string, TeamSkillsLoad>();
 
+/**
+ * Start a load and make it the root's current one. A load that settles after a newer one
+ * started (a Refresh racing a passive load) does not write the cache; its caller gets the
+ * newer load's result instead.
+ */
+function startTeamSkillsLoad(repoRoot: string, refresh: boolean): Promise<Skill[]> {
+  const load: TeamSkillsLoad = { promise: Promise.resolve([]), startedAt: Date.now(), settled: false };
+  load.promise = loadTeamSkills(repoRoot, refresh)
+    .catch(() => teamSkillsByRoot.get(repoRoot) ?? [])
+    .then((skills) => {
+      load.settled = true;
+      const current = loadByRoot.get(repoRoot);
+      if (current && current !== load) return current.promise;
+      teamSkillsByRoot.set(repoRoot, skills);
+      return skills;
+    });
+  loadByRoot.set(repoRoot, load);
+  return load.promise;
+}
+
+/** Single-flight passive load: reuse the in-flight or still-fresh load, else start a new one. */
 function initialTeamSkillsLoad(repoRoot: string): Promise<Skill[]> {
-  const existing = firstLoadByRoot.get(repoRoot);
-  if (existing) return existing;
-  const load = loadTeamSkills(repoRoot, false).catch(() => teamSkillsByRoot.get(repoRoot) ?? []);
-  firstLoadByRoot.set(repoRoot, load);
-  return load;
+  const current = loadByRoot.get(repoRoot);
+  if (current && (!current.settled || Date.now() - current.startedAt <= PASSIVE_FETCH_TTL_MS)) {
+    return current.promise;
+  }
+  return startTeamSkillsLoad(repoRoot, false);
 }
 
 /**
@@ -460,9 +560,7 @@ export function waitForTeamSkills(repoRoot: string): Promise<Skill[]> {
 
 /** Refresh: clone missing sources, `git fetch` existing ones, reload the list. */
 export async function refreshTeamSkills(repoRoot: string): Promise<Skill[]> {
-  const load = loadTeamSkills(repoRoot, true).catch(() => teamSkillsByRoot.get(repoRoot) ?? []);
-  firstLoadByRoot.set(repoRoot, load);
-  return load;
+  return startTeamSkillsLoad(repoRoot, true);
 }
 
 async function loadTeamSkills(repoRoot: string, refresh: boolean): Promise<Skill[]> {
@@ -504,6 +602,5 @@ async function loadTeamSkills(repoRoot: string, refresh: boolean): Promise<Skill
       // degrade: this source contributes nothing
     }
   }
-  teamSkillsByRoot.set(repoRoot, out);
   return out;
 }
