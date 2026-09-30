@@ -1364,6 +1364,23 @@ describe('CEZ:ASK parks as waiting and emits ask.requested (#473)', () => {
     vi.useRealTimers();
   });
 
+  it('uses a positive configured timeout at both new-run and continuation parks (#992)', async () => {
+    manager.dispose();
+    manager = new RunManager(store, repoRoot, {
+      semaphore: new WorkspaceSemaphore({ initial: { idleTimeoutMinutes: 30 } }),
+    });
+    const record = manager.startRun(SINGLE_STEP, { task: 'mock:ask choose a path', worktree: false });
+    currentId = record.id;
+    await waitFor(record.id, (r) => r?.status === 'waiting');
+    const active = (manager as unknown as {
+      active: Map<string, { idleTimer?: NodeJS.Timeout }>;
+    }).active;
+    expect(active.get(record.id)?.idleTimer).toBeDefined();
+    expect(manager.sendMessage(record.id, [{ type: 'text', text: 'continue' }])).toBe(true);
+    await waitFor(record.id, (r) => r?.status === 'waiting');
+    expect(active.get(record.id)?.idleTimer).toBeDefined();
+  }, 30_000);
+
   it.each([0, null])('does not arm the plain-wait timeout when configured as %s (#992)', (minutes) => {
     manager.dispose();
     manager = new RunManager(store, repoRoot, {
