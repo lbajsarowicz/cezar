@@ -2,6 +2,7 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeEach } from 'vitest'
+import { abortTeamSkillsBackgroundWork, resetTeamSkillsBackgroundWorkAbort, settleTeamSkillsBackgroundWork } from './src/skills-remote.ts'
 
 // Nothing in this suite may write to the developer's own `~/.cezar`. Most cases pin
 // `CEZ_HOME` themselves, but the pin is one global for the whole worker and their
@@ -25,6 +26,12 @@ beforeEach(pinSandboxHome)
 // Registered before any suite's own hooks, so vitest runs it last on the way out —
 // after a case's `afterEach` has deleted the pin.
 afterEach(pinSandboxHome)
-afterAll(() => {
-  rmSync(sandboxHome, { recursive: true, force: true })
+afterAll(async () => {
+  // A background team-skills load can still hold a `git clone`/`fetch` writing
+  // under the cache dir; letting it run into the removal turns rmSync into
+  // ENOTEMPTY. Stop the children, let the loads unwind, then remove.
+  abortTeamSkillsBackgroundWork()
+  await settleTeamSkillsBackgroundWork()
+  resetTeamSkillsBackgroundWorkAbort()
+  rmSync(sandboxHome, { recursive: true, force: true, maxRetries: 3, retryDelay: 25 })
 })
