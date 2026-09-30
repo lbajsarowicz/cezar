@@ -2223,6 +2223,42 @@ describe('RunStore — read-only data dir (zero-config degradation)', () => {
       }
     },
   );
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    "drops a pruned run's buffered transcript instead of leaking it for the process lifetime",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), 'cez-ro-prune-'));
+      chmodSync(root, 0o500);
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      try {
+        const store = RunStore.open(join(root, 'data'));
+        const ids: string[] = [];
+        for (let i = 0; i < 306; i++) {
+          const created = store.createRun({
+            title: `run ${i}`,
+            workflow: 'quick-task',
+            task: `run ${i}`,
+            steps: [],
+          });
+          store.appendEvent(created.id, { type: 'text', text: `event ${i}` });
+          ids.push(created.id);
+          vi.advanceTimersByTime(1);
+        }
+        const pruned = ids.filter((id) => store.getRun(id) === undefined);
+        expect(pruned).toHaveLength(6);
+        for (const id of pruned) expect(store.readEvents(id)).toEqual([]);
+        const kept = ids.filter((id) => store.getRun(id) !== undefined);
+        expect(store.readEvents(kept[0]!)).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+        warn.mockRestore();
+        chmodSync(root, 0o700);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe('RunStore — a failed index save on a writable data dir', () => {

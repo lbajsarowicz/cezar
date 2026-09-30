@@ -1635,6 +1635,8 @@ export class RunStore extends EventEmitter {
     ];
     for (const stale of stalePool) {
       this.forget(stale.id);
+      this.seqs.delete(stale.id);
+      this.memoryEvents.delete(stale.id);
       try {
         rmSync(this.eventsPath(stale.id), { force: true });
         rmSync(this.handoffPath(stale.id), { force: true });
