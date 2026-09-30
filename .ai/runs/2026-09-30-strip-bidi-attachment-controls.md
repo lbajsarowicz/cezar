@@ -23,7 +23,7 @@
 
 ### Phase 2: Validation and handoff
 
-- [x] 2.1 Run the complete configured validation gate, document any baseline/unrelated failures, and complete the PR review handoff. — pending commit
+- [x] 2.1 Run the complete configured validation gate, document any baseline/unrelated failures, and complete the PR review handoff. — 3ad30c74
 
 Gate evidence: `npm run typecheck` and `npm run build` fail on pre-existing workspace dependency/contract drift (including Zod v3/v4 resolution and stale `/tmp/cezar-review-1098-final-...` paths); `npm test` reports 312 failed files and an unrelated repository-root discovery failure; `npm run test:unit` has 3 unrelated failing suites; `npm run test:package` has 2 artifact assertions. `git diff --check` and direct source-level sanitizer checks pass. The focused Vitest suite cannot collect because of the same `z.looseObject is not a function` dependency mismatch.
 
