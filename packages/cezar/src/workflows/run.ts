@@ -120,6 +120,12 @@ export const IDLE_TIMEOUT_MS = 15 * 60_000;
 /** Maximum time a live provider gets to honor cancellation before its slot is reaped. */
 const CANCEL_GRACE_MS = 1_000;
 /**
+ * How long a run may sit parked on `CEZ:MONITORING` with nothing waking it and no dispatched
+ * child still in flight before it is handed to the user as `waiting`. Only a bound, never a
+ * close: a monitor watching slow CI must not be settled as `done` behind its back (#661).
+ */
+export const MONITORING_LIVENESS_MS = 4 * IDLE_TIMEOUT_MS;
+/**
  * Task-completion marker from the agent contract (HANDOFF_INSTRUCTIONS): a
  * turn whose text ends with `CEZ:DONE` means "goal achieved, nothing to ask" —
  * the session is closed right away instead of parking at `waiting` (#347).
@@ -182,6 +188,11 @@ export function turnEndMarkerText(turnText: string): string {
  */
 export function endsWithMonitoringMarker(turnText: string): boolean {
   return MONITORING_MARKER_RE.test(turnEndMarkerText(turnText));
+}
+/** Did this turn end on `CEZ:DONE`? Tolerates trailing task-reference lines exactly as
+ *  `endsWithMonitoringMarker` does. */
+export function endsWithDoneMarker(turnText: string): boolean {
+  return DONE_MARKER_RE.test(turnEndMarkerText(turnText));
 }
 /**
  * The follow-up cezar sends when a turn ended on nothing but the backend compacting its own
@@ -362,6 +373,7 @@ interface ActiveRun {
   monitoringWakeTimer?: NodeJS.Timeout;
   monitoringWakeIntervalMinutes?: number;
   monitoringWakeups?: number;
+  monitoringLivenessTimer?: NodeJS.Timeout;
   autosaveTimer?: NodeJS.Timeout;
   cancellationTimer?: NodeJS.Timeout;
   /* The screenshot counter lives on `RunManager.queuedImageSeq` (#472), keyed by
@@ -1080,6 +1092,7 @@ export class RunManager {
     for (const [runId, state] of this.active) {
       this.clearIdleTimer(state);
       this.clearMonitoringWakeTimer(state, runId);
+      this.clearMonitoringLivenessTimer(state);
       this.clearAutosaveTimer(state);
       state.releaseRepoRoot?.();
       state.releaseRepoRoot = undefined;
@@ -1360,18 +1373,23 @@ export class RunManager {
     this.monitoring.add(runId);
     if (spawnParked) this.unitParents.add(runId);
     else this.unitParents.delete(runId);
+    const state = this.active.get(runId);
+    if (state) this.armMonitoringLivenessTimer(runId, state);
   }
 
   /**
    * Leave the monitoring set — the ONE exit, and every transition out of the state goes through
    * it: a child's report or a user message (`deliverMessage`), the next turn ending in anything
-   * but a park, a native `ask.requested`, the session's own teardown, and `dropActive` (cancel,
-   * settle, restart recovery). The monitoring wake timer is deliberately NOT one: its nudge is
-   * delivered into the same parked session and the turn it starts ends back here.
+   * but a park, a native `ask.requested`, the session's own teardown, `dropActive` (cancel,
+   * settle, restart recovery), and `parkMonitorAsWaiting` (the wake-up cap and the liveness
+   * timer). An ordinary wake-up is deliberately NOT one: its nudge is delivered into the same
+   * parked session and the turn it starts ends back here.
    */
   private leaveMonitoring(runId: string): void {
     this.monitoring.delete(runId);
     this.unitParents.delete(runId);
+    const state = this.active.get(runId);
+    if (state) this.clearMonitoringLivenessTimer(state);
   }
 
   /** Epoch ms of this manager's oldest queued run (the semaphore's fairness
@@ -1625,8 +1643,8 @@ export class RunManager {
    *    workflowDef (or the catalog by name for older records);
    *  - `waiting` → the turn was over and the ball was in the user's court —
    *    settle exactly like a closed session (review/done, Continue still works),
-   *    unless `askParked` says the workflow stopped mid-way on a question (#917),
-   *    which settles `failed` instead so unrun steps are not reported as done;
+   *    unless `askParked` says the workflow stopped mid-way on a question (#917)
+   *    or a monitor was handed over unfinished, which settles `failed` instead;
    *  - `running` → mark interrupted, then immediately resume the last agent
    *    session via the Continue path, pointing the agent at its handoff file.
    * Call once, before the server starts taking requests.
@@ -1656,7 +1674,9 @@ export class RunManager {
         // reopens the session so the question can still be answered. No
         // automatic resume here, unlike the `running` branch below: the agent
         // asked for a decision, and nudging it onward would be cezar making
-        // that decision on the user's behalf.
+        // that decision on the user's behalf. A monitor handed to the user
+        // (`parkMonitorAsWaiting`) carries the same marker for the same reason:
+        // the agent said its work was still pending.
         if (run.askParked) {
           const interruptedAt = new Date().toISOString();
           for (const step of run.steps) {
@@ -2285,12 +2305,6 @@ export class RunManager {
       // A CANCELLED child is persisted and nothing more: a cancel cascades children-first, so the
       // parent is already cancelled — or about to be — and every live rung below would fight that.
       if (child.status === 'cancelled') return;
-
-      const parentState = this.active.get(parentId);
-      if (parentState) parentState.monitoringWakeups = 0;
-      if (parent.monitoringWakeCapReached) {
-        this.store.updateRun(parentId, { monitoringWakeCapReached: undefined });
-      }
 
       const blocks: PastedContent[] = [{ type: 'text', text }];
       if (this.deliverMessage(parentId, blocks, false) || this.enqueueMessage(parentId, blocks)) {
@@ -3626,7 +3640,7 @@ export class RunManager {
         // working again, so the anti-spin budget is restored. Before the early returns below,
         // because a turn that finished or dispatched is progress too.
         if (!compacted) state.compactionContinues = 0;
-        const done = sessionOpen && DONE_MARKER_RE.test(turnText.trimEnd());
+        const done = sessionOpen && endsWithDoneMarker(turnText);
         // The dispatch facts of this turn (spec 2026-09-10-dispatch), through the ONE helper both
         // turn-end handlers call. Inert for a run with no `dispatch`.
         const dispatchTurn = this.handleDispatchTurn(runId, turnText, {
@@ -3893,6 +3907,10 @@ export class RunManager {
         this.store.updateRun(runId, { status: 'cancelled', finishedAt: finishedAt(), currentStepId: undefined });
         this.store.appendEvent(runId, { type: 'lifecycle', message: 'run cancelled' });
         appendHandoffHeartbeat(this.dataDir, runId, `step "${stepId}" complete — status=cancelled`);
+      } else if (state.askPark === 'waiting') {
+        state.askPark = undefined;
+        this.settleUnansweredPark(runId, finishedAt());
+        appendHandoffHeartbeat(this.dataDir, runId, `step "${stepId}" complete — status=failed`);
       } else {
         this.store.updateStep(runId, stepId, { status: 'done', finishedAt: finishedAt() });
         this.store.appendEvent(runId, { type: 'step-end', stepId, status: 'done' });
@@ -4274,25 +4292,7 @@ export class RunManager {
       this.store.updateRun(runId, { status: 'failed', error: runError, finishedAt, currentStepId: undefined });
       emit({ type: 'lifecycle', message: `run failed — ${runError}` });
     } else if (askPark === 'waiting') {
-      // The question was never answered, so the steps behind it never ran.
-      // `settleSuccess` would put a finished badge on a workflow that stopped at
-      // its first question; `failed` says what happened and keeps the Continue
-      // button, which reopens the session so the answer can still be given.
-      const run = this.store.getRun(runId);
-      for (const s of run?.steps ?? []) {
-        if (s.status === 'running' || s.status === 'waiting') {
-          this.store.updateStep(runId, s.id, { status: 'failed', finishedAt });
-        }
-      }
-      // Say what Continue will and will not do. It reopens the session through
-      // `runContinuation`, so the question can still be answered — but that is a
-      // standalone continuation, not a re-entry into `execute`, so the steps this
-      // park never reached stay `pending` and nothing will run them automatically.
-      const error =
-        'the session closed before the question was answered — continue to answer it, ' +
-        'but the remaining workflow steps will not resume automatically';
-      this.store.updateRun(runId, { status: 'failed', error, finishedAt, currentStepId: undefined });
-      emit({ type: 'lifecycle', message: `run stopped — ${error}` });
+      this.settleUnansweredPark(runId, finishedAt);
     } else {
       // Includes `askPark === 'abandoned'`: Finish on a parked run ends it the
       // way Finish always does, with the later steps left honestly at `pending`.
@@ -4449,7 +4449,7 @@ export class RunManager {
         const compacted = event.reason === 'context-compaction';
         const markerless = compacted && markerlessTurn(turnText);
         if (!compacted) state.compactionContinues = 0;
-        const done = interactive && sessionOpen && DONE_MARKER_RE.test(turnText.trimEnd());
+        const done = interactive && sessionOpen && endsWithDoneMarker(turnText);
         // The dispatch facts, through the same ONE helper `runContinuation` calls (spec
         // 2026-09-10-dispatch A5). Not gated on `interactive`: a report and a dispatch
         // are the agent telling cezar what it did, and a chained workflow's non-final step that
@@ -5042,6 +5042,30 @@ export class RunManager {
   }
 
   /**
+   * Settle a run whose session closed while it was parked for a reply that never came — a
+   * mid-workflow `CEZ:ASK` (#917) or a monitor handed to the user. `settleSuccess` would put a
+   * finished badge on work the agent said was still open; `failed` says what happened and keeps
+   * the Continue button, which reopens the session so the reply can still be given.
+   */
+  private settleUnansweredPark(runId: string, finishedAt: string): void {
+    const run = this.store.getRun(runId);
+    const stepsLeft = run?.steps.some((s) => s.status === 'pending') ?? false;
+    for (const s of run?.steps ?? []) {
+      if (s.status === 'running' || s.status === 'waiting') {
+        this.store.updateStep(runId, s.id, { status: 'failed', finishedAt });
+      }
+    }
+    // Continue reopens the session through `runContinuation`, a standalone continuation rather
+    // than a re-entry into `execute`, so steps the park never reached stay `pending`.
+    const error = stepsLeft
+      ? 'the session closed before the question was answered — continue to answer it, ' +
+        'but the remaining workflow steps will not resume automatically'
+      : 'the session closed before you replied — continue to reply';
+    this.store.updateRun(runId, { status: 'failed', error, finishedAt, currentStepId: undefined });
+    this.store.appendEvent(runId, { type: 'lifecycle', message: `run stopped — ${error}` });
+  }
+
+  /**
    * Diff-first review gate (spec 009), shared by `execute` and
    * `runContinuation`: a *successful* run whose worktree holds changes rests
    * at `review` instead of `done` — the user inspects the diff first, then
@@ -5405,13 +5429,7 @@ export class RunManager {
     }
     if ((state.monitoringWakeups ?? 0) >= MAX_AUTO_CONTINUES) {
       this.clearMonitoringWakeTimer(state, runId);
-      if (!this.store.getRun(runId)?.monitoringWakeCapReached) {
-        this.store.updateRun(runId, { monitoringWakeCapReached: true });
-        this.store.appendEvent(runId, {
-          type: 'note',
-          message: `automatic monitoring wake-up cap reached (${MAX_AUTO_CONTINUES}); session remains parked`,
-        });
-      }
+      this.monitoringWakeCapReached(runId, state);
       return;
     }
     if (state.monitoringWakeTimer && state.monitoringWakeIntervalMinutes === minutes) return;
@@ -5424,13 +5442,15 @@ export class RunManager {
       state.monitoringWakeTimer = undefined;
       this.store.updateRun(runId, { monitoringWakeAt: undefined });
       if (!this.monitoring.has(runId) || !state.session?.open || state.cancelled) return;
+      // A dispatched child's settle report wakes this run on its own; a blind re-check while
+      // one is still in flight is a model turn that can only re-park.
+      if (this.hasInFlightChildren(runId)) {
+        this.armMonitoringWakeTimer(runId, state);
+        return;
+      }
       const wakeups = state.monitoringWakeups ?? 0;
       if (wakeups >= MAX_AUTO_CONTINUES) {
-        this.store.updateRun(runId, { monitoringWakeCapReached: true });
-        this.store.appendEvent(runId, {
-          type: 'note',
-          message: `automatic monitoring wake-up cap reached (${MAX_AUTO_CONTINUES}); session remains parked`,
-        });
+        this.monitoringWakeCapReached(runId, state);
         return;
       }
       state.monitoringWakeups = wakeups + 1;
@@ -5448,6 +5468,77 @@ export class RunManager {
     state.monitoringWakeTimer = undefined;
     state.monitoringWakeIntervalMinutes = undefined;
     if (runId) this.store.updateRun(runId, { monitoringWakeAt: undefined });
+  }
+
+  /**
+   * The wake-up cap is a lifetime budget: only a user message (`sendMessage`) refills it. At the
+   * cap a run with a dispatched child still in flight stays parked for that child's report;
+   * any other run is handed to the user.
+   */
+  private monitoringWakeCapReached(runId: string, state: ActiveRun): void {
+    const awaitsChildren = this.hasInFlightChildren(runId);
+    if (!this.store.getRun(runId)?.monitoringWakeCapReached) {
+      this.store.updateRun(runId, { monitoringWakeCapReached: true });
+      if (awaitsChildren) {
+        this.store.appendEvent(runId, {
+          type: 'note',
+          message: `automatic monitoring wake-up cap reached (${MAX_AUTO_CONTINUES}); session remains parked for its dispatched tasks' reports`,
+        });
+      }
+    }
+    if (awaitsChildren) return;
+    this.parkMonitorAsWaiting(
+      runId,
+      state,
+      `automatic monitoring wake-up cap reached (${MAX_AUTO_CONTINUES}); parked for your reply`,
+    );
+  }
+
+  private armMonitoringLivenessTimer(runId: string, state: ActiveRun): void {
+    this.clearMonitoringLivenessTimer(state);
+    state.monitoringLivenessTimer = setTimeout(() => {
+      state.monitoringLivenessTimer = undefined;
+      if (!this.monitoring.has(runId) || !state.session?.open || state.cancelled) return;
+      if (this.hasInFlightChildren(runId)) {
+        this.armMonitoringLivenessTimer(runId, state);
+        return;
+      }
+      this.parkMonitorAsWaiting(
+        runId,
+        state,
+        `monitoring with no activity for ${Math.round(MONITORING_LIVENESS_MS / 60_000)}m; parked for your reply`,
+      );
+    }, MONITORING_LIVENESS_MS);
+    state.monitoringLivenessTimer.unref?.();
+  }
+
+  private clearMonitoringLivenessTimer(state: ActiveRun): void {
+    if (state.monitoringLivenessTimer) clearTimeout(state.monitoringLivenessTimer);
+    state.monitoringLivenessTimer = undefined;
+  }
+
+  private hasInFlightChildren(runId: string): boolean {
+    return inFlightChildren(this.store.listRuns(), runId).length > 0;
+  }
+
+  /**
+   * Turn a monitoring park into a `waiting` park: attention raised, the idle timer armed, the
+   * session left open so a reply still lands in it. Parked like a `CEZ:ASK` (`askPark`), so a
+   * hand-off nobody answers settles `failed` with Continue, never as a finished run.
+   */
+  private parkMonitorAsWaiting(runId: string, state: ActiveRun, message: string): void {
+    if (!this.monitoring.has(runId) || !state.session?.open || state.cancelled) return;
+    this.leaveMonitoring(runId);
+    this.clearMonitoringWakeTimer(state, runId);
+    state.askPark = 'waiting';
+    this.store.updateRun(runId, { status: 'waiting', activity: undefined, askParked: true });
+    if (state.currentStepId) this.store.updateStep(runId, state.currentStepId, { status: 'waiting' });
+    this.store.appendEvent(runId, { type: 'note', message });
+    // Deferred past a turn-end handler that re-parked straight into the cap, so this line follows
+    // its `turn complete — status=monitoring` heartbeat instead of preceding it.
+    queueMicrotask(() => appendHandoffHeartbeat(this.dataDir, runId, 'monitoring ended — status=waiting'));
+    this.armIdleTimer(runId, state);
+    this.releaseSlot();
   }
 
   /** Autosave-commit the worktree every 90 s while the run lives (spec 006).

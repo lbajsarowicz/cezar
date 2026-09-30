@@ -4,14 +4,14 @@
 
 ## TLDR
 
-Durable bounded monitoring can wait indefinitely at zero model cost, but some stabilization workflows need the agent to re-check CI and continue as soon as it changes. Add an optional workspace wake interval that sends the same live agent a backend-neutral follow-up every N minutes after it emits `CEZ:MONITORING`. Parked mode stays the default; interval mode is explicitly cost-bearing, never overlaps turns, and stops after 40 automatic wakeups per monitoring epoch.
+Durable bounded monitoring waits at zero model cost for up to 60 minutes before the run is handed to the user, but some stabilization workflows need the agent to re-check CI and continue as soon as it changes. Add an optional workspace wake interval that sends the same live agent a backend-neutral follow-up every N minutes after it emits `CEZ:MONITORING`. Parked mode stays the default; interval mode is explicitly cost-bearing, never overlaps turns, and stops after 40 automatic wakeups per monitoring epoch.
 
 ## Resolved assumptions (autonomous defaults)
 
 | # | Question | Applied default | Why | Confirm? |
 |---|----------|-----------------|-----|----------|
 | Q1 | Fixed or adaptive cadence? | Fixed 1–60 minute interval; first opt-in starts at 5 minutes. | It is predictable across backends and easy to explain, test, and budget. | ok |
-| Q2 | Default behavior? | `monitoringWakeIntervalMinutes: null` means park until externally resumed. | Zero surprise and zero model spend remain the zero-config behavior. | ok |
+| Q2 | Default behavior? | `monitoringWakeIntervalMinutes: null` means park with no automatic wake-ups. The park is bounded: after 60 minutes with no child in flight the run is handed to the user as `waiting`, and a hand-off nobody answers within the 15-minute idle timeout settles `failed` with Continue (75 minutes in total). | Zero model spend stays the zero-config behavior, and no park is left without an exit that needs no human. | ok |
 | Q3 | Native backend scheduler or cezar timer? | Cezar timer using `AgentSession.sendMessage`. | Claude has `/loop`, but Codex CLI/app-server has no documented equivalent; parity belongs at the runner seam. | ok |
 | Q4 | Safety bound? | 40 automatic wakeups per monitoring epoch. | Reuses cezar's existing autonomous continuation ceiling and prevents forgotten loops from spending indefinitely. | ok |
 
@@ -31,11 +31,14 @@ The shared subset is small: schedule while idle, send a normal follow-up into th
 
 Add nullable workspace resource `monitoringWakeIntervalMinutes`:
 
-- `null` (default): durable monitoring remains parked until user/external input;
+- `null` (default): durable monitoring stays parked with no automatic wake-ups until user/external input, a dispatched child's report, or the liveness bound below;
 - integer 1–60: after a turn parks with `CEZ:MONITORING`, schedule a wake after N minutes;
 - wake prompt: “Re-check the downstream work you were monitoring. Continue toward the task goal; emit `CEZ:MONITORING` again only if it is still pending.”;
 - when the next turn monitors again, schedule one new timer;
-- after 40 automatic wakeups in the current monitoring epoch, remain parked and emit a lifecycle note; a real user follow-up starts a new epoch.
+- after 40 automatic wakeups in the current monitoring epoch, emit a lifecycle note and hand the run to the user as an ordinary `waiting` park (idle timer armed, session left open for a reply); a run with a dispatched child still in flight stays parked for that child's report instead. A real user follow-up starts a new epoch; a child's report does not;
+- while a dispatched child is in flight, a due wake-up is skipped (not counted) and re-armed: the child's settle report wakes the run on its own;
+- a monitoring park with nothing in flight that hears nothing for `MONITORING_LIVENESS_MS` (4 × the 15-minute idle timeout) is handed to the user as `waiting` the same way, which is the bound when the interval is null;
+- a hand-off is parked like a mid-workflow `CEZ:ASK` (`askParked`): when the idle timer closes the session without a reply, the run settles `failed` ("the session closed before you replied — continue to reply") with the Continue button, never `done`/`review` on work the agent said was still pending. A cezar restart settles a handed-off run `failed` the same way. Total fuse on the zero-config path: 60 + 15 = 75 minutes in park mode, 40 × 5 + 15 = 215 minutes at the 5-minute interval.
 
 Immediate autonomous mode keeps precedence and existing behavior. The timed mode starts only after the run actually parks as monitoring, including after immediate autonomous continuation reaches its own cap.
 
@@ -90,7 +93,7 @@ When a run has `status: running`, `activity: monitoring`, and `monitoringWakeAt`
 - supporting relative text may update client-side (for example, **in 4m 12s**) but the absolute timestamp remains visible and is the accessible name/source of truth;
 - no refetch interval is added—the existing global run event updates the field when a timer is scheduled, replaced, fired, or cancelled.
 
-Monitoring without a scheduled wake shows **Parked — no automatic check scheduled** rather than inventing a time. After the 40-wakeup cap it shows **Automatic checks paused — 40/40 reached**. During an automatic turn, `activity` and `monitoringWakeAt` are cleared, so a stale deadline is never displayed while the agent is active. Invalid timestamps degrade to the parked copy and never render `Invalid Date`.
+Monitoring without a scheduled wake shows **Parked — no automatic check scheduled** rather than inventing a time. After the 40-wakeup cap a childless run leaves monitoring for `waiting`, so the monitoring schedule line disappears with it; **Automatic checks paused — 40/40 reached** is shown only for a run that reached the cap while a dispatched child is still in flight and stays monitoring for that child's report. During an automatic turn, `activity` and `monitoringWakeAt` are cleared, so a stale deadline is never displayed while the agent is active. Invalid timestamps degrade to the parked copy and never render `Invalid Date`.
 
 The same deadline should appear in the compact run status/header when space permits; on mobile it wraps beneath the monitoring pill. It must not exist only as a tooltip, and screen readers should announce a changed deadline through the existing status region without a continuously ticking live announcement.
 
@@ -103,7 +106,7 @@ The same deadline should appear in the compact run status/header when space perm
 - Refreshing or opening the session on another browser reconstructs the same exact deadline from `RunRecord.monitoringWakeAt`.
 - A slow agent turn cannot overlap the cadence; no timer exists during the turn.
 - A timer racing with terminal state re-checks synchronously and becomes a no-op.
-- Wake #40 runs normally; if it monitors again, cezar parks it without timer and emits the cap note.
+- Wake #40 runs normally; if it monitors again, cezar emits the cap note and parks it `waiting` (or keeps it monitoring while a dispatched child is in flight).
 - A user message resets the epoch; a config refresh alone does not.
 - Backend disconnect uses the existing visible error/terminal path.
 - Cezar restart does not promise vendor-process resurrection or missed-wake replay.
