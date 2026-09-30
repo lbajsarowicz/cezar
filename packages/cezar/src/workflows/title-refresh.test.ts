@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -129,6 +129,23 @@ describe('live title refresh: namer calls per turn', () => {
     await expect.poll(() => counters.prompts.length, { timeout: 10_000 }).toBe(TURNS);
     expect(counters.discoverSkills).toBe(0);
     expect(counters.prompts.every((p) => p.includes('Skill description: SNAPSHOT DESCRIPTION'))).toBe(true);
+    (manager as unknown as Seam).active.delete(runId);
+  });
+
+  it('an EMPTY skills snapshot (failed discovery) rescans instead of dropping the description', async () => {
+    process.env.CEZ_TITLE_UPDATES = '1';
+    mkdirSync(join(repoRoot, '.ai/skills'), { recursive: true });
+    writeFileSync(
+      join(repoRoot, '.ai/skills/om-auto-review-pr.md'),
+      '---\nname: om-auto-review-pr\ndescription: FRESH SCAN DESCRIPTION\n---\nbody\n',
+    );
+    const runId = namerOwnedRun();
+    // What runContinuation leaves behind when its one discovery call throws: [].
+    (manager as unknown as Seam).active.set(runId, { skills: [] });
+    await turns(runId);
+    await expect.poll(() => counters.prompts.length, { timeout: 10_000 }).toBe(TURNS);
+    expect(counters.discoverSkills).toBeGreaterThan(0);
+    expect(counters.prompts.every((p) => p.includes('Skill description: FRESH SCAN DESCRIPTION'))).toBe(true);
     (manager as unknown as Seam).active.delete(runId);
   });
 });

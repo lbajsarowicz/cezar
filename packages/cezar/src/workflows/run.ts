@@ -4918,7 +4918,10 @@ export class RunManager {
     try {
       let skillDescription: string | undefined;
       if (skillName) {
-        const skills = knownSkills ?? (await discoverSkills(this.repoRoot).catch(() => [] as Skill[]));
+        // An EMPTY snapshot is the failure sentinel runContinuation writes when discovery
+        // throws, not "this repo has no skills" — a real empty catalog costs one rescan here,
+        // a dropped description costs the namer context for the rest of the run.
+        const skills = knownSkills?.length ? knownSkills : await discoverSkills(this.repoRoot).catch(() => [] as Skill[]);
         skillDescription = skills.find((s) => s.name === skillName)?.description;
       }
       const result = await generateRunName(this.repoRoot, { task, skillName, skillDescription, ...live });

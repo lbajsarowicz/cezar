@@ -13,11 +13,28 @@ export interface HostProbeCache<T> {
   invalidate(): void;
 }
 
+export interface HostProbeCacheOptions {
+  /** Clock injection for tests. */
+  now?: () => number;
+  /**
+   * Hard ceiling on staleness, a different job from the TTL. The TTL decides how often a
+   * revalidation is kicked off; on its own it bounds nothing, because that revalidation is
+   * fire-and-forget. A reader that arrives after a long idle gap — the normal state of a
+   * background server is that nothing calls `get()` — would be answered from the last compute
+   * however old it is. Past this age `get()` waits for the recompute instead, so the FIRST
+   * read after hours of idling is already fresh rather than one read behind. Must be `>= ttlMs`;
+   * the gap between them is the window in which stale is served while a refresh runs.
+   */
+  maxStaleMs: number;
+}
+
 export function createHostProbeCache<T>(
   compute: () => Promise<T>,
   ttlMs: number,
-  now: () => number = Date.now,
+  options: HostProbeCacheOptions,
 ): HostProbeCache<T> {
+  const now = options.now ?? Date.now;
+  const { maxStaleMs } = options;
   let completed: { at: number; value: T } | undefined;
   let inFlight: Promise<T> | undefined;
   let generation = 0;
@@ -33,7 +50,12 @@ export function createHostProbeCache<T>(
         return value;
       },
       (err: unknown) => {
-        if (mine === generation) inFlight = undefined;
+        if (mine === generation) {
+          // Keep serving the last good value, but push the next attempt out by a full TTL:
+          // a persistently failing probe must not restart on every read of a warm cache.
+          if (completed) completed = { at: now(), value: completed.value };
+          inFlight = undefined;
+        }
         throw err;
       },
     );
@@ -43,11 +65,16 @@ export function createHostProbeCache<T>(
 
   return {
     get() {
-      if (completed) {
-        if (now() - completed.at >= ttlMs && !inFlight) void track(compute()).catch(() => {});
-        return Promise.resolve(completed.value);
+      if (!completed) return inFlight ?? track(compute());
+      const stale = completed.value;
+      const age = now() - completed.at;
+      if (age >= ttlMs && !inFlight) void track(compute()).catch(() => {});
+      if (age >= maxStaleMs) {
+        // Past the ceiling, correctness beats latency: wait for the recompute — but never
+        // let a failing probe turn a health read into an error, so fall back to the old value.
+        return (inFlight ?? track(compute())).catch(() => stale);
       }
-      return inFlight ?? track(compute());
+      return Promise.resolve(stale);
     },
     seed(pending) {
       if (completed || inFlight) return;

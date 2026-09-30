@@ -378,6 +378,10 @@ export const configResponseSchema = z.object({
   worktreeRetention: z.number(),
   /** Live title updates: null = no config key, the `CEZ_TITLE_UPDATES` env default (OFF) decides. */
   liveTitleUpdates: z.boolean().nullable(),
+  /** The switch's effective state once `liveTitleUpdates` is folded with the `CEZ_TITLE_UPDATES`
+   *  env default — what the feature actually does, which is what the Settings switch must show
+   *  (otherwise a null key with the env opt-in renders "Off" while the refresh is running). */
+  effectiveLiveTitleUpdates: z.boolean(),
   /** Optional review gate (#489): null = no config key, the `CEZ_REVIEW_GATE` env default (OFF)
    *  decides. */
   reviewGate: z.boolean().nullable(),

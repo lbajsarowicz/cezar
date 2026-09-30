@@ -147,4 +147,15 @@ describe('health host probes (live-server path)', () => {
     }
     expect({ detect: counters.detect - before.detect, repoInfo: counters.repoInfo - before.repoInfo }).toEqual({ detect: 1, repoInfo: 1 });
   }, 60_000);
+
+  it('an idle serve answers the first read past the ceiling fresh, not one read behind it', async () => {
+    const app = build();
+    await vi.waitFor(async () => expect((await health(app)).repo).not.toBeNull(), { timeout: 30_000, interval: 50 });
+    const before = counters.detect;
+    await run('git', ['remote', 'add', 'origin', 'https://github.com/example/late.git'], { cwd: repoRoot });
+    vi.setSystemTime(Date.now() + 60 * 60_000);
+    // The host facts sat unread for an hour. This ONE read must observe them, not the next one.
+    expect((await health(app)).repo?.remote).toBe('https://github.com/example/late.git');
+    expect(counters.detect).toBe(before + 1);
+  }, 60_000);
 });
