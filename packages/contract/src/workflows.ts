@@ -33,6 +33,9 @@ export const workflowStepDefSchema = z
     bashAllowlist: z.array(z.string()).optional(),
     // check step
     command: z.string().optional(),
+    /** Kill the check's whole process tree and fail the step after this long (default 30 min).
+     *  Capped at the largest delay `setTimeout` honours; above it Node fires after 1 ms. */
+    timeoutMs: z.number().int().positive().max(2_147_483_647).optional(),
     onFail: z
       .object({
         retry: z.string().min(1),

@@ -2,6 +2,7 @@
 import { parseArgs } from 'node:util';
 import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:net';
+import { constants as osConstants } from 'node:os';
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +43,7 @@ import { runProjectsCommand } from './workspace/projects-cli.ts';
 import { WorkspaceSemaphore } from './workspace/semaphore.ts';
 import { runTaskCommand } from './dispatch/task-cli.ts';
 import { runAutomationCommand } from './automations/automation-cli.ts';
+import { killLiveChecks } from './workflows/check-step.ts';
 
 import { runTrackerConnectionsCommand } from './server/tracker/connections-cli.ts';
 
@@ -339,11 +341,13 @@ async function serveCommand(
   await printSkillsBanner(repoRoot);
 
   const shutdown = () => {
+    killLiveChecks();
     store.flush();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  process.on('SIGHUP', shutdown);
   // Under the desktop shell a managed install may exist without launchers (the shell installs
   // cezar itself on first launch, spec 2026-09-25-desktop-distribution): write them so
   // `cezar` in a terminal works too. Idempotent; never touches the shell profile.
@@ -487,6 +491,13 @@ async function runCommand(
   const semaphore = new WorkspaceSemaphore();
   await semaphore.refresh();
   const manager = new RunManager(store, repoRoot, { semaphore });
+  // Check steps run in their own process group, out of reach of the terminal's Ctrl-C.
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.once(signal, () => {
+      killLiveChecks();
+      process.exit(128 + osConstants.signals[signal]);
+    });
+  }
 
   store.on('event', ({ event }) => {
     switch (event.type) {
