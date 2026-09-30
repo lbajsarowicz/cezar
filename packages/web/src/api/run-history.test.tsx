@@ -3,8 +3,9 @@ import { act, renderHook, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { RunHistoryContext, RunHistoryPage } from '@open-mercato/cezar-api-client'
+import type { ApiRun, RunHistoryContext, RunHistoryPage, RunRecord } from '@open-mercato/cezar-api-client'
 import { getRunHistory, getRunHistoryContext } from './client'
+import { queryKeys } from './queries'
 import { coveredLiveEventSeqs, mergeRunHistoryEvents, useRunHistory } from './run-history'
 
 vi.mock('./client', () => ({
@@ -126,6 +127,33 @@ describe('useRunHistory', () => {
     )
     await waitFor(() => expect(result.current.visibleEvents.at(-1)?.seq).toBe(250))
     expect(result.current.currentEvents.map(({ seq }) => seq)).toEqual([90, 250])
+    vi.unstubAllGlobals()
+  })
+
+  it('keeps an open run detail whole from the per-run stream\'s own run frame', async () => {
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
+    mockHistory.mockResolvedValue(page(100))
+    mockContext.mockResolvedValue(context())
+    const { client, wrapper } = harness()
+    const cached: ApiRun = {
+      id: 'run-1', title: 'run-1', workflow: 'quick-task', task: 'first', status: 'queued',
+      createdAt: '2026-07-30T00:00:00.000Z', tokensUsed: 0, archived: false, steps: [],
+      queuedMessages: [{ id: 'q1', text: 'more', createdAt: '2026-07-30T00:00:00.000Z' }],
+      usage: { cpuPct: 1, rssBytes: 2, procCount: 3 },
+    }
+    client.setQueryData(queryKeys.runs.detail('run-1'), cached)
+    renderHook(() => useRunHistory('run-1'), { wrapper })
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1))
+
+    const { queuedMessages: _q, usage: _u, ...dequeued } = cached
+    const steps: RunRecord['steps'] = [{ id: 'agent', name: 'agent', kind: 'agent', status: 'running', iterations: 1, tokensUsed: 0 }]
+    act(() => FakeEventSource.instances[0]!.emit('run', JSON.stringify({ ...dequeued, status: 'running', steps })))
+
+    const detail = client.getQueryData<ApiRun>(queryKeys.runs.detail('run-1'))
+    expect(detail).toMatchObject({ status: 'running', steps, usage: cached.usage })
+    expect(detail).not.toHaveProperty('queuedMessages')
+    expect(client.getQueryData(queryKeys.runs.detail('other'))).toBeUndefined()
     vi.unstubAllGlobals()
   })
 

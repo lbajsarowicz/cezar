@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createUsageStore, type UsageStore } from './events'
 import { GlobalEventsProvider, useGlobalEvents, useRunUsage, useUsage } from './global-events'
-import { setApiScope } from '@open-mercato/cezar-api-client'
+import { setApiScope, WORKSPACE_RUN_EVENT_OMITTED_KEYS } from '@open-mercato/cezar-api-client'
 import { createQueryClient } from './query-client'
 import { queryKeys, useProviderStatus, useRuns, useTodos, workspaceQueryKeys } from './queries'
 import { RUN_EVENT_BATCH_MS } from './run-events'
@@ -122,6 +122,13 @@ const CONNECTED_PROVIDERS: ProviderStatusResponse = {
  *  stamp riding along, which the parser strips back off before the reducers see it. */
 function stampedRun(record: RunRecord, project = BOOT): string {
   return JSON.stringify({ ...record, project })
+}
+
+/** A `run` frame exactly as the workspace stream sends it now: the thread-only keys left off. */
+function slimRun(record: RunRecord, project = BOOT): string {
+  const frame: Record<string, unknown> = { ...record, project }
+  for (const key of WORKSPACE_RUN_EVENT_OMITTED_KEYS) delete frame[key]
+  return JSON.stringify(frame)
 }
 
 async function flushRunEvents(): Promise<void> {
@@ -359,6 +366,65 @@ describe('useGlobalEvents — run events', () => {
     expect(detail?.usage).toEqual(SAMPLE)
     // r2 was never opened: a summary must not masquerade as a fetched detail.
     expect(client.getQueryData(queryKeys.runs.detail('r2'))).toBeUndefined()
+  })
+
+  it('patches a cached row and detail from a slim frame, keeping what the frame leaves out', async () => {
+    const steps: RunRecord['steps'] = [{ id: 'agent', name: 'agent', kind: 'agent', status: 'running', iterations: 1, tokensUsed: 5 }]
+    const cached = runRecord('r1', { task: 'the prompt', steps, activity: 'monitoring', error: 'old' })
+    client.setQueryData<ApiRun[]>(queryKeys.runs.list(), [cached])
+    client.setQueryData<ApiRun>(queryKeys.runs.detail('r1'), { ...cached, usage: SAMPLE })
+    const { source } = mount()
+
+    source.emit('run', slimRun(runRecord('r1', { status: 'done', tokensUsed: 7 })))
+    await flushRunEvents()
+
+    for (const row of [
+      client.getQueryData<ApiRun[]>(queryKeys.runs.list())?.[0],
+      client.getQueryData<ApiRun>(queryKeys.runs.detail('r1')),
+    ]) {
+      expect(row).toMatchObject({ status: 'done', tokensUsed: 7, task: 'the prompt', steps })
+      expect(row).not.toHaveProperty('activity')
+      expect(row).not.toHaveProperty('error')
+    }
+    expect(client.getQueryData<ApiRun>(queryKeys.runs.detail('r1'))?.usage).toEqual(SAMPLE)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('refetches the list for a slim frame about a run it never held, instead of inventing a row', async () => {
+    vi.useFakeTimers()
+    client.setQueryData<ApiRun[]>(queryKeys.runs.list(), [runRecord('r0')])
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+    const { source } = mount()
+
+    source.emit('run', slimRun(runRecord('r1', { status: 'queued' })))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(450)
+    })
+
+    expect(client.getQueryData<ApiRun[]>(queryKeys.runs.list())?.map((row) => row.id)).toEqual(['r0'])
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.runs.list(), exact: true })
+  })
+
+  it('asks for the list once for a new run whose frames land in separate batches', async () => {
+    vi.useFakeTimers()
+    client.setQueryData<ApiRun[]>(queryKeys.runs.list(), [runRecord('r0')])
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+    const { source } = mount()
+    const listRefetches = () =>
+      invalidate.mock.calls.filter(([filters]) =>
+        JSON.stringify(filters?.queryKey) === JSON.stringify(queryKeys.runs.list())).length
+
+    for (const status of ['queued', 'running', 'running'] as const) {
+      source.emit('run', slimRun(runRecord('r1', { status })))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RUN_EVENT_BATCH_MS + 5)
+      })
+    }
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(450)
+    })
+
+    expect(listRefetches()).toBe(1)
   })
 
   it('invalidates the changes cache on a run event so an ended run’s final writes appear (#488)', async () => {

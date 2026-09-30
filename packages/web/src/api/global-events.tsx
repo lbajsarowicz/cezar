@@ -13,6 +13,7 @@ import {
 import {
   applyRunDeleted,
   applyRunEvent,
+  isFullRunRecord,
   createUsageStore,
   EMPTY_USAGE,
   mergeRun,
@@ -142,6 +143,29 @@ function createRunsIndexRefresher(queryClient: QueryClient): {
   }
 }
 
+/** One `GET /runs` per quiet moment for slim frames about runs the list does not hold yet: a new
+ *  run's create → queued → running frames land in separate batches, and each would otherwise
+ *  restart the refetch. The fetch runs after the window, so it answers with every frame in it. */
+function createRunsListRefresher(queryClient: QueryClient): {
+  request: () => void
+  cancel: () => void
+} {
+  let pending: ReturnType<typeof setTimeout> | undefined
+  return {
+    request() {
+      if (pending !== undefined) return
+      pending = setTimeout(() => {
+        pending = undefined
+        void queryClient.invalidateQueries({ queryKey: queryKeys.runs.list(), exact: true })
+      }, RUNS_INDEX_REFRESH_DEBOUNCE_MS)
+    },
+    cancel() {
+      clearTimeout(pending)
+      pending = undefined
+    },
+  }
+}
+
 function projectCacheScopes(queryClient: QueryClient, project: string): string[] {
   let bootProject: string | undefined
   for (const query of queryClient.getQueryCache().getAll()) {
@@ -237,6 +261,7 @@ function createRunEventBatcher(
   queryClient: QueryClient,
   usage: UsageStore,
   onDroppedProject: (project: string) => void,
+  onUnknownRun: () => void,
 ): {
   onEvent: (event: Extract<GlobalEvent, { type: 'run' | 'run-deleted' }>, project: string) => void
   beginReconcile: () => void
@@ -260,7 +285,7 @@ function createRunEventBatcher(
     for (const queued of events.values()) {
       // The route can change while the 50 ms window is open. Never resolve the cache keys from
       // the new scope for an event that arrived under the old one.
-      if (queued.project === project) applyGlobalEvent(queryClient, usage, queued.event)
+      if (queued.project === project) applyGlobalEvent(queryClient, usage, queued.event, onUnknownRun)
       else onDroppedProject(queued.project)
     }
   }
@@ -383,10 +408,22 @@ function activeProject(queryClient: QueryClient): string | undefined {
 
 /** Fold one stream message into the cache. The reducers it calls are pure and table-tested in
  *  events.ts; this is only the wiring from an event to the cache it belongs in. */
-function applyGlobalEvent(queryClient: QueryClient, usage: UsageStore, event: GlobalEvent): void {
+function applyGlobalEvent(
+  queryClient: QueryClient,
+  usage: UsageStore,
+  event: GlobalEvent,
+  onUnknownRun: () => void,
+): void {
   switch (event.type) {
     case 'run': {
-      queryClient.setQueryData<ApiRun[]>(queryKeys.runs.list(), (list) => applyRunEvent(list, event.run))
+      const listKey = queryKeys.runs.list()
+      const list = queryClient.getQueryData<ApiRun[]>(listKey)
+      if (list && !isFullRunRecord(event.run) && !list.some((row) => row.id === event.run.id)) {
+        // A run this list never held arrives as a slim frame, which is not a row: ask for one.
+        onUnknownRun()
+      } else {
+        queryClient.setQueryData<ApiRun[]>(listKey, (current) => applyRunEvent(current, event.run))
+      }
       // Only a detail cache that exists: `setQueryData` would happily create one, leaving an entry
       // for a run nobody opened — and, worse, one built from a summary rather than from
       // `GET /api/runs/:id`, which the next reader would then be served as if it were fetched.
@@ -464,11 +501,13 @@ export function useGlobalEvents(usage: UsageStore, url: string = SSE_URL): void 
       dashboardMax ??= setTimeout(refreshDashboard, 1000)
     }
     const runsIndexRefresher = createRunsIndexRefresher(queryClient)
+    const runsListRefresher = createRunsListRefresher(queryClient)
     const inactiveProjectRefresher = createInactiveProjectRefresher(queryClient)
     const runEventBatcher = createRunEventBatcher(
       queryClient,
       usage,
       inactiveProjectRefresher.onEvent,
+      runsListRefresher.request,
     )
     let reopenTimer: ReturnType<typeof setTimeout> | undefined
     let everOpened = false
@@ -630,7 +669,7 @@ export function useGlobalEvents(usage: UsageStore, url: string = SSE_URL): void 
           } else if (parsed.event.type === 'todos' && reconciliationDepth > 0) {
             if (parsed.project !== null) pendingTodos.add(parsed.project)
           } else {
-            applyGlobalEvent(queryClient, usage, parsed.event)
+            applyGlobalEvent(queryClient, usage, parsed.event, runsListRefresher.request)
           }
         })
       }
@@ -764,6 +803,7 @@ export function useGlobalEvents(usage: UsageStore, url: string = SSE_URL): void 
       dashboardLive.connected(false)
       clearTimeout(dashboardTimer); clearTimeout(dashboardMax)
       runsIndexRefresher.cancel()
+      runsListRefresher.cancel()
       inactiveProjectRefresher.cancel()
       runEventBatcher.cancel()
       pendingTodos.clear()
