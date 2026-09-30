@@ -205,6 +205,28 @@ describe('a parked monitor always has an exit', () => {
     expect(reopened.getRun(id)?.error).toContain('waiting for an answer');
   }, 30_000);
 
+  it('reports a handed-off dispatched child to its parent after a restart', async () => {
+    boot(null);
+    const parentId = await startMonitor('mock:monitoring wait for the child');
+    const childId = addChild(parentId, 'waiting');
+    store.updateRun(childId, { askParked: true });
+    // Keep the parent out of `recover`'s own live set so only the child's settlement is under test.
+    store.updateRun(parentId, { status: 'cancelled' });
+    store.flush();
+
+    const reopened = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    const restarted = new RunManager(reopened, repoRoot, {
+      semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 0 } }),
+    });
+    await restarted.recover();
+    restarted.dispose();
+    expect(reopened.getRun(childId)?.status).toBe('failed');
+    expect(reopened.getRun(childId)?.error).toContain('waiting for an answer');
+    expect(
+      reopened.getRun(parentId)?.dispatch?.pendingReports?.some((r) => r.fromRunId === childId),
+    ).toBe(true);
+  }, 30_000);
+
   it('hands the run to the user at the wake-up cap instead of leaving it open with no timer', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
     boot(5);
@@ -290,12 +312,30 @@ describe('a parked monitor always has an exit', () => {
     expect(notes(id).some((n) => n.startsWith('automatic monitoring wake-up ('))).toBe(false);
     expect(store.getRun(id)?.activity).toBe('monitoring');
     expect(stateOf(id)?.monitoringWakeTimer).toBeDefined();
-    expect(stateOf(id)?.monitoringLivenessTimer).toBeDefined();
+    // A configured interval IS the exit, so no park-mode liveness timer competes with it.
+    expect(stateOf(id)?.monitoringLivenessTimer).toBeUndefined();
+    // The re-armed check is a fallback the child's report will pre-empt; it must not show as a
+    // promised deadline in the cockpit.
+    expect(store.getRun(id)?.monitoringWakeAt).toBeUndefined();
+  }, 30_000);
+
+  it('wakes at the maximum interval instead of being pre-empted by the liveness bound', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+    boot(60);
+    const id = await startMonitor('mock:monitoring-sticky watch CI at the slowest cadence');
+    expect(stateOf(id)?.monitoringWakeTimer).toBeDefined();
+    expect(stateOf(id)?.monitoringLivenessTimer).toBeUndefined();
+
+    vi.advanceTimersByTime(60 * 60_000);
+    await waitFor(id, () => notes(id).some((n) => n === `automatic monitoring wake-up (1/${MAX_AUTO_CONTINUES})`));
+    await waitFor(id, (r) => r?.activity === 'monitoring');
+    expect(store.getRun(id)?.status).toBe('running');
   }, 30_000);
 
   it('a user message still resumes a parked monitor and clears its liveness timer', async () => {
-    boot();
+    boot(null);
     const id = await startMonitor();
+    expect(stateOf(id)?.monitoringLivenessTimer).toBeDefined();
     expect(manager.sendMessage(id, [{ type: 'text', text: 'thanks, carry on' }])).toBe(true);
     expect(stateOf(id)?.monitoringLivenessTimer).toBeUndefined();
     await waitFor(id, (r) => r?.status === 'waiting');

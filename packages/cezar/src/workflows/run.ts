@@ -1694,6 +1694,9 @@ export class RunManager {
             type: 'lifecycle',
             message: 'cezar restarted — the task was waiting for your answer; continue it to reply',
           });
+          // Same as the settled branch below: this terminal transition never passes through
+          // `dropActive`, so a handed-off child still owes its parent a report.
+          this.reportSettledChildToParent(run.id);
           continue;
         }
         for (const step of run.steps) {
@@ -5425,8 +5428,14 @@ export class RunManager {
     const minutes = this.semaphore.monitoringWakeIntervalMinutes();
     if (minutes === null) {
       this.clearMonitoringWakeTimer(state, runId);
+      // Reconcile can be reached on any pump, so arm only a park that has none — a pump must not
+      // push the liveness deadline out from under an already-bounded park.
+      if (!state.monitoringLivenessTimer) this.armMonitoringLivenessTimer(runId, state);
       return;
     }
+    // An interval IS the exit, so a configured run must not also carry the liveness bound; see
+    // `armMonitoringLivenessTimer` for why the two cannot coexist.
+    this.clearMonitoringLivenessTimer(state);
     if ((state.monitoringWakeups ?? 0) >= MAX_AUTO_CONTINUES) {
       this.clearMonitoringWakeTimer(state, runId);
       this.monitoringWakeCapReached(runId, state);
@@ -5446,6 +5455,9 @@ export class RunManager {
       // one is still in flight is a model turn that can only re-park.
       if (this.hasInFlightChildren(runId)) {
         this.armMonitoringWakeTimer(runId, state);
+        // The child's report is what wakes this run; the re-armed timer is a fallback, so the
+        // cockpit must not promise a scheduled check that a report will pre-empt.
+        this.store.updateRun(runId, { monitoringWakeAt: undefined });
         return;
       }
       const wakeups = state.monitoringWakeups ?? 0;
@@ -5496,6 +5508,11 @@ export class RunManager {
 
   private armMonitoringLivenessTimer(runId: string, state: ActiveRun): void {
     this.clearMonitoringLivenessTimer(state);
+    // With a wake interval configured, a wake-up turn re-parks and resets this timer, so at the
+    // interval's maximum (60m) the two would fire together and the liveness hand-off would win —
+    // disabling the configured re-checks. Liveness therefore bounds only a park-mode (null) run;
+    // an interval-configured run exits on its wake-up cap instead.
+    if (this.semaphore.monitoringWakeIntervalMinutes() !== null) return;
     state.monitoringLivenessTimer = setTimeout(() => {
       state.monitoringLivenessTimer = undefined;
       if (!this.monitoring.has(runId) || !state.session?.open || state.cancelled) return;

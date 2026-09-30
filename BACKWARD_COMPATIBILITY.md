@@ -232,6 +232,16 @@ inert prose to older cezars, which is the property that keeps the vocabulary for
 Required path for a change: keep parsing the old spelling for at least one minor release while
 the instructions emit the new one.
 
+`CEZ:MONITORING` bound (recorded 2026-09-30). A monitoring park is no longer open-ended. With a
+wake interval configured, cez wakes the run on that cadence and, once the automatic-wakeup cap is
+reached, hands it to the user as an ordinary `waiting` park; with the interval `null` (park mode)
+it does the same after `MONITORING_LIVENESS_MS` (60 minutes). A hand-off the user does not answer
+before the idle timeout closes the session settles the run `failed` with Continue — never `done`
+or `review` on work the agent said was still pending — and a cezar restart settles a handed-off
+run `failed` the same way. The marker keeps its meaning ("still working on my own downstream work,
+not waiting on the user"); only the boundedness of the park changed, and the agent-facing text in
+`handoff.ts` and `dispatch/prompts.ts` now states the bound so an emitting agent knows it.
+
 ## 9. `~/.cezar/` per-user workspace files (`packages/cezar/src/workspace/`, `packages/cezar/src/paths.ts`)
 
 The multi-project workspace (spec `.ai/specs/2026-07-20-multi-project-workspace.md`) adds per-user state next to the per-repo files in section 3. Same contract, one extra twist: these files are shared by **every** cezar the user runs across all their repos, so an old CLI and a new one routinely read and write the *same file* — the `.passthrough()` rule cuts both ways (an **older writer must not lose keys a newer version wrote**, not just vice versa). All paths hang off `cezarHomeDir()`, so the `CEZ_HOME` override applies (tests and containers must pin it and never touch a real home).
