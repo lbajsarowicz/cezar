@@ -519,7 +519,24 @@ function pruneSettledHistory(fold: ContextFold): void {
   const { roots, children, rootsByTurn, boundaries } = fold;
   const rootTurns = [...rootsByTurn.keys()].sort((a, b) => a - b);
   const latestRootTurn = rootTurns.at(-1);
-  if (latestRootTurn === undefined) return;
+  if (latestRootTurn === undefined) {
+    // No fan-out bounds carry-over, so the only episode is the current turn. Without this a run
+    // that never opens a subagent retains every turn boundary — and every orphan child — for as
+    // long as the fold is cached, which is the process lifetime. Children are already absent from
+    // the emitted context with no retained root, so only the boundary window is observable.
+    let turnStart = -1;
+    for (let index = boundaries.length - 1; index >= 0; index -= 1) {
+      const boundary = boundaries[index];
+      if (boundary === undefined) break;
+      if (boundary.type === 'user-message' || boundary.type === 'turn.started') {
+        turnStart = index;
+        break;
+      }
+    }
+    if (turnStart > 0) boundaries.splice(0, turnStart);
+    children.clear();
+    return;
+  }
   let pruneThrough: number | undefined;
   for (let index = rootTurns.length - 2; index >= 0; index -= 1) {
     const candidate = rootTurns[index]!;
@@ -678,6 +695,12 @@ interface ContextCacheEntry {
 const contextCache = new Map<string, ContextCacheEntry>();
 const contextReads = new Map<string, Promise<RunHistoryContext>>();
 
+/** Test seam: the fold cache is module-global, so a suite asserting hits or eviction starts clean. */
+export function __clearContextCacheForTests(): void {
+  contextCache.clear();
+  contextReads.clear();
+}
+
 async function readProbe(filePath: string, end: number): Promise<Buffer> {
   const length = Math.min(CONTEXT_PROBE_BYTES, end);
   if (length === 0) return Buffer.alloc(0);
@@ -713,28 +736,39 @@ async function deriveCachedContext(
     return { ...cached.result, contextEvents: [...cached.result.contextEvents] };
   }
   try {
-    const resumable = cached !== undefined
-      && cached.ino === current.ino
-      && current.size >= cached.end
-      && (await readProbe(filePath, cached.end)).equals(cached.probe);
-    const fold = resumable ? cached.fold : createContextFold();
-    const { end, bytesRead } = await foldLinesFrom(filePath, resumable ? cached.end : 0, (event) =>
-      foldContextEvent(fold, event),
-    );
+    let resumeProbeBytes = 0;
+    let resumable = false;
+    if (cached !== undefined && cached.ino === current.ino && current.size >= cached.end) {
+      const probe = await readProbe(filePath, cached.end);
+      resumeProbeBytes = probe.length;
+      resumable = probe.equals(cached.probe);
+    }
+    const fold = resumable && cached !== undefined ? cached.fold : createContextFold();
+    const start = resumable && cached !== undefined ? cached.end : 0;
+    const { end, bytesRead } = await foldLinesFrom(filePath, start, (event) => foldContextEvent(fold, event));
     const result = finishContextFold(fold);
     // A line appended between the stat and the fold puts `end` past `size`: the next call misses the
     // cheap hit and resumes through the probe, which is still correct.
+    const tailProbe = await readProbe(filePath, end);
     contextCache.set(filePath, {
       ino: current.ino,
       size: current.size,
       mtimeMs: current.mtimeMs,
       end,
-      probe: await readProbe(filePath, end),
+      probe: tailProbe,
       fold,
       result,
     });
-    while (contextCache.size > CONTEXT_CACHE_ENTRIES) contextCache.delete(contextCache.keys().next().value!);
-    onRead?.({ fileSize: current.size, bytesRead, retainedEvents: result.contextEvents.length });
+    while (contextCache.size > CONTEXT_CACHE_ENTRIES) {
+      const oldest = contextCache.keys().next().value;
+      if (oldest === undefined) break;
+      contextCache.delete(oldest);
+    }
+    onRead?.({
+      fileSize: current.size,
+      bytesRead: bytesRead + resumeProbeBytes + tailProbe.length,
+      retainedEvents: result.contextEvents.length,
+    });
     return { ...result, contextEvents: [...result.contextEvents] };
   } catch {
     contextCache.delete(filePath);

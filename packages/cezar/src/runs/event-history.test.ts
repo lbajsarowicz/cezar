@@ -1,11 +1,12 @@
 import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { RunEvent } from '@open-mercato/cezar-contract';
 import {
   HistoryCursorError,
+  __clearContextCacheForTests,
   canonicalSessionItems,
   deriveRunContextEvents,
   readEventsAfterLiveCursor,
@@ -313,6 +314,14 @@ describe('live cursor replay and compact context', () => {
 });
 
 describe('deriveRunContextEvents — per-file fold cache', () => {
+  beforeEach(() => {
+    __clearContextCacheForTests();
+  });
+
+  afterEach(() => {
+    __clearContextCacheForTests();
+  });
+
   function line(event: Partial<RunEvent> & Pick<RunEvent, 'seq' | 'type'>): string {
     return `${JSON.stringify({ ts: '2026-07-30T00:00:00.000Z', ...event })}\n`;
   }
@@ -356,7 +365,12 @@ describe('deriveRunContextEvents — per-file fold cache', () => {
     appendFileSync(file, appended);
     const grown = await deriveRunContextEvents(file, onRead);
 
-    expect(reads).toEqual([Buffer.byteLength(lines.slice(0, 20).join('')), 0, Buffer.byteLength(appended)]);
+    const probe = 64;
+    expect(reads).toEqual([
+      Buffer.byteLength(lines.slice(0, 20).join('')) + probe,
+      0,
+      Buffer.byteLength(appended) + probe + probe,
+    ]);
     expect(grown).toEqual(await deriveRunContextEvents(freshCopy(file, lines.join(''))));
   });
 
@@ -432,6 +446,44 @@ describe('deriveRunContextEvents — per-file fold cache', () => {
     rmSync(file);
 
     expect(await deriveRunContextEvents(file)).toEqual({ contextEvents: [], asOfSeq: 0 });
+  });
+
+  it('bounds a run with no task fan-out to its current turn', async () => {
+    const lines: string[] = [];
+    let seq = 0;
+    const push = (event: Omit<Partial<RunEvent>, 'seq'> & Pick<RunEvent, 'type'>) =>
+      lines.push(line({ seq: ++seq, ...event }));
+    for (let turn = 0; turn < 50; turn += 1) {
+      push({ type: 'turn.started', turnId: `t${turn}` });
+      push({ type: 'item.completed', item: { kind: 'message', id: `m${turn}`, role: 'assistant', text: String(turn) } });
+      push({ type: 'turn.completed' });
+    }
+    const file = fixture([]);
+    writeFileSync(file, lines.join(''));
+
+    const context = await deriveRunContextEvents(file);
+
+    expect(context.contextEvents.length).toBeLessThanOrEqual(2);
+    expect(context.contextEvents.some(({ seq: eventSeq }) => eventSeq === 1)).toBe(false);
+    expect(context.contextEvents.at(-1)?.seq).toBe(150);
+    expect(context).toEqual(await deriveRunContextEvents(freshCopy(file, lines.join(''))));
+  });
+
+  it('keeps the cache at its LRU bound and re-reads a transcript it evicted', async () => {
+    const files: string[] = [];
+    for (let index = 0; index < 33; index += 1) {
+      const file = fixture([]);
+      writeFileSync(file, transcript(2).join(''));
+      files.push(file);
+    }
+    for (const file of files) await deriveRunContextEvents(file);
+
+    const reads: number[] = [];
+    await deriveRunContextEvents(files[0]!, ({ bytesRead }) => reads.push(bytesRead));
+    await deriveRunContextEvents(files[32]!, ({ bytesRead }) => reads.push(bytesRead));
+
+    expect(reads[0]).toBeGreaterThan(0);
+    expect(reads[1]).toBe(0);
   });
 });
 

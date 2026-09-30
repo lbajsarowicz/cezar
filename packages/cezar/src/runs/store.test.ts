@@ -2207,7 +2207,7 @@ describe('RunStore — seq rehydration from the persisted high-water mark', () =
     vi.useRealTimers();
   });
 
-  /** A run whose creation save already landed, so only what `nextSeq` schedules can persist `lastSeq`. */
+  /** A run whose creation save already landed, so a later explicit save is the only thing left. */
   function savedRun(store: RunStore): RunRecord {
     const run = store.createRun({ title: 't', workflow: 'w', task: 't', steps: [] });
     vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS);
@@ -2220,25 +2220,27 @@ describe('RunStore — seq rehydration from the persisted high-water mark', () =
     const run = savedRun(store);
     store.appendEvent(run.id, { type: 'note', message: 'one' });
     const delta = store.emitEphemeral(run.id, { type: 'item.delta', delta: 'x' });
-    vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS);
+    store.flush();
 
     const reopened = RunStore.open(dataDir, { keepLive: true });
     expect(reopened.appendEvent(run.id, { type: 'note', message: 'after restart' }).seq).toBe(delta.seq + 1);
   });
 
-  it('persists lastSeq on the index debounce, not only on an explicit flush', () => {
+  it('does not schedule an index save for a stream that dirties nothing else', () => {
     vi.useFakeTimers();
     const store = RunStore.open(dataDir);
     const run = savedRun(store);
-    for (let index = 0; index < 3; index += 1) store.appendEvent(run.id, { type: 'note', message: `n${index}` });
-    store.emitEphemeral(run.id, { type: 'item.delta', delta: 'x' });
+    const saveNow = vi.spyOn(store as unknown as { saveNow: (...args: unknown[]) => void }, 'saveNow');
 
-    const persistedLastSeq = () =>
-      (JSON.parse(readFileSync(join(dataDir, 'runs.json'), 'utf8')) as RunRecord[]).find(({ id }) => id === run.id)
-        ?.lastSeq;
-    expect(persistedLastSeq()).toBeUndefined();
-    vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS);
-    expect(persistedLastSeq()).toBe(4);
+    for (let index = 0; index < 60; index += 1) {
+      store.appendEvent(run.id, { type: 'note', message: `n${index}` });
+      store.emitEphemeral(run.id, { type: 'item.delta', delta: 'x' });
+    }
+    vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS * 6);
+
+    expect(saveNow).not.toHaveBeenCalled();
+    store.flush();
+    expect(saveNow).toHaveBeenCalledTimes(1);
   });
 
   it('resumes from the record and the transcript tail without re-reading the whole transcript', () => {
@@ -2246,7 +2248,7 @@ describe('RunStore — seq rehydration from the persisted high-water mark', () =
     const store = RunStore.open(dataDir);
     const run = savedRun(store);
     for (let index = 0; index < 50; index += 1) store.appendEvent(run.id, { type: 'note', message: `n${index}` });
-    vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS);
+    store.flush();
 
     const reopened = RunStore.open(dataDir, { keepLive: true });
     const readEvents = vi.spyOn(reopened, 'readEvents');
@@ -2290,14 +2292,34 @@ describe('RunStore — runs.json encoding', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it('writes the index without indentation', () => {
+  it('writes compact by default, both on the debounce and on a plain flush', () => {
+    vi.useFakeTimers();
+    try {
+      const store = RunStore.open(dataDir);
+      store.createRun({ title: 't', workflow: 'w', task: 't', steps: [{ id: 's1', name: 'Agent', kind: 'agent' }] });
+      vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS);
+
+      const indexPath = join(dataDir, 'runs.json');
+      expect(readFileSync(indexPath, 'utf8')).not.toContain('\n');
+
+      store.flush();
+      const plainFlush = readFileSync(indexPath, 'utf8');
+      expect(plainFlush).not.toContain('\n');
+      expect(JSON.parse(plainFlush)).toEqual(JSON.parse(JSON.stringify(store.listRuns())));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('writes indented only when the shutdown flush asks for it', () => {
     const store = RunStore.open(dataDir);
     store.createRun({ title: 't', workflow: 'w', task: 't', steps: [{ id: 's1', name: 'Agent', kind: 'agent' }] });
-    store.flush();
+    store.flush({ pretty: true });
 
-    const raw = readFileSync(join(dataDir, 'runs.json'), 'utf8');
-    expect(raw).not.toContain('\n');
-    expect(JSON.parse(raw)).toEqual(JSON.parse(JSON.stringify(store.listRuns())));
+    const indexPath = join(dataDir, 'runs.json');
+    const flushed = readFileSync(indexPath, 'utf8');
+    expect(flushed).toContain('\n  ');
+    expect(JSON.parse(flushed)).toEqual(JSON.parse(JSON.stringify(store.listRuns())));
   });
 });
 

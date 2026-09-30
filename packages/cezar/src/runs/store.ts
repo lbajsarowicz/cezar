@@ -1588,13 +1588,15 @@ export class RunStore extends EventEmitter {
     return existed;
   }
 
-  /** Write the index out now (used on shutdown). */
-  flush(options: { throwOnError?: boolean } = {}): void {
+  /** Write the index out now. `flush()` is also a mid-run checkpoint (usage, automation launches),
+   *  so indentation is opt-in: only a real shutdown passes `pretty`, leaving the hand-editable file
+   *  the README promises behind a clean exit while every in-run save stays compact. */
+  flush(options: { throwOnError?: boolean; pretty?: boolean } = {}): void {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    this.saveNow(options.throwOnError);
+    this.saveNow(options.throwOnError, options.pretty ?? false);
   }
 
   // ---- internals -----------------------------------------------------------
@@ -1604,11 +1606,12 @@ export class RunStore extends EventEmitter {
   private nextSeq(runId: string): number {
     const next = (this.seqs.get(runId) ?? this.rehydrateSeq(runId)) + 1;
     this.seqs.set(runId, next);
+    // The high-water mark rides whatever index save happens next — a status flip, a usage update,
+    // the shutdown flush — rather than scheduling one per seq. An ephemeral `item.delta` stream
+    // touches nothing else, so scheduling here would rewrite the whole index once a second for a
+    // run whose transcript never changed; `rehydrateSeq` recovers the tail from disk on its own.
     const run = this.runs.get(runId);
-    if (run) {
-      run.lastSeq = next;
-      this.scheduleSave();
-    }
+    if (run) run.lastSeq = next;
     return next;
   }
 
@@ -1718,11 +1721,11 @@ export class RunStore extends EventEmitter {
     this.saveTimer.unref?.();
   }
 
-  private saveNow(throwOnError = false): void {
+  private saveNow(throwOnError = false, pretty = false): void {
     const indexPath = join(this.dataDir, 'runs.json');
     const tmpPath = `${indexPath}.tmp`;
     try {
-      writeFileSync(tmpPath, JSON.stringify(this.mergeWithIndexOnDisk(indexPath)), 'utf8');
+      writeFileSync(tmpPath, JSON.stringify(this.mergeWithIndexOnDisk(indexPath), null, pretty ? 2 : undefined), 'utf8');
       renameSync(tmpPath, indexPath);
     } catch (err) {
       if (throwOnError) throw new Error('Could not persist automation run provenance; the launch was not confirmed.');
