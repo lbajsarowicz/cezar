@@ -16,15 +16,29 @@ How it is used at runtime: `om-setup-agent-pipeline` copies this file into the r
 - PRs open as **drafts** when a skill says so; a human (or **mark-pr-ready**) promotes them.
 - Claim/lock signals on an issue or PR are: assignee set to the automation user, the `in-progress` label, and a `🤖`-prefixed claim comment. All three are set on claim; the label is guarded (below).
 - Long, multi-line comment bodies are posted with `--body-file` (or a heredoc via process substitution) so formatting is preserved.
-- CI status truth comes from **get-pr-checks**; the set of *required* checks comes from **get-required-checks** (branch protection). When branch protection is not readable (404), treat every reported check as required.
+- CI status truth comes from **get-pr-checks**; the set of *required* checks comes from **get-required-checks**. Both of its reads mean "nothing is required" when there is no branch protection (the `--required` query reports no required checks, and the fallback endpoint answers HTTP 404); a 401/403 on the fallback means protection is unreadable and is surfaced as an error rather than guessed away.
 
 ## Label guards
 
 Every label mutation goes through an existence guard so a missing label degrades to a logged skip instead of a failure, and `labels.enabled: false` in the config skips label operations entirely.
 
 ```bash
+# The repo's label names are fetched once per shell and reused, so a batch of guard
+# checks costs one API round trip rather than one per label. Call repo_labels with no
+# pipe: a pipeline would run it in a subshell and throw the cache away. A failed fetch
+# leaves the cache empty, so the next guard retries instead of treating every label as
+# absent.
+repo_labels() {
+  if [ -z "${REPO_LABELS-}" ]; then
+    REPO_LABELS=$(gh label list --limit 200 --json name --jq '.[].name')
+  fi
+}
+
 label_exists() {
-  gh label list --limit 200 --json name --jq '.[].name' | grep -Fxq "$1"
+  repo_labels
+  grep -Fxq "$1" <<EOF
+$REPO_LABELS
+EOF
 }
 
 # PR labels
@@ -54,18 +68,50 @@ remove_issue_label() {
   fi
 }
 
-# Pipeline labels are mutually exclusive: setting one removes the others first.
+# Pipeline labels are mutually exclusive. The target is added and the siblings that
+# are actually present are removed in a single call, then the resulting set is read
+# back: a partial failure must not leave the PR with no pipeline label.
 set_pipeline_label() {
   if [ "$LABELS_ENABLED" != "true" ]; then return 0; fi
+  pr="$1"
+  target="$2"
+  if ! label_exists "$target"; then
+    echo "Skipping label '$target' (not defined in this repo). Create it with: gh label create '$target'"
+    return 0
+  fi
+  remove=""
   for label in $PIPELINE_LABELS; do
-    [ "$label" = "$2" ] && continue
-    gh pr edit "$1" --remove-label "$label" 2>/dev/null || true
+    [ "$label" = "$target" ] && continue
+    label_exists "$label" || continue
+    remove="${remove:+$remove,}$label"
   done
-  apply_label "$2" "$1"
+  if [ -n "$remove" ]; then
+    gh pr edit "$pr" --add-label "$target" --remove-label "$remove"
+  else
+    gh pr edit "$pr" --add-label "$target"
+  fi
+  present=$(gh pr view "$pr" --json labels --jq '.labels[].name')
+  if ! grep -Fxq "$target" <<EOF
+$present
+EOF
+  then
+    echo "set_pipeline_label: '$target' is not on PR #$pr after the transition." >&2
+    return 1
+  fi
+  for label in $PIPELINE_LABELS; do
+    [ "$label" = "$target" ] && continue
+    if grep -Fxq "$label" <<EOF
+$present
+EOF
+    then
+      echo "set_pipeline_label: '$label' is still on PR #$pr after the transition." >&2
+      return 1
+    fi
+  done
 }
 ```
 
-When operating on a different repository than the current checkout, add `--repo "$REPO"` to each command inside the guards and check label existence against that repo (`gh label list --repo "$REPO"`).
+When operating on a different repository than the current checkout, add `--repo "$REPO"` to each command inside the guards and check label existence against that repo (`gh label list --repo "$REPO"`). The cache is not repo-keyed, so `unset REPO_LABELS` before the guards when one shell moves between repositories.
 
 ## Operations
 
@@ -216,11 +262,13 @@ gh api "repos/${OWNER_REPO}/git/refs/heads/${EVIDENCE_BRANCH}" >/dev/null 2>&1 |
 BODY_IMAGES=""
 for img in <image-paths>; do
   path="{slug}/$(basename "$img")"
-  base64 < "$img" | tr -d '\n' > /tmp/ev-content.b64            # portable across GNU/BSD; no newlines
+  b64=$(mktemp)                                                 # per-image path: concurrent runs must not share it
+  base64 < "$img" | tr -d '\n' > "$b64"                        # portable across GNU/BSD; no newlines
   existing=$(gh api "repos/${OWNER_REPO}/contents/${path}?ref=${EVIDENCE_BRANCH}" --jq .sha 2>/dev/null || true)
-  jq -n --rawfile c /tmp/ev-content.b64 --arg m "qa evidence {slug}" --arg b "$EVIDENCE_BRANCH" --arg s "$existing" \
+  jq -n --rawfile c "$b64" --arg m "qa evidence {slug}" --arg b "$EVIDENCE_BRANCH" --arg s "$existing" \
      'if $s == "" then {message:$m,branch:$b,content:$c} else {message:$m,branch:$b,content:$c,sha:$s} end' \
      | gh api -X PUT "repos/${OWNER_REPO}/contents/${path}" --input - >/dev/null
+  rm -f "$b64"
   url="https://raw.githubusercontent.com/${OWNER_REPO}/${EVIDENCE_BRANCH}/${path}"
   BODY_IMAGES="${BODY_IMAGES}\n![$(basename "$img")](${url})"
 done
@@ -290,9 +338,28 @@ gh pr checks {prNumber} --json name,state,link
 ```
 
 #### get-required-checks
-Base branch → the set of required status checks. A 404 means branch protection is not readable — treat all reported checks as required.
+`{prNumber}` → the required status checks for the PR. Ask the PR directly; `--required` keeps only the checks branch protection enforces, and `bucket` gives each one's current state. When branch protection requires nothing, `gh` exits 1 with `no required checks reported` and no JSON — that is "nothing is required", not an error; any other exit 1 is a genuine failure and is re-raised:
 ```bash
-gh api repos/{owner}/{repo}/branches/{baseRefName}/protection/required_status_checks --jq '.contexts[]' 2>/dev/null
+out=$(gh pr checks {prNumber} --required --json name,state,link,bucket 2>&1); status=$?
+if [ "$status" -eq 0 ]; then
+  printf '%s\n' "$out"
+elif printf '%s' "$out" | grep -qi 'no required checks reported'; then
+  :  # no check is required
+else
+  printf '%s\n' "$out" >&2
+  false
+fi
+```
+When the raw protection contexts are needed instead, read the endpoint with its headers so a repo with no protection is distinguishable from one whose protection is unreadable:
+```bash
+resp=$(gh api --include "repos/{owner}/{repo}/branches/${BASE_BRANCH}/protection/required_status_checks" 2>/dev/null || true)
+code=$(printf '%s\n' "$resp" | head -1 | awk '{print $2}')
+case "$code" in
+  200) printf '%s\n' "$resp" | tr -d '\r' | sed '1,/^$/d' | jq -r '.contexts[]' ;;
+  404) : ;;  # no branch protection: no check is required
+  401|403) echo "get-required-checks: branch protection is unreadable (HTTP $code); surface this error instead of treating every check as required." >&2; false ;;
+  *) echo "get-required-checks: unexpected response (HTTP ${code:-none})." >&2; false ;;
+esac
 ```
 
 #### get-pr-comment / get-review-comment
@@ -371,6 +438,7 @@ gh label create skip-qa           --color 0e8a16 --description "Low risk, QA not
 gh label create qa-approved       --color 0e8a16 --description "Manual QA passed"
 gh label create qa-self-verified  --color c5def5 --description "Self-QA exception used"
 gh label create in-progress       --color c5def5 --description "An automated skill is working on this"
+gh label create ci-monitoring     --color fbca04 --description "An automated skill is watching CI on this"
 gh label create do-not-close      --color c5def5 --description "Humans only: never auto-close this issue"
 gh label create priority-low      --color e4e669 --description "Cosmetic or follow-up work"
 gh label create priority-medium   --color fbca04 --description "Ordinary bug or feature"
