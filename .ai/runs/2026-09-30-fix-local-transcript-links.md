@@ -12,7 +12,7 @@ Non-goals: serving arbitrary host files, adding an artifact endpoint, or changin
 
 - [x] 1.1 Add a transcript destination classifier and local-only renderer — targeted tests pass — b1b4b908
 - [x] 1.2 Preserve safety confirmation for HTTPS and cockpit-relative links — targeted tests pass — b1b4b908
-- [ ] 1.3 Run the full repository validation gate and authoritative PR review — local gate has two unrelated baseline failures; independent review remains pending
+- [x] 1.3 Run the full repository validation gate and authoritative PR review — CI green and independent review approved; two task-context baseline failures documented
 
 ## Risks
 
@@ -26,7 +26,7 @@ Non-goals: serving arbitrary host files, adding an artifact endpoint, or changin
 
 - [x] 1.1 Add a transcript destination classifier and local-only renderer — targeted tests pass — b1b4b908
 - [x] 1.2 Preserve safety confirmation for HTTPS and cockpit-relative links — targeted tests pass — b1b4b908
-- [ ] 1.3 Run the full repository validation gate and authoritative PR review — local gate has two unrelated baseline failures; independent review remains pending
+- [x] 1.3 Run the full repository validation gate and authoritative PR review — CI green and independent review approved; two task-context baseline failures documented
 
 ## Verification record
 
