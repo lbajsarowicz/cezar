@@ -379,7 +379,7 @@ describe('the agents form', () => {
   })
 
 
-  it('live title updates: the switch defaults ON and PUTs the toggle', async () => {
+  it('live title updates: the switch defaults OFF and PUTs the toggle', async () => {
     serve()
     renderAt('/settings/agents')
     await waitFor(() => expect(form()).not.toBeNull())
@@ -388,8 +388,8 @@ describe('the agents form', () => {
     expect(toggle.getAttribute('aria-checked') ?? toggle.getAttribute('data-state')).toBeTruthy()
     fireEvent.click(toggle)
     await waitFor(() => expect(puts()).toHaveLength(1))
-    expect(puts()[0]?.body).toEqual({ liveTitleUpdates: false })
-    await waitFor(() => expect(screen.getByText('Off')).toBeTruthy())
+    expect(puts()[0]?.body).toEqual({ liveTitleUpdates: true })
+    await waitFor(() => expect(screen.getByText('On')).toBeTruthy())
   })
 
   it('review gate: the switch defaults OFF and PUTs the toggle (#489)', async () => {

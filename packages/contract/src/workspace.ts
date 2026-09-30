@@ -376,7 +376,7 @@ export const configResponseSchema = z.object({
   /** Keep the last N finished worktrees on disk (#483); 0 = unlimited. Older ones are reclaimed
    *  (directory only — branch kept, so work is recoverable). */
   worktreeRetention: z.number(),
-  /** Live title updates: null = no config key, the `CEZ_TITLE_UPDATES` env default (ON) decides. */
+  /** Live title updates: null = no config key, the `CEZ_TITLE_UPDATES` env default (OFF) decides. */
   liveTitleUpdates: z.boolean().nullable(),
   /** Optional review gate (#489): null = no config key, the `CEZ_REVIEW_GATE` env default (OFF)
    *  decides. */

@@ -4908,6 +4908,7 @@ export class RunManager {
     skillName: string | undefined,
     task: string,
     live?: { turnText?: string; diffStat?: string },
+    knownSkills?: readonly Skill[],
   ): Promise<void> {
     // CEZ_AUTONAME=0 kills all LLM naming; dry-run skips it too unless
     // CEZ_AUTONAME=1 forces the mock path — see autoNamingActive.
@@ -4917,7 +4918,7 @@ export class RunManager {
     try {
       let skillDescription: string | undefined;
       if (skillName) {
-        const skills = await discoverSkills(this.repoRoot).catch(() => [] as Skill[]);
+        const skills = knownSkills ?? (await discoverSkills(this.repoRoot).catch(() => [] as Skill[]));
         skillDescription = skills.find((s) => s.name === skillName)?.description;
       }
       const result = await generateRunName(this.repoRoot, { task, skillName, skillDescription, ...live });
@@ -5002,7 +5003,7 @@ export class RunManager {
   /**
    * Live title refresh (task auto-naming spec, step 3): re-run the namer with
    * the turn's context. Skips: toggle off (`liveTitleUpdates` config over
-   * `CEZ_TITLE_UPDATES` env, default ON), user-owned title, marker-owned title
+   * `CEZ_TITLE_UPDATES` env, default OFF), user-owned title, marker-owned title
    * (the agent declares via `CEZ:TITLE` — the token-saving fast path), dry-run
    * mocks (canned answers add nothing), empty turn text, unchanged namer inputs.
    */
@@ -5019,7 +5020,7 @@ export class RunManager {
     this.lastNamerKey.set(runId, key);
     const workflow = await this.reviveWorkflow(run);
     const skillName = workflow?.steps.find((s) => stepKind(s) === 'agent' && s.skill)?.skill?.trim();
-    void this.autoNameRun(runId, skillName, run.task, { turnText, diffStat: statText });
+    void this.autoNameRun(runId, skillName, run.task, { turnText, diffStat: statText }, this.active.get(runId)?.skills);
   }
 
   /**
