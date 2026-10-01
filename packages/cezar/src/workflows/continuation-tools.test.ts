@@ -242,9 +242,9 @@ describe('a resumed session keeps its workflow step tools', () => {
     await settled(id);
   });
 
-  it("Continue grants the directory of the owning step's path-delivered skill", async () => {
-    // A directory skill outside `.agents/skills` is delivered as an absolute path the resumed
-    // session already holds, so the continuation needs the same grant the first spawn had.
+  it("Continue never grants a skill's source directory (--add-dir is read+write)", async () => {
+    // A directory skill outside `.agents/skills` is read through its in-worktree path; granting
+    // its source dir would let the resumed agent rewrite the skill every concurrent run shares.
     mkdirSync(join(repoRoot, '.ai/skills/demo-dir'), { recursive: true });
     writeFileSync(join(repoRoot, '.ai/skills/demo-dir/SKILL.md'), '---\nname: demo-dir\n---\nbody\n');
     const def: WorkflowDef = {
@@ -256,7 +256,8 @@ describe('a resumed session keeps its workflow step tools', () => {
 
     expect(manager!.continueRun(id, { text: 'keep going' })).toEqual({ ok: true });
     const spec = await specAt(0);
-    expect(spec.additionalDirectories).toContain(join(repoRoot, '.ai/skills/demo-dir'));
+    expect(spec.additionalDirectories ?? []).not.toContain(join(repoRoot, '.ai/skills/demo-dir'));
+    expect(spec.additionalDirectories ?? []).not.toContain(join(repoRoot, '.ai/skills'));
     await settled(id);
   });
 

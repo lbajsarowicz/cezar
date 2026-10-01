@@ -455,20 +455,17 @@ describe('systemPrompt end-to-end (dry run)', () => {
     expect(named?.titleSummary).toBe('432: implementing cr fixes');
     expect(named?.titleOrigin).toBe('auto');
 
-    // A SKILL.md directory skill on a native-skill backend travels as its path. This repo does
-    // not ignore its skill dirs, so nothing is copied into the worktree and the prompt names
-    // the installed copy in the MAIN repo.
+    // This repo does not ignore its skill dirs, so nothing is copied into the worktree and the
+    // skill's source dir sits outside it: the body goes inline rather than name a path a
+    // `--add-dir` grant (read+write) would be needed to reach.
     const skillFile = join(repoRoot, '.ai/skills/om-auto-review-pr/SKILL.md');
-    const skillPrompt = skillSystemPrompt(
-      {
-        name: 'om-auto-review-pr',
-        description: SKILL_DESCRIPTION,
-        body: SKILL_BODY,
-        path: skillFile,
-        source: 'ai',
-      },
-      { mode: 'path', file: skillFile },
-    );
+    const skillPrompt = skillSystemPrompt({
+      name: 'om-auto-review-pr',
+      description: SKILL_DESCRIPTION,
+      body: SKILL_BODY,
+      path: skillFile,
+      source: 'ai',
+    });
     expect(capturedSystemPrompt()).toBe(
       composeSystemPrompt(skillPrompt, CONFIG_PROMPT, HANDOFF_INSTRUCTIONS),
     );
