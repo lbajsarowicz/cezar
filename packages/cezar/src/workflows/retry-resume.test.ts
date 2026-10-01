@@ -1,10 +1,10 @@
 import { execFile } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentRunner } from '../core/agent-runner.ts';
 import { CursorAgentRunner } from '../core/cursor-agent-runner.ts';
 import { RunStore } from '../runs/store.ts';
@@ -41,7 +41,7 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
 
   beforeEach(async () => {
     repoRoot = mkdtempSync(join(tmpdir(), 'cez-retry-resume-'));
-    turnsFile = join(repoRoot, '..', `${repoRoot.split('/').pop()}-turns.ndjson`);
+    turnsFile = join(repoRoot, '..', `${basename(repoRoot)}-turns.ndjson`);
     setEnv('CEZ_CODEX_BIN', MOCK_CODEX);
     setEnv('CEZ_AUTONAME', '0');
     setEnv('MOCK_CODEX_TURNS_FILE', turnsFile);
@@ -117,6 +117,73 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     expect(store.readEvents(id).some((e) => e.type === 'note' && String(e.message).includes('retrying in a fresh session'))).toBe(true);
   }, 30_000);
 
+  it('keeps the run token totals when the resume attempt never opens a turn', async () => {
+    setEnv('MOCK_CODEX_REJECT_RESUME', '1');
+    const id = await runToEnd();
+    const record = store.getRun(id);
+    const step = record?.steps.find((s) => s.id === 'implement');
+    // Two turns ran (the first attempt and the fallback); the abandoned resume attempt must not
+    // leave `started > observed`, which would clear the run's directional totals for good.
+    expect(step?.usageInvocationsStarted).toBe(2);
+    expect(step?.usageInvocationsObserved).toBe(2);
+    expect(record?.inputTokens).toBe(2400);
+    expect(record?.outputTokens).toBe(600);
+  }, 30_000);
+
+  it('carries the reports the abandoned resume attempt had flushed into the fresh session', async () => {
+    setEnv('MOCK_CODEX_REJECT_RESUME', '1');
+    const record = manager.startRun(WORKFLOW, { task: TASK, runner: 'codex', worktree: false });
+    const pending = {
+      fromRunId: 'child_run_1',
+      title: 'Auth check',
+      report: { status: 'done' as const, result: 'auth refactor finished', evidence: [], side_effects: [], errors: [], suggestions: [] },
+      at: '2026-09-30T00:00:00.000Z',
+    };
+    const terminal = new Set(['done', 'review', 'failed', 'cancelled']);
+    const deadline = Date.now() + 25_000;
+    // The first attempt flushes pending reports before it is given a session id; seeding after
+    // that leaves one for the retry attempt to flush, which the fresh fallback must then carry.
+    while (!store.getRun(record.id)?.steps.find((s) => s.id === 'implement')?.sessionId) {
+      if (Date.now() > deadline) throw new Error('the first attempt never started');
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    store.updateRun(record.id, { dispatch: { rootRunId: record.id, pendingReports: [pending] } });
+    while (!terminal.has(store.getRun(record.id)?.status ?? '')) {
+      if (Date.now() > deadline) throw new Error(`run did not finish: ${store.getRun(record.id)?.status}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    const all = turns();
+    expect(all).toHaveLength(2);
+    expect(all[1]).toContain('auth refactor finished');
+    expect(all[1]).toContain('Reports from your dispatched tasks');
+  }, 30_000);
+
+  it('does not resume a strict backend under a different account', async () => {
+    const seam = manager as unknown as {
+      agentEnvForStep: (runId: string, backend: string, options?: { recordedProfileId?: string }) => Promise<{ env: Record<string, string>; profileId: string }>;
+    };
+    const real = seam.agentEnvForStep.bind(manager);
+    let calls = 0;
+    const spy = vi.spyOn(seam, 'agentEnvForStep').mockImplementation(async (runId, backend, options) => {
+      const resolved = await real(runId, backend, options);
+      calls += 1;
+      return { ...resolved, profileId: calls === 1 ? 'work' : 'personal' };
+    });
+    try {
+      const id = await runToEnd();
+      const all = turns();
+      expect(all).toHaveLength(2);
+      // The previous attempt recorded `work`; the retry resolved to another account, so it must
+      // run the whole task in a fresh session rather than reopen the wrong account's session.
+      expect(all[1]).toContain(TASK);
+      expect(all[1]).toContain('## Handoff (cezar)');
+      expect(store.readEvents(id).some((e) => e.type === 'note' && String(e.message).includes('sending only the failure'))).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 30_000);
+
   describe('on claude', () => {
     const claudeWorkflow = (marker: string): WorkflowDef => ({
       ...WORKFLOW,
@@ -127,7 +194,7 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     });
 
     async function runClaude(marker: string): Promise<{ id: string; argv: string[][] }> {
-      const argsFile = join(repoRoot, '..', `${repoRoot.split('/').pop()}-args.ndjson`);
+      const argsFile = join(repoRoot, '..', `${basename(repoRoot)}-args.ndjson`);
       setEnv('CEZ_DRY_RUN', '1');
       setEnv('CEZ_MOCK_ARGS_FILE', argsFile);
       try {
@@ -164,6 +231,43 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
       const notes = store.readEvents(id).filter((e) => e.type === 'note').map((e) => String(e.message));
       expect(notes.some((m) => m.includes('No conversation found with session ID') && m.includes('retrying in a fresh session'))).toBe(true);
     }, 30_000);
+
+    it('does not restart when the resumed session fails with a usage limit', async () => {
+      const { id, argv } = await runClaude('mock:resume-limit');
+      // A usage limit is not a missing conversation: the retry must fail on the limit rather than
+      // pay for a whole fresh prompt that would hit the same limit.
+      expect(store.getRun(id)?.status).toBe('failed');
+      expect(argv).toHaveLength(2);
+      expect(argv[1]).toContain('--resume');
+      const notes = store.readEvents(id).filter((e) => e.type === 'note').map((e) => String(e.message));
+      expect(notes.some((m) => m.includes('could not reopen the previous session'))).toBe(false);
+    }, 30_000);
+
+    it('still falls back when a resume error has an unrecognized wording', async () => {
+      const { id, argv } = await runClaude('mock:resume-mystery');
+      // The fallback is keyed on "not a provider refusal", not an allowlist of known session-gone
+      // strings, so a backend that words the failure differently still degrades instead of failing.
+      expect(store.getRun(id)?.steps.map((s) => [s.id, s.status])).toEqual([
+        ['implement', 'done'],
+        ['verify', 'done'],
+      ]);
+      expect(argv).toHaveLength(3);
+      expect(argv[1]).toContain('--resume');
+      expect(argv[2]).not.toContain('--resume');
+      expect(store.getRun(id)?.status).not.toBe('failed');
+    }, 30_000);
+
+    it('does not restart a session that reopened and then failed mid-turn', async () => {
+      const { id, argv } = await runClaude('mock:resume-mid-fail');
+      // The conversation reopened and its turn started (init reached the engine), then the provider
+      // failed mid-turn. That is a real failure, not "could not reopen": a fresh retry would only
+      // repeat it and pay for the whole prompt again.
+      expect(store.getRun(id)?.status).toBe('failed');
+      expect(argv).toHaveLength(2);
+      expect(argv[1]).toContain('--resume');
+      const notes = store.readEvents(id).filter((e) => e.type === 'note').map((e) => String(e.message));
+      expect(notes.some((m) => m.includes('could not reopen the previous session'))).toBe(false);
+    }, 30_000);
   });
   describe('on cursor', () => {
     // Cursor print mode has no verified resume, so a retry must stay a fresh session that is
@@ -171,7 +275,7 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     it('retries in a fresh session carrying the whole task', async () => {
       const cursorRunner: AgentRunner = new CursorAgentRunner();
       expect(cursorRunner.strictResume).toBeUndefined();
-      const argsFile = join(repoRoot, '..', `${repoRoot.split('/').pop()}-cursor-args.ndjson`);
+      const argsFile = join(repoRoot, '..', `${basename(repoRoot)}-cursor-args.ndjson`);
       setEnv('CEZ_DRY_RUN', '1');
       setEnv('CEZ_MOCK_ARGS_FILE', argsFile);
       try {

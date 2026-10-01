@@ -69,6 +69,14 @@ export interface AgentRunSpec {
    * picks up the on-disk conversation (used by "Continue" after a run ends).
    */
   resume?: boolean;
+  /**
+   * The opening prompt for a fresh session when `resume` cannot reopen `sessionId`, built lazily
+   * because constructing it reads the run's whole event log. Only a runner that can tell a missing
+   * session apart from any other failure uses it (opencode), and only inside the reopen-failure
+   * branch; the retry path leaves it unset so the engine's own fresh-session fallback owns that
+   * decision. Runners that always fail a missing resume (claude, codex) ignore it.
+   */
+  resumeFallbackPrompt?: () => string;
 }
 
 /**

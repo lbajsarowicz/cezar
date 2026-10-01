@@ -7,6 +7,9 @@ const CONVERSATION_CONTEXT_CHARS = 60_000;
  *  the most recent exchange. */
 const CONVERSATION_WITH_JOURNAL_CHARS = 12_000;
 const JOURNAL_CHARS = 8_000;
+/** A journal earns the shorter transcript only when it actually says where the task stands:
+ *  resume notes, or enough progress to be more than one stray line. */
+const JOURNAL_SUBSTANTIVE_CHARS = 400;
 /** Cezar's own heartbeat lines (`appendHandoffHeartbeat`) say nothing the task state does not. */
 const HEARTBEAT_RE = /^- \S+ — (?:turn complete\b|step "[^"]*" complete\b|picked from \d+ variants$)/;
 
@@ -29,12 +32,12 @@ function keepTail(text: string, max: number): { text: string; truncated: boolean
 }
 
 /** The first `max` UTF-16 units, ending at a line boundary and never on half a surrogate pair. */
-function keepHead(text: string, max: number): string {
-  if (text.length <= max) return text;
+function keepHead(text: string, max: number): { text: string; truncated: boolean } {
+  if (text.length <= max) return { text, truncated: false };
   let head = text.slice(0, max);
   if (isHighSurrogate(head.charCodeAt(head.length - 1))) head = head.slice(0, -1);
   const lastLine = head.lastIndexOf('\n');
-  return lastLine > 0 ? head.slice(0, lastLine) : head;
+  return { text: lastLine > 0 ? head.slice(0, lastLine) : head, truncated: true };
 }
 
 function handoffSection(text: string, header: string): string[] {
@@ -49,8 +52,9 @@ function handoffSection(text: string, header: string): string[] {
 }
 
 /** What the previous session wrote into its handoff journal: its resume notes and its own progress
- *  lines, newest first. Empty when the agent never wrote to it. */
-export function handoffJournal(handoff: string): string {
+ *  lines, newest first. Empty when the agent never wrote to it; `substantive` says whether it
+ *  carries enough state to justify a shorter transcript. */
+export function handoffJournal(handoff: string): { text: string; substantive: boolean } {
   const resumeNotes = handoffSection(handoff, '## Resume notes').join('\n').trim();
   const progress = handoffSection(handoff, '## Progress log')
     .map((line) => line.trim())
@@ -59,7 +63,11 @@ export function handoffJournal(handoff: string): string {
     ...(resumeNotes ? ['### Resume notes', resumeNotes] : []),
     ...(progress.length ? ['### Progress log (newest first)', ...progress] : []),
   ];
-  return parts.length ? keepHead(parts.join('\n'), JOURNAL_CHARS) : '';
+  if (!parts.length) return { text: '', substantive: false };
+  const body = parts.join('\n');
+  const substantive = Boolean(resumeNotes) || body.length >= JOURNAL_SUBSTANTIVE_CHARS;
+  const { text, truncated } = keepHead(body, JOURNAL_CHARS);
+  return { text: truncated ? `${text}\n\n_(journal truncated)_` : text, substantive };
 }
 
 function cleanText(value: unknown): string | undefined {
@@ -75,7 +83,8 @@ function cleanText(value: unknown): string | undefined {
 /**
  * Reconstruct the portable part of a task when a continuation switches runner/account and the
  * provider-owned session id therefore cannot be resumed. Events are already secret-redacted by
- * RunStore; only conversation messages are copied, never tool inputs/results or reasoning.
+ * RunStore; only conversation messages are copied, never tool inputs/results or reasoning. The
+ * `handoff` journal is the previous session's own file, read raw and appended as-is.
  */
 export function freshContinuationContext(run: RunRecord, events: readonly RunEvent[], handoff = ''): string {
   const v2Messages = events.flatMap((event) => {
@@ -109,7 +118,7 @@ export function freshContinuationContext(run: RunRecord, events: readonly RunEve
   const journal = handoffJournal(handoff);
   const { text: conversation, truncated } = keepTail(
     messages.join('\n\n'),
-    journal ? CONVERSATION_WITH_JOURNAL_CHARS : CONVERSATION_CONTEXT_CHARS,
+    journal.substantive ? CONVERSATION_WITH_JOURNAL_CHARS : CONVERSATION_CONTEXT_CHARS,
   );
 
   const steps = run.steps.map((step) =>
@@ -128,7 +137,7 @@ export function freshContinuationContext(run: RunRecord, events: readonly RunEve
     ...(run.worktreePath ? [`Worktree: ${run.worktreePath}`] : []),
     ...(steps.length ? ['Steps:', ...steps] : []),
     '',
-    ...(journal ? ['## Handoff journal (kept by the previous session)', journal, ''] : []),
+    ...(journal.text ? ['## Handoff journal (kept by the previous session)', journal.text, ''] : []),
     `## Conversation history${truncated ? ' (oldest messages truncated)' : ''}`,
     conversation || '(No persisted conversation messages.)',
   ].join('\n');

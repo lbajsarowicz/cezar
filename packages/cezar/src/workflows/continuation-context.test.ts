@@ -92,6 +92,23 @@ describe('freshContinuationContext and the handoff journal', () => {
     expect(freshContinuationContext(run(), [], heartbeatsOnly)).not.toContain('Handoff journal');
   });
 
+  it('keeps the full transcript when the journal carries no state', () => {
+    // One stray progress line is not "where the task stands": the old gate shortened the
+    // transcript on any non-empty journal, giving a provider hand-off a fifth of the conversation
+    // in exchange for nothing.
+    const thin = '## Progress log\n\n- 2026-09-04T09:50:00.000Z — started the refactor\n';
+    const context = freshContinuationContext(run(), longConversation(100), thin);
+    const history = context.slice(context.indexOf('## Conversation history'));
+    expect(context).toContain('## Handoff journal (kept by the previous session)');
+    expect(history.length).toBeGreaterThan(59_000);
+    expect(history.length).toBeLessThanOrEqual(60_100);
+  });
+
+  it('marks a journal that was cut at the cap', () => {
+    const oversized = `## Resume notes\n${'y'.repeat(9_000)}\n`;
+    expect(freshContinuationContext(run(), [], oversized)).toContain('_(journal truncated)_');
+  });
+
   it('never cuts a surrogate pair in half when one message overflows the cap', () => {
     // An odd tail after the pairs puts the cut on the low half of a pair.
     const emoji = '🙂'.repeat(40_000);

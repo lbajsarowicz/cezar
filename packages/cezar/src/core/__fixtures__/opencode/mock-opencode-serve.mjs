@@ -86,12 +86,24 @@ const server = createServer((req, res) => {
     }
     if (req.method === 'GET' && url.startsWith('/session/') && !url.slice('/session/'.length).includes('/')) {
       const id = decodeURIComponent(url.slice('/session/'.length));
-      if (id === SESSION_ID) {
+      if (id === 'ses_server_error') {
+        // A 5xx is not evidence the session is gone — the runner must propagate it, never replace
+        // the conversation with a fresh one.
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ name: 'InternalServerError', data: { message: 'storage unavailable' } }));
+      } else if (id === SESSION_ID) {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ id: SESSION_ID, title: 'cezar task' }));
-      } else {
+      } else if (id.startsWith('ses_')) {
+        // A well-formed but unknown session id: the real server says 404, which the runner reads
+        // as "gone" and may replace with a fresh session.
         res.writeHead(404, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ name: 'NotFoundError', data: { message: `Session not found: ${id}` } }));
+      } else {
+        // Not an opencode id at all (cezar's pre-assigned placeholder): real opencode answers 500
+        // UnknownError, so the runner must treat the shape itself as missing, never look it up.
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ name: 'UnknownError', data: { message: `Invalid session id: ${id}` } }));
       }
       return;
     }

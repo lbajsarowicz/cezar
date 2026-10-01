@@ -397,4 +397,79 @@ describe('opencode session resume', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it('degrades to a fresh session carrying the portable context when the session is gone', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cez-opencode-resume-'));
+    const promptsFile = join(dir, 'prompts.ndjson');
+    try {
+      const fallback = '## Original task\nfix the checkout bug\n\n---\n\n## New user instruction\nthe check failed';
+      const { events, result } = await runOnce(
+        { sessionId: 'ses_gone', resume: true, userPrompt: 'the check failed', resumeFallbackPrompt: () => fallback },
+        promptsFile,
+      );
+
+      const prompts = readFileSync(promptsFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string);
+      expect(prompts).toEqual([prependSystemPrompt('SKILL BODY', fallback)]);
+      expect(result.sessionId).toBe('ses_mock_1');
+      expect(events).toContainEqual({ type: 'session', sessionId: 'ses_mock_1' });
+      expect(events.some((event) => event.type === 'error')).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('propagates a server error on the session lookup instead of opening a fresh session', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cez-opencode-resume-'));
+    const promptsFile = join(dir, 'prompts.ndjson');
+    try {
+      const { events } = await runOnce(
+        { sessionId: 'ses_server_error', resume: true, userPrompt: 'the check failed', resumeFallbackPrompt: () => 'portable context' },
+        promptsFile,
+      );
+
+      // A 500 is not "the session is gone": the continuation must fail loudly rather than replace
+      // the stored session with a fresh one and lose the provider-owned conversation.
+      expect(events.some((event) => event.type === 'error' && event.message.includes('GET /session/ses_server_error → 500'))).toBe(true);
+      expect(events.some((event) => event.type === 'session')).toBe(false);
+      expect(() => readFileSync(promptsFile, 'utf8')).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('treats a non-`ses_` id as missing without a lookup — a step that died before its session event', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cez-opencode-resume-'));
+    const promptsFile = join(dir, 'prompts.ndjson');
+    const fallback = '## Original task\nfix the checkout bug\n\n---\n\n## New user instruction\nthe check failed';
+    try {
+      // cezar pre-assigns a randomUUID to every step; opencode mints its own `ses_…` id and only
+      // announces it with a `session` event. A step that failed before that event leaves the
+      // placeholder, which real opencode answers with 500 — the fresh-session fallback is correct.
+      const { events, result } = await runOnce(
+        { sessionId: '3f9a2c10-0000-4000-8000-000000000000', resume: true, userPrompt: 'the check failed', resumeFallbackPrompt: () => fallback },
+        promptsFile,
+      );
+
+      const prompts = readFileSync(promptsFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string);
+      expect(prompts).toEqual([prependSystemPrompt('SKILL BODY', fallback)]);
+      expect(result.sessionId).toBe('ses_mock_1');
+      expect(events).toContainEqual({ type: 'session', sessionId: 'ses_mock_1' });
+      expect(events.some((event) => event.type === 'error')).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('fails when a non-`ses_` id has no fallback prompt', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cez-opencode-resume-'));
+    const promptsFile = join(dir, 'prompts.ndjson');
+    try {
+      const { events } = await runOnce({ sessionId: 'not-a-session', resume: true }, promptsFile);
+      expect(events.some((event) => event.type === 'error')).toBe(true);
+      expect(events.some((event) => event.type === 'session')).toBe(false);
+      expect(() => readFileSync(promptsFile, 'utf8')).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
