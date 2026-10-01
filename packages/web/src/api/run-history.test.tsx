@@ -7,6 +7,7 @@ import type { ApiRun, RunHistoryContext, RunHistoryPage, RunRecord } from '@open
 import { getRunHistory, getRunHistoryContext } from './client'
 import { queryKeys } from './queries'
 import { coveredLiveEventSeqs, mergeRunHistoryEvents, useRunHistory } from './run-history'
+import { RUN_EVENT_BATCH_MS } from './run-events'
 
 vi.mock('./client', () => ({
   getRunHistory: vi.fn(),
@@ -148,12 +149,20 @@ describe('useRunHistory', () => {
 
     const { queuedMessages: _q, usage: _u, ...dequeued } = cached
     const steps: RunRecord['steps'] = [{ id: 'agent', name: 'agent', kind: 'agent', status: 'running', iterations: 1, tokensUsed: 0 }]
-    act(() => FakeEventSource.instances[0]!.emit('run', JSON.stringify({ ...dequeued, status: 'running', steps })))
+    // A frame for a run with no detail cache creates nothing: only an existing cache is patched.
+    act(() => FakeEventSource.instances[0]!.emit('run', JSON.stringify({ ...dequeued, id: 'run-2', status: 'running', steps })))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, RUN_EVENT_BATCH_MS + 5))
+    })
+    expect(client.getQueryData(queryKeys.runs.detail('run-2'))).toBeUndefined()
 
+    act(() => FakeEventSource.instances[0]!.emit('run', JSON.stringify({ ...dequeued, status: 'running', steps })))
+    await waitFor(() => {
+      expect(client.getQueryData<ApiRun>(queryKeys.runs.detail('run-1')))
+        .toMatchObject({ status: 'running', steps, usage: cached.usage })
+    })
     const detail = client.getQueryData<ApiRun>(queryKeys.runs.detail('run-1'))
-    expect(detail).toMatchObject({ status: 'running', steps, usage: cached.usage })
     expect(detail).not.toHaveProperty('queuedMessages')
-    expect(client.getQueryData(queryKeys.runs.detail('other'))).toBeUndefined()
     vi.unstubAllGlobals()
   })
 

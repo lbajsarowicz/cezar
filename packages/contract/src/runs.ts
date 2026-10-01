@@ -440,8 +440,9 @@ export const WORKSPACE_RUN_EVENT_OMITTED_KEYS = Object.keys(workspaceRunEventOmi
 /**
  * The `run` frame on `GET /api/v1/workspace/events`: the stored record minus
  * `WORKSPACE_RUN_EVENT_OMITTED_KEYS`, stamped with the owning `project`. Every other record key
- * rides it, so it is a superset of `runIndexEntrySchema` (with `project` for `projectId`) and a
- * list row patched from it answers exactly as a `GET /runs` row does.
+ * rides it, so a list row patched from it answers as a `GET /runs` row does. It is not a strict
+ * superset of `runIndexEntrySchema`: that row also carries the live `usage` sample, which this
+ * frame never has (`withUsage` attaches it to route answers only).
  */
 export const workspaceRunEventSchema = runRecordSchema.omit(workspaceRunEventOmitted).extend({
   project: z.string(),

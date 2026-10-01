@@ -281,7 +281,7 @@ export function useRunHistory(runId: string | undefined): RunHistoryState {
   const onRun = useCallback((run: RunRecord) => {
     const key = queryKeys.runs.detail(run.id)
     if (queryClient.getQueryData(key) === undefined) return
-    queryClient.setQueryData<ApiRun>(key, (previous) => mergeRun(previous, run))
+    queryClient.setQueryData<ApiRun>(key, (previous) => (previous === undefined ? run : mergeRun(previous, run)))
   }, [queryClient])
   const liveFrames = useRunEvents(newestPage && !fallback ? runId : undefined, newestPage ? {
     cursor: newestPage.liveCursor,

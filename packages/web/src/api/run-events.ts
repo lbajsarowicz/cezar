@@ -152,7 +152,9 @@ export interface RunEventStreamOptions {
   compactAt?: number
   /** Return exactly the live sequence numbers now covered by durable history. */
   onCompact?: (events: readonly RunEvent[]) => RunEventCompaction | false | Promise<RunEventCompaction | false>
-  /** The whole run record, sent on connect and on every change of this run. */
+  /** The whole run record, sent on connect and on every change of this run. Delivered on the same
+   *  `RUN_EVENT_BATCH_MS` flush as the transcript frames, so a burst of changes costs one call
+   *  with the latest record. */
   onRun?: (run: RunRecord) => void
 }
 
@@ -193,6 +195,7 @@ export function useRunEvents(runId: string | undefined, options: RunEventStreamO
     let nextCompactionAt = 0
     let eventsSinceCompaction = 0
     let pending: RunEvent[] = []
+    let pendingRun: RunRecord | undefined
     let flushTimer: ReturnType<typeof setTimeout> | undefined
     const CLOSED = 2 // EventSource.CLOSED, spelled literally like global-events.tsx
     const REOPEN_DELAY_MS = 1_500
@@ -260,6 +263,11 @@ export function useRunEvents(runId: string | undefined, options: RunEventStreamO
 
     const flush = (): void => {
       flushTimer = undefined
+      if (pendingRun !== undefined) {
+        const run = pendingRun
+        pendingRun = undefined
+        if (!disposed) optionsRef.current.onRun?.(run)
+      }
       if (pending.length === 0) return
       const batch = pending
       pending = []
@@ -348,7 +356,11 @@ export function useRunEvents(runId: string | undefined, options: RunEventStreamO
         if (disposed || token !== streamToken) return
         lastFrameAt = Date.now()
         const run = parseRunRecordFrame((event as MessageEvent<string>).data)
-        if (run) optionsRef.current.onRun?.(run)
+        if (!run) return
+        // Coalesced with the transcript frames: a run change (a token or cost tick included)
+        // otherwise writes the detail cache on every frame, bypassing the batch window.
+        pendingRun = run
+        scheduleFlush()
       })
       const errorListener = (): void => {
         if (disposed || token !== streamToken) return
@@ -410,6 +422,7 @@ export function useRunEvents(runId: string | undefined, options: RunEventStreamO
       clearTimeout(flushTimer)
       flushTimer = undefined
       pending = []
+      pendingRun = undefined
       clearInterval(livenessTimer)
       document.removeEventListener('visibilitychange', onVisibilityChange)
       window.removeEventListener('pagehide', onPageHide)

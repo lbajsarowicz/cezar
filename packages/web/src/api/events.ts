@@ -125,8 +125,8 @@ function isRunRecord(value: unknown): value is RunRecord {
 }
 
 /** Whether a `run` payload is a whole record, i.e. one a cache may hold as a row on its own.
- *  `steps` is required on `runRecordSchema` and is one of `WORKSPACE_RUN_EVENT_OMITTED_KEYS`, so
- *  its presence is what tells a record from a slim frame. */
+ *  `task` and `steps` are both required on `runRecordSchema` and both omitted from the slim
+ *  frame, so their presence is what tells a record from a slim frame. */
 export function isFullRunRecord(run: RunSummary): run is RunRecord {
   return typeof (run as Partial<RunRecord>).task === 'string' && Array.isArray((run as Partial<RunRecord>).steps)
 }
@@ -149,13 +149,14 @@ export function applyRunEvent(list: ApiRun[] | undefined, run: RunSummary): ApiR
   if (!list) return undefined
 
   const index = list.findIndex((r) => r.id === run.id)
-  if (index >= 0) {
+  const existing = index < 0 ? undefined : list[index]
+  if (existing !== undefined) {
     const next = [...list]
-    next[index] = mergeRun(list[index], run)
+    next[index] = mergeRun(existing, run)
     return next
   }
   // A slim frame for a run this list has never held cannot become a row: it has no `steps`.
-  // The caller refetches the list instead.
+  // The caller fetches the single run instead.
   if (!isFullRunRecord(run)) return list
 
   // `?? ''` because only `id` is validated on the way in: a record missing `createdAt` must sort
@@ -176,7 +177,9 @@ export function applyRunDeleted(list: ApiRun[] | undefined, id: string): ApiRun[
 }
 
 /**
- * The stream's record over the cached one.
+ * The stream's record over the cached one. `previous` is required: merging needs a row to merge
+ * into, and a slim frame with no cached record has no valid row to produce — the caller fetches
+ * the whole record (`GET /runs/:id`) instead.
  *
  * `usage` is carried over rather than dropped: the global `run` event is a bare `RunRecord`, while
  * `GET /api/runs` answers with the live sample attached (`withUsage`). An absent field on the wire
@@ -190,10 +193,8 @@ export function applyRunDeleted(list: ApiRun[] | undefined, id: string): ApiRun[
  * keys. Every other key is taken from the frame as-is, absent included: `activity`, `error` and
  * friends are cleared by being left out.
  */
-export function mergeRun(previous: ApiRun | undefined, run: RunSummary): ApiRun {
+export function mergeRun(previous: ApiRun, run: RunSummary): ApiRun {
   const next = { ...run } as ApiRun
-  if (!previous) return next
-
   if (!isFullRunRecord(run)) {
     const target = next as Record<string, unknown>
     for (const key of WORKSPACE_RUN_EVENT_OMITTED_KEYS) {
