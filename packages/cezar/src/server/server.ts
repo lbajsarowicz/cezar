@@ -93,7 +93,7 @@ import {
 import { planChain, slugify } from '../planner.ts';
 import { discoverSkills } from '../skills.ts';
 import { SkillsUpdateConflictError, SkillsUpdateCoordinator, SkillsUpdateService, type SkillsUpdateState } from '../skills-update.ts';
-import { selfUpdateApplyRequestSchema, selfUpdateChannelRequestSchema } from '@open-mercato/cezar-contract';
+import { selfUpdateApplyRequestSchema, selfUpdateChannelRequestSchema, selfUpdateDevelopmentQuerySchema } from '@open-mercato/cezar-contract';
 import { SelfUpdateBusyError, SelfUpdateService } from '../self-update/service.ts';
 import { getTeamSkillsCached, refreshTeamSkills, waitForTeamSkills } from '../skills-remote.ts';
 import { appendHandoffHeartbeat, handoffProgressExcerpt, readHandoff } from '../handoff.ts';
@@ -819,6 +819,11 @@ const uiStateSchema = z
     // The GitHub tab's last-selected sub-tab (#417): issues or PRs. ADDITIVE — an old
     // ui-state.json without the key behaves as the default (issues).
     githubView: z.enum(['issues', 'prs']).optional(),
+    // The GitHub tab's list order: newest first (what `gh` returns) or oldest first, for working
+    // the backlog from the long-waiting end. ADDITIVE, like `githubView` above — an old
+    // ui-state.json without the key behaves as the default (newest), and the sort is applied
+    // client-side, so this key changes presentation only, never what `GET /github` fetches.
+    githubSort: z.enum(['newest', 'oldest']).optional(),
     // Settings → Appearance (redesign R6): accent + density. ADDITIVE — the theme itself
     // stays in the browser (`cez-theme` localStorage, pre-paint). The cockpit always PUTs
     // the whole object because the top-level merge below is shallow.
@@ -2977,7 +2982,13 @@ export function createApp(deps: ServerDeps) {
 
     .post('/workspace/self-update/refresh', async (c) => c.json(await selfUpdate.status({ refresh: true })))
 
-    .put('/workspace/self-update/channel', jsonZodValidator(selfUpdateChannelRequestSchema, { message: 'body must be { channel: "stable" | "nightly" }' }), async (c) => {
+    // The development channel's pickers: cezar's own worktrees and its open PRs' preview builds.
+    // A separate read because it costs a git call per worktree and a GitHub round trip.
+    .get('/workspace/self-update/development', queryZodValidator(selfUpdateDevelopmentQuerySchema), async (c) =>
+      c.json(await selfUpdate.development({ refresh: c.req.valid('query').refresh === '1' })),
+    )
+
+    .put('/workspace/self-update/channel', jsonZodValidator(selfUpdateChannelRequestSchema, { message: 'body must be { channel: "stable" | "nightly" | "development" }' }), async (c) => {
       const { channel } = c.req.valid('json');
       await selfUpdate.setChannel(channel);
       return c.json(await selfUpdate.status());
