@@ -11,7 +11,9 @@ const LABEL: Record<ProviderId, string> = {
   claude: 'Claude Code',
   codex: 'Codex',
   opencode: 'OpenCode',
+  cursor: 'Cursor',
   pi: 'pi',
+  copilot: 'GitHub Copilot CLI',
 };
 
 export function providersRequiredByWorkflow(

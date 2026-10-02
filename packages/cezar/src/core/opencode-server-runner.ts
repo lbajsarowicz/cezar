@@ -10,6 +10,7 @@ import type {
 import type { AgentSession, SessionOptions } from './agent-runner.ts';
 import { prependSystemPrompt, trackChildExit } from './agent-runner.ts';
 import { buildChildEnv } from './agent-env.ts';
+import { disclaimedCommand } from './disclaim-spawn.ts';
 import { AUTO_END_DELAY_MS, DEFAULT_RUN_TIMEOUT_MS } from './claude-cli-runner.ts';
 import { parseModelIdentity } from './model-identity.ts';
 import { V1TextCoalescer } from './v1-text-coalescer.ts';
@@ -129,7 +130,7 @@ class OpencodeSession implements AgentSession {
    *  (the user's own message also streams as parts over the same SSE feed). */
   private readonly msgRole = new Map<string, string>();
   private tokensUsed = 0;
-  private lastCost = 0;
+  private lastCost: number | undefined;
   private turnInFlight = false;
   /** Has this turn's prompt POST settled (either way)? Until it has, nothing
    *  synthesizes a turn end — only the wire does. */
@@ -165,12 +166,12 @@ class OpencodeSession implements AgentSession {
     private readonly onEvent: ((event: AgentEvent) => void) | undefined,
     private readonly opts: SessionOptions,
   ) {
-    // Port 0 lets the server pick a free port; the bound URL is read back from stdout.
+    // Random high port; the actual bound URL is read back from stdout.
+    const port = 40000 + Math.floor(Math.random() * 20000);
     try {
-      this.child = nodeSpawn(bin, ['serve', '--hostname', '127.0.0.1', '--port', '0'], {
-        cwd: spec.cwd,
-        env: buildChildEnv({ backend: 'opencode', extraEnv: spec.env }),
-      });
+      const env = buildChildEnv({ backend: 'opencode', extraEnv: spec.env });
+      const [file, argv] = disclaimedCommand(bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], env);
+      this.child = nodeSpawn(file, argv, { cwd: spec.cwd, env });
     } catch (err) {
       throw wrapSpawnError(err, bin);
     }
@@ -298,6 +299,10 @@ class OpencodeSession implements AgentSession {
     this.finishTurn();
     this.sse.abort();
     this.terminate();
+  }
+
+  hardStop(): void {
+    this.interrupt();
   }
 
   /**
@@ -617,9 +622,9 @@ class OpencodeSession implements AgentSession {
         this.emit({ type: 'token-usage', tokensUsed: this.tokensUsed });
       }
     }
-    const cost = numField(info, 'cost');
-    if (cost > this.lastCost) {
-      this.emit({ type: 'cost', usd: cost - this.lastCost });
+    const cost = info.cost;
+    if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 && (this.lastCost === undefined || cost > this.lastCost)) {
+      this.emit({ type: 'cost', usd: cost - (this.lastCost ?? 0) });
       this.lastCost = cost;
     }
   }
