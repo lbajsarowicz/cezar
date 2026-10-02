@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { AGENT_MODELS_LOCKED_ENV } from './agent-model-policy.ts';
 import { profileEnv } from './agent-profiles.ts';
 import { resolveClaudeBin } from './claude-bin.ts';
 import { quoteExecutable, withEnvPrefix } from './shell-env.ts';
 
-export const PROVIDER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi'] as const;
+export const PROVIDER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi', 'copilot'] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 export type ProviderConnectionState =
   | 'connected'
@@ -45,6 +46,10 @@ export type RunProviderCommand = (
    *  2026-07-29-agent-profiles). Optional so every existing caller and the test kit keep their
    *  three-argument signature; absent means the default profile, which needs nothing. */
   env?: Record<string, string>,
+  /** Written to the probe's stdin, which is then closed. Only Copilot needs it: the CLI ships no
+   *  non-interactive auth-status command, so its state is read by driving its ACP server. Optional
+   *  so every existing caller and the test kit keep their shorter signature. */
+  stdin?: string,
 ) => Promise<ProviderCommandResult>;
 
 /**
@@ -68,6 +73,8 @@ interface ProviderDescriptor {
   loginArgs: readonly string[];
   installHint: string;
   parse: (result: ProviderCommandResult) => ProviderConnectionState | null;
+  /** See {@link RunProviderCommand}'s `stdin`. */
+  stdin?: () => string;
   /**
    * An answer available WITHOUT spawning the CLI at all, checked before `runCommand` — `undefined`
    * defers to the normal probe. Every other backend's own CLI self-reports API-key vs. subscription
@@ -253,6 +260,35 @@ function parsePiStatus(result: ProviderCommandResult): ProviderConnectionState |
   return null;
 }
 
+/**
+ * Copilot CLI has **no** non-interactive auth-status command — `login` is its only auth
+ * subcommand and it is interactive (verified against 1.0.88;
+ * `.ai/runs/2026-09-27-copilot-cli-runner/copilot-acp-notes.md`). What it does have is an ACP
+ * server that answers the question definitively and cheaply: `session/new` returns a `sessionId`
+ * for an entitled credential and the JSON-RPC error `-32000 "Authentication required"` without
+ * one. Nothing is prompted, so no AI credits are spent, and the server exits when stdin closes.
+ */
+function copilotAcpProbeStdin(): string {
+  const initialize = {
+    jsonrpc: '2.0',
+    id: 0,
+    method: 'initialize',
+    params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } },
+  };
+  // A throwaway cwd: the probe must not touch the user's repo, and `session/new` requires one.
+  const newSession = { jsonrpc: '2.0', id: 1, method: 'session/new', params: { cwd: tmpdir(), mcpServers: [] } };
+  return `${JSON.stringify(initialize)}\n${JSON.stringify(newSession)}\n`;
+}
+
+function parseCopilotStatus(result: ProviderCommandResult): ProviderConnectionState | null {
+  const output = `${result.stdout}\n${result.stderr}`;
+  // Order matters: an authenticated answer also contains the `initialize` result, and an
+  // unauthenticated one contains BOTH that result and the error, so the error is checked first.
+  if (/"Authentication required"/i.test(output)) return 'disconnected';
+  if (/"sessionId"\s*:\s*"/.test(output)) return 'connected';
+  return null;
+}
+
 const DESCRIPTORS: readonly ProviderDescriptor[] = [
   {
     id: 'claude',
@@ -297,6 +333,15 @@ const DESCRIPTORS: readonly ProviderDescriptor[] = [
     installHint: 'Install pi, then run `pi /login`.',
     parse: parsePiStatus,
   },
+  {
+    id: 'copilot',
+    executable: () => process.env.CEZ_COPILOT_BIN ?? 'copilot',
+    statusArgs: ['--acp'],
+    loginArgs: ['login'],
+    installHint: 'Install GitHub Copilot CLI (`npm i -g @github/copilot`), then run `copilot login`.',
+    parse: parseCopilotStatus,
+    stdin: copilotAcpProbeStdin,
+  },
 ];
 
 function parseCursorStatus(result: ProviderCommandResult): ProviderConnectionState | null {
@@ -325,9 +370,10 @@ function defaultRunProviderCommand(
   args: readonly string[],
   timeoutMs: number,
   env?: Record<string, string>,
+  stdin?: string,
 ): Promise<ProviderCommandResult> {
   return new Promise((resolve) => {
-    execFile(
+    const child = execFile(
       executable,
       args,
       {
@@ -355,6 +401,9 @@ function defaultRunProviderCommand(
         });
       },
     );
+    // Closing stdin is what makes a stdin-driven probe terminate at all: the Copilot ACP server
+    // reads until EOF. A probe with no payload closes it immediately, exactly as before.
+    child.stdin?.end(stdin ?? '');
   });
 }
 
@@ -726,9 +775,16 @@ export class ProviderAuthService {
     // path for no gain.
     const env = configDir ? profileEnv(descriptor.id, configDir) : undefined;
     try {
-      result = await (env === undefined
-        ? this.runCommand(descriptor.executable(), descriptor.statusArgs, COMMAND_TIMEOUT_MS)
-        : this.runCommand(descriptor.executable(), descriptor.statusArgs, COMMAND_TIMEOUT_MS, env));
+      // Never pass a trailing `undefined`: the existing three- and four-argument calls are the
+      // zero-config path and the injected test kit asserts them literally, so only a descriptor
+      // that actually has a stdin payload reaches the five-argument form.
+      const stdin = descriptor.stdin?.();
+      const executable = descriptor.executable();
+      result = await (stdin !== undefined
+        ? this.runCommand(executable, descriptor.statusArgs, COMMAND_TIMEOUT_MS, env, stdin)
+        : env === undefined
+          ? this.runCommand(executable, descriptor.statusArgs, COMMAND_TIMEOUT_MS)
+          : this.runCommand(executable, descriptor.statusArgs, COMMAND_TIMEOUT_MS, env));
     } catch {
       return { provider: descriptor.id, status: 'unknown', hint: UNKNOWN_HINT };
     }

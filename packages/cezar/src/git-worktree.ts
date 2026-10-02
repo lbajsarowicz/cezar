@@ -33,14 +33,54 @@ interface RegisteredWorktree {
 }
 
 /** Run git, never throw — degradation is the caller's policy. */
-function git(cwd: string, args: string[], env?: Record<string, string>): Promise<GitResult> {
+function git(
+  cwd: string,
+  args: string[],
+  opts: { timeout?: number; env?: NodeJS.ProcessEnv } = {},
+): Promise<GitResult> {
   return new Promise((resolve) => {
     execFile(
       'git',
       args,
-      { cwd, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8', ...(env ? { env: { ...process.env, ...env } } : {}) },
+      { cwd, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8', ...opts },
       (err, stdout, stderr) => resolve({ ok: !err, stdout: stdout ?? '', stderr: stderr ?? '' }),
     );
+  });
+}
+
+/**
+ * Scratch-index overrides (`GIT_INDEX_FILE`) as `git()` options. The overrides layer onto the
+ * ambient environment: `execFile`'s `env` replaces it wholesale, and a git that lost `PATH` or
+ * `HOME` behaves differently from the one every other call site runs.
+ */
+function envOpts(env: Record<string, string>): { env: NodeJS.ProcessEnv } {
+  return { env: { ...process.env, ...env } };
+}
+
+/** Upper bound on the pre-fork fetch; a slow or unreachable remote must not stall task start. */
+const FETCH_TIMEOUT_MS = 15_000;
+
+/**
+ * Refresh `origin/<base>` so a new task forks from the newest upstream tip,
+ * not whatever the remote-tracking ref happened to hold at the last manual
+ * fetch. Best effort: no `origin`, offline, auth required or a timeout all
+ * leave the existing refs untouched. The explicit refspec updates the
+ * tracking ref even when the remote has a narrowed fetch config. Skipped under
+ * `CEZ_DRY_RUN=1`, which must stay network-free.
+ */
+async function fetchBase(repoRoot: string, base: string): Promise<void> {
+  if (process.env.CEZ_DRY_RUN === '1') return;
+  // The name is spliced into a refspec — only a well-formed branch name may be.
+  const wellFormed = await git(repoRoot, ['check-ref-format', `refs/heads/${base}`]);
+  if (!wellFormed.ok) return;
+  const hasOrigin = await git(repoRoot, ['remote', 'get-url', 'origin']);
+  if (!hasOrigin.ok) return;
+  const refspec = `+refs/heads/${base}:refs/remotes/origin/${base}`;
+  // GIT_TERMINAL_PROMPT only silences git's own (HTTPS) prompts; an SSH remote
+  // can still ask on the controlling TTY — the timeout is what bounds that.
+  await git(repoRoot, ['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', 'origin', refspec], {
+    timeout: FETCH_TIMEOUT_MS,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
   });
 }
 
@@ -60,26 +100,66 @@ export function branchFor(runId: string): string {
  * merged into origin since then counts as the task's own changes — the phantom
  * 142k-line diff. `origin/<base>` is the source of truth for a review base, so
  * only keep the local ref when it is equal to or ahead of origin (unpushed base
- * commits); otherwise use origin.
+ * commits); otherwise use origin. `origin/<base>` is fetched first (best
+ * effort) so "up to date" means the remote as it is now, not at the last fetch.
  *
  * This answers the question once, when the worktree is forked. The local ref
  * goes stale AFTERWARDS too — agents fetch, they never pull — so every diff
  * re-applies the same rule at read time through `freshestBaseRef`
  * (`git-diff-base.ts`). Keep the two in agreement.
+ *
+ * `keepDiverged` is for the user's OWN checked-out branch (the zero-config
+ * fork point): there a local branch that diverged from origin — rebased or
+ * amended but not yet force-pushed — is the user's work, not staleness, so
+ * origin wins only when local is strictly behind it (fast-forwardable). A
+ * deliberate `reset --hard HEAD~N` that is not force-pushed yet also reads as
+ * "behind" — git cannot tell it from staleness — so such a task forks with the
+ * dropped commits back in; push the reset first. An own branch origin has
+ * never tracked is local-only work, so it skips the fetch round trip.
  */
-export async function resolveBaseRef(repoRoot: string, base: string): Promise<string | null> {
+export async function resolveBaseRef(
+  repoRoot: string,
+  base: string,
+  opts: { keepDiverged?: boolean } = {},
+): Promise<string | null> {
   if (!isSafeGitRef(base)) return null;
   const verify = (ref: string) =>
     git(repoRoot, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).then((r) => r.ok);
+  if (!opts.keepDiverged || (await verify(`origin/${base}`))) await fetchBase(repoRoot, base);
   const [hasLocal, hasRemote] = await Promise.all([verify(base), verify(`origin/${base}`)]);
   if (hasLocal && hasRemote) {
     // `--is-ancestor origin/<base> <base>` succeeds iff local is equal-or-ahead.
     const localCurrent = await git(repoRoot, ['merge-base', '--is-ancestor', `origin/${base}`, base]);
-    return localCurrent.ok ? base : `origin/${base}`;
+    if (localCurrent.ok) return base;
+    if (!opts.keepDiverged) return `origin/${base}`;
+    // `--is-ancestor <base> origin/<base>` succeeds iff local is strictly behind here.
+    const localBehind = await git(repoRoot, ['merge-base', '--is-ancestor', base, `origin/${base}`]);
+    return localBehind.ok ? `origin/${base}` : base;
   }
   if (hasLocal) return base;
   if (hasRemote) return `origin/${base}`;
   return null;
+}
+
+/**
+ * The ref a NEW task forks from: the configured base branch when it resolves,
+ * else the checked-out branch — itself refreshed against origin, but keeping
+ * local work that diverged from it (`keepDiverged`). A detached HEAD stays
+ * `HEAD`; `createWorktree` pins it to the commit. Never throws.
+ */
+export async function chooseForkBase(
+  repoRoot: string,
+  currentBranch: string,
+  configured: string | undefined,
+  note: (message: string) => void,
+): Promise<string> {
+  if (configured) {
+    const resolved = await resolveBaseRef(repoRoot, configured);
+    if (resolved) return resolved;
+    note(`configured base branch "${configured}" not found (locally or on origin) — using "${currentBranch}"`);
+  }
+  if (currentBranch === 'HEAD') return currentBranch;
+  return (await resolveBaseRef(repoRoot, currentBranch, { keepDiverged: true })) ?? currentBranch;
 }
 
 export function worktreePathFor(repoRoot: string, runId: string): string {
@@ -509,8 +589,8 @@ export async function withScratchIntentToAddIndex<T>(
   try {
     const real = await realIndexPath(dir);
     const copied = real ? await copyIndex(real, scratch) : false;
-    if (!copied) await git(dir, ['read-tree', 'HEAD'], env); // no index yet; harmless if no HEAD
-    await git(dir, ['add', '-N', '.'], env);
+    if (!copied) await git(dir, ['read-tree', 'HEAD'], envOpts(env)); // no index yet; harmless if no HEAD
+    await git(dir, ['add', '-N', '.'], envOpts(env));
     return await fn(env);
   } finally {
     rmSync(scratch, { force: true });
@@ -543,7 +623,7 @@ export async function worktreeDiff(
   return withScratchIntentToAddIndex(worktreePath, async (env) => {
     const mergeBase = await git(worktreePath, ['merge-base', baseBranch, 'HEAD']);
     const base = mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : baseBranch;
-    const res = await git(worktreePath, ['diff', base], env);
+    const res = await git(worktreePath, ['diff', base], envOpts(env));
     if (!res.ok) return `(diff failed: ${res.stderr.trim() || 'unknown git error'})`;
     if (res.stdout.length > cap) return `${res.stdout.slice(0, cap)}\n… (diff truncated)`;
     return res.stdout;
@@ -567,7 +647,7 @@ export async function worktreeDiffStat(
   return withScratchIntentToAddIndex(worktreePath, async (env) => {
     const mergeBase = await git(worktreePath, ['merge-base', baseBranch, 'HEAD']);
     const base = mergeBase.ok && mergeBase.stdout.trim() ? mergeBase.stdout.trim() : baseBranch;
-    const res = await git(worktreePath, ['diff', '--stat', base], env);
+    const res = await git(worktreePath, ['diff', '--stat', base], envOpts(env));
     return res.ok ? res.stdout.trim() : '';
   });
 }
@@ -630,7 +710,7 @@ export async function worktreeShortstat(
       baseBranch,
       opts,
     );
-    const res = await git(worktreePath, ['diff', '--shortstat', base], env);
+    const res = await git(worktreePath, ['diff', '--shortstat', base], envOpts(env));
     if (!res.ok) return null;
     // The key stays ABSENT (not `false`) on a normal run: `diffStat` is persisted in
     // `runs.json` and served on the runs API, so the un-narrowed shape must keep

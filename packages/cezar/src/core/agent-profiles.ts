@@ -39,6 +39,11 @@ import type { ProviderId } from './provider-auth.ts';
  * - **pi** → nothing documented. pi ships no per-user home variable of its own, so — exactly like
  *   OpenCode — a second account cannot be carried without silently billing the wrong one. `null`
  *   until pi documents a single home variable that moves credentials as well as config.
+ * - **copilot** → `COPILOT_HOME` moves config and state, but whether it also moves the stored
+ *   login has not been tested, and Copilot reads `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` /
+ *   `GITHUB_TOKEN` ahead of any stored credential regardless. `null` until a test proves one
+ *   variable moves both (spec 2026-09-19-runner-seam-native-backends Q14) — being wrong here
+ *   bills the wrong account.
  */
 export const PROFILE_ENV_VAR: Record<ProviderId, string | null> = {
   claude: 'CLAUDE_CONFIG_DIR',
@@ -46,6 +51,7 @@ export const PROFILE_ENV_VAR: Record<ProviderId, string | null> = {
   opencode: null,
   cursor: null,
   pi: null,
+  copilot: null,
 };
 
 /** Providers that can carry more than one account — what the UI offers "Add account" for. */
@@ -100,4 +106,6 @@ const PROFILE_DIR_MARKERS: Record<ProviderId, readonly string[]> = {
   // pi cannot carry profiles (`PROFILE_ENV_VAR.pi === null`), so nothing ever probes a pi
   // profile dir; the entry exists to keep this table exhaustive over `ProviderId`.
   pi: [],
+  // Same for copilot (`PROFILE_ENV_VAR.copilot === null`).
+  copilot: [],
 };

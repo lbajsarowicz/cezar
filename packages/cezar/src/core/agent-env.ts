@@ -230,6 +230,10 @@ const BACKEND_ALLOW_PREFIXES: Record<AgentBackend, readonly string[]> = {
   // granting it here handed pi the whole `AWS_*` / `GOOGLE_CLOUD_*` family on any host that had
   // set `CLAUDE_CODE_USE_BEDROCK=1` for Claude Code, plus Claude's own config dir.
   pi: ['PI_', ...MULTI_PROVIDER_PREFIXES],
+  // Copilot routes every model through GitHub, so it needs only its own family. The `gh` names
+  // it authenticates with (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`) are already forwarded to every
+  // backend below, and `COPILOT_GITHUB_TOKEN` is covered by this prefix — so nothing else widens.
+  copilot: ['COPILOT_'],
 };
 
 /** `gh` handoff (draft PRs) works in every backend — the one credential the

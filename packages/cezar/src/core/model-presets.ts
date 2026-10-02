@@ -42,6 +42,11 @@ export const KNOWN_PRESETS_BY_RUNNER: Record<RunnerId, readonly string[]> = {
   // overlap (`anthropic/claude-sonnet-5`), and a shared id present in pi's list but absent from
   // OpenCode's empty one would read as "another runner's preset" and be refused.
   pi: [],
+  // Copilot lists nothing for a third reason on top of OpenCode's and pi's: its catalog is fetched
+  // from GitHub at run time, and the ids it routes are other vendors' own (`gpt-5.4`,
+  // `claude-sonnet-4`). Naming them here would make this guard reject a legitimate codex or
+  // claude model as "another runner's preset" — the exact failure pi's comment warns about.
+  copilot: [],
 };
 
 /**
