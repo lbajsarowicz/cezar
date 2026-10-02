@@ -71,8 +71,8 @@ export class CodexAppServerRpc {
   dispatchResponse(message: CodexAppServerMessage): boolean {
     if (message.result === undefined && message.error === undefined) return false;
     // JSON-RPC lets a server echo the id as a string; cezar only ever allocates integers.
-    const id = typeof message.id === 'string' && /^\d+$/.test(message.id) ? Number(message.id) : message.id;
-    if (typeof id !== 'number') return false;
+    const id = typeof message.id === 'string' && /^(0|[1-9]\d*)$/.test(message.id) ? Number(message.id) : message.id;
+    if (typeof id !== 'number' || !Number.isSafeInteger(id)) return false;
     const pending = this.pending.get(id);
     if (!pending) return false;
     this.pending.delete(id);

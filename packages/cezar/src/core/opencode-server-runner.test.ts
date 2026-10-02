@@ -169,16 +169,26 @@ describe('opencode serve startup', () => {
     spawnHook.override = null;
   });
 
-  it('lets the OS pick the port instead of guessing a free one', () => {
+  it.each([0, 0.5, 0.99999])('passes a random port in 40000–59999 and exposes the PID synchronously (random=%s)', (random) => {
     let argv: unknown;
     spawnHook.override = (_bin, args) => {
       argv = args;
       return silentChild();
     };
     vi.useFakeTimers();
-    const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs: 0 }).startSession({ userPrompt: 'do it', cwd: process.cwd() });
-    void session.result.catch(() => undefined);
-    expect(argv).toEqual(['serve', '--hostname', '127.0.0.1', '--port', '0']);
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(random);
+    try {
+      const session = new OpencodeServerRunner({ bin: 'opencode', timeoutMs: 0 }).startSession({ userPrompt: 'do it', cwd: process.cwd() });
+      void session.result.catch(() => undefined);
+      const port = 40000 + Math.floor(random * 20000);
+      expect(argv).toEqual(['serve', '--hostname', '127.0.0.1', '--port', String(port)]);
+      expect(Number.isInteger(port)).toBe(true);
+      expect(port).toBeGreaterThanOrEqual(40000);
+      expect(port).toBeLessThan(60000);
+      expect(session.pid).toBe(5151);
+    } finally {
+      randomSpy.mockRestore();
+    }
   });
 
   it('fails the session when the server never reports a listening URL', async () => {

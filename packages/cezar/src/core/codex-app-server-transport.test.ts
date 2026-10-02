@@ -66,13 +66,17 @@ describe('Codex app-server transport', () => {
     expect(writes.join('')).toContain('"method":"initialized"');
   });
 
-  it('settles a request whose response echoes the id as a string', async () => {
+  it('settles canonical safe integer string ids and ignores invalid string ids', async () => {
     const { child } = fakeChild();
     const rpc = new CodexAppServerRpc(child);
-    const request = rpc.request('thread/start', {});
-    expect(rpc.dispatchResponse({ id: '1', result: { thread: { id: 'th' } } })).toBe(true);
-    await expect(request).resolves.toEqual({ thread: { id: 'th' } });
-    expect(rpc.dispatchResponse({ id: 'ask-1', result: {} })).toBe(false);
+    const requests = Array.from({ length: 7 }, () => rpc.request('thread/start', {}));
+    expect(rpc.dispatchResponse({ id: 'abc', result: {} })).toBe(false);
+    expect(rpc.dispatchResponse({ id: '007', result: {} })).toBe(false);
+    expect(rpc.dispatchResponse({ id: '123456789012345678901234567890', result: {} })).toBe(false);
+    expect(rpc.dispatchResponse({ id: '5', result: { thread: { id: 'th' } } })).toBe(true);
+    await expect(requests[4]).resolves.toEqual({ thread: { id: 'th' } });
+    for (const id of [1, 2, 3, 4, 6, 7]) expect(rpc.dispatchResponse({ id, result: {} })).toBe(true);
+    await Promise.all(requests);
   });
 
   it('rejects a correlated request with the app-server error message', async () => {
