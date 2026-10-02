@@ -281,8 +281,11 @@ export async function collectChanges(
 
 /** Bounds staleness the fingerprint cannot see (two same-size writes inside one mtime tick). */
 const CHANGES_CACHE_TTL_MS = 120_000;
-/** Each entry can hold up to `CHANGES_JSON_CAP` of payload. TTL and this LRU bound are the only
- *  eviction: a finished run is exactly the one whose Changes tab gets reviewed. */
+/** Each entry can hold up to `CHANGES_JSON_CAP` of payload. TTL and this bound are the only
+ *  eviction: a finished run is exactly the one whose Changes tab gets reviewed. Insertion order
+ *  decides, not use — a hit serves the entry without moving it, so a tab polled steadily still
+ *  ages out behind eight newer directories. With eight slots and a 120 s TTL that costs one
+ *  recompute, which is why it is not worth the re-insert on the read path. */
 const CHANGES_CACHE_ENTRIES = 8;
 const changesCache = new Map<string, { fingerprint: string; at: number; result: ChangesResult }>();
 const changesInflight = new Map<string, Promise<ChangesResult>>();

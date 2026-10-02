@@ -11,6 +11,7 @@ import {
   FILE_CONTENT_CAP,
   assemblePayload,
   capChangesPayload,
+  clearChangesCache,
   collectChanges,
   collectRunCommits,
   commitAll,
@@ -62,6 +63,9 @@ describe('collectChanges — structured diff vs base', () => {
   let dir: string;
 
   beforeEach(() => {
+    // The payload cache lives on the module, so without this every test in this worker shares
+    // eight slots with every other — the entry-bound test below is the one that notices first.
+    clearChangesCache();
     dir = mkdtempSync(join(tmpdir(), 'cez-changes-'));
     initRepo(dir);
   });
