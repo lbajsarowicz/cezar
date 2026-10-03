@@ -250,6 +250,7 @@ interface ResolveCacheEntry {
   runStartedAt?: string;
   at: number;
 }
+const RESOLVE_CACHE_MAX = 50;
 const resolveCache = new Map<string, ResolveCacheEntry>();
 
 /** Drop memoized anchors — tests and any caller that repoints HEAD directly. */
@@ -290,6 +291,7 @@ function storeBase(
   opts: { taskBranch?: string; runStartedAt?: string; cacheKey?: string },
   remoteTip?: string,
 ): void {
+  resolveCache.delete(opts.cacheKey as string);
   resolveCache.set(opts.cacheKey as string, {
     base: result.base,
     headSha,
@@ -301,6 +303,7 @@ function storeBase(
     runStartedAt: opts.runStartedAt,
     at: Date.now(),
   });
+  while (resolveCache.size > RESOLVE_CACHE_MAX) resolveCache.delete(resolveCache.keys().next().value!);
 }
 
 async function computeTaskDiffBase(

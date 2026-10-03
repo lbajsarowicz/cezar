@@ -42,8 +42,7 @@ async function git(
 const REPO_INFO_TTL_MS = 5_000;
 const repoInfoCache = new Map<string, { at: number; info: RepoInfo | null }>();
 
-/** Drop the memo — call where a repo's identity changes (branch switch, project
- *  probe invalidation) so the next read is fresh. */
+/** Drop the memo after branch creation or switching so the next read is fresh. */
 export function clearRepoInfoCache(): void {
   repoInfoCache.clear();
 }

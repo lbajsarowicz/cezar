@@ -414,14 +414,20 @@ export async function fetchGithub(repoRoot: string, refresh = false, limit = 30)
     const inflight = listInflight.get(repoRoot);
     if (inflight && inflight.limit >= capped) return inflight.promise;
   }
-  const task = listFetch(repoRoot, capped);
-  if (!refresh) {
-    listInflight.set(repoRoot, { limit: capped, promise: task });
-    void task.finally(() => {
-      const current = listInflight.get(repoRoot);
-      if (current?.promise === task) listInflight.delete(repoRoot);
-    });
-  }
+  const task = listFetch(repoRoot, capped).then((data) => {
+    if (data.available && listInflight.get(repoRoot)?.promise === task) {
+      listCache.delete(repoRoot);
+      listCache.set(repoRoot, { at: Date.now(), limit: capped, data });
+      while (listCache.size > LIST_CACHE_MAX) {
+        listCache.delete(listCache.keys().next().value!);
+      }
+    }
+    return data;
+  });
+  listInflight.set(repoRoot, { limit: capped, promise: task });
+  void task.finally(() => {
+    if (listInflight.get(repoRoot)?.promise === task) listInflight.delete(repoRoot);
+  });
   return task;
 }
 
@@ -508,13 +514,6 @@ async function listFetch(repoRoot: string, capped: number): Promise<GithubData> 
       prs,
       labelColors,
     };
-    listCache.delete(repoRoot); // re-insert so this key becomes the newest
-    listCache.set(repoRoot, { at: Date.now(), limit: capped, data });
-    while (listCache.size > LIST_CACHE_MAX) {
-      const oldest = listCache.keys().next().value;
-      if (oldest === undefined) break;
-      listCache.delete(oldest);
-    }
     return data;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -2969,6 +2968,7 @@ export async function fetchPrMergeState(
 
 export function evictGithubProjectCaches(repoRoot: string): void {
   listCache.delete(repoRoot);
+  listInflight.delete(repoRoot);
   mergeStateCache.forEach((_value, key) => {
     if (key.startsWith(`${repoRoot}:`)) mergeStateCache.delete(key);
   });

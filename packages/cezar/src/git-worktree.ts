@@ -325,6 +325,7 @@ export function worktreeSizeBytes(path: string): Promise<number | null> {
 // number. A finalized worktree can still grow afterwards — `open-in`, a manual
 // `npm install`, the run's own finalize-time push — so the entry expires too.
 const WORKTREE_SIZE_TTL_MS = 60_000;
+const WORKTREE_SIZE_MAX = 50;
 const worktreeSizeCache = new Map<string, { at: number; size: number | null }>();
 
 /** The `du -sk` size of a run's worktree, memoized once the run has finalized. */
@@ -337,7 +338,9 @@ export async function worktreeSizeForRun(
     const hit = worktreeSizeCache.get(runId);
     if (hit && Date.now() - hit.at < WORKTREE_SIZE_TTL_MS) return hit.size;
     const size = await worktreeSizeBytes(path);
+    worktreeSizeCache.delete(runId);
     worktreeSizeCache.set(runId, { at: Date.now(), size });
+    while (worktreeSizeCache.size > WORKTREE_SIZE_MAX) worktreeSizeCache.delete(worktreeSizeCache.keys().next().value!);
     return size;
   }
   worktreeSizeCache.delete(runId);
@@ -618,6 +621,7 @@ export async function worktreeDiffStat(
 // previous finish. Like the size memo it expires, because post-run edits
 // (Continue, `open-in`) change the table under a finalized run.
 const WORKTREE_DIFF_STAT_TTL_MS = 60_000;
+const WORKTREE_DIFF_STAT_MAX = 50;
 const worktreeDiffStatCache = new Map<string, { at: number; text: string }>();
 
 /** The `git diff --stat` text of a run's worktree, memoized once the run finalized. */
@@ -631,7 +635,9 @@ export async function worktreeDiffStatForRun(
     const hit = worktreeDiffStatCache.get(runId);
     if (hit && Date.now() - hit.at < WORKTREE_DIFF_STAT_TTL_MS) return hit.text;
     const text = await worktreeDiffStat(path, baseBranch);
+    worktreeDiffStatCache.delete(runId);
     worktreeDiffStatCache.set(runId, { at: Date.now(), text });
+    while (worktreeDiffStatCache.size > WORKTREE_DIFF_STAT_MAX) worktreeDiffStatCache.delete(worktreeDiffStatCache.keys().next().value!);
     return text;
   }
   worktreeDiffStatCache.delete(runId);

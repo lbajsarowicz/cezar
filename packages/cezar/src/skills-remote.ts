@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -19,6 +19,7 @@ import { readJsonCache, writeJsonCache } from './skills-cache-state.ts';
 
 const LIST_TIMEOUT_MS = 10_000; // ls-tree / show / rev-parse
 const CLONE_TIMEOUT_MS = 60_000; // clone / fetch
+const GIT_OUTPUT_CAP = 16 * 1024 * 1024;
 
 // ---- git plumbing ------------------------------------------------------------
 
@@ -58,15 +59,14 @@ const GIT_HARDENING_ENV = {
 function git(args: string[], timeoutMs: number, cwd?: string): Promise<GitResult> {
   if (backgroundWorkAborted) return Promise.resolve({ ok: false, stdout: '', stderr: '' });
   return new Promise((resolve) => {
-    let child: ReturnType<typeof execFile>;
-    child = execFile(
+    const child = execFile(
       'git',
       [...GIT_HARDENING_ARGS, ...args],
       {
         cwd,
         timeout: timeoutMs,
         killSignal: 'SIGKILL',
-        maxBuffer: 16 * 1024 * 1024,
+        maxBuffer: GIT_OUTPUT_CAP,
         encoding: 'utf8',
         env: { ...process.env, ...GIT_HARDENING_ENV },
       },
@@ -84,7 +84,7 @@ function git(args: string[], timeoutMs: number, cwd?: string): Promise<GitResult
 // cache dir. Tests tear that cache dir down at the end of a file, and a child
 // still writing into it turns the removal into ENOTEMPTY. This tracks the
 // children and lets a teardown stop them. It is never set on the real paths.
-const inFlightGitChildren = new Set<ReturnType<typeof execFile>>();
+const inFlightGitChildren = new Set<ChildProcess>();
 let backgroundWorkAborted = false;
 
 /** Stop every in-flight team-skills git child and refuse to start new ones. */
@@ -112,7 +112,7 @@ export async function settleTeamSkillsBackgroundWork(): Promise<void> {
  */
 function batchReadBlobs(bareDir: string, names: string[]): Promise<Map<string, string>> {
   return new Promise((resolve) => {
-    if (names.length === 0) {
+    if (backgroundWorkAborted || names.length === 0) {
       resolve(new Map());
       return;
     }
@@ -121,12 +121,15 @@ function batchReadBlobs(bareDir: string, names: string[]): Promise<Map<string, s
       env: { ...process.env, ...GIT_HARDENING_ENV },
       stdio: ['pipe', 'pipe', 'ignore'],
     });
+    inFlightGitChildren.add(child);
     const chunks: Buffer[] = [];
+    let bytes = 0;
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      inFlightGitChildren.delete(child);
       resolve(parseBatchBlobs(Buffer.concat(chunks)));
     };
     // A stalled network mount must not park the load forever — and with
@@ -135,14 +138,17 @@ function batchReadBlobs(bareDir: string, names: string[]): Promise<Map<string, s
       child.kill('SIGKILL');
       finish();
     }, LIST_TIMEOUT_MS);
-    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
-    child.on('error', () => {
-      clearTimeout(timer);
-      if (!settled) {
-        settled = true;
-        resolve(new Map());
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      const remaining = GIT_OUTPUT_CAP - bytes;
+      chunks.push(chunk.subarray(0, remaining));
+      bytes += Math.min(chunk.length, remaining);
+      if (chunk.length > remaining) {
+        child.kill('SIGKILL');
+        finish();
       }
     });
+    child.on('error', finish);
     child.on('close', finish);
     child.stdin.on('error', () => {});
     child.stdin.write(names.map((name) => `${name}\n`).join(''));
@@ -163,7 +169,8 @@ function parseBatchBlobs(buf: Buffer): Map<string, string> {
     if (!name || type === 'missing') continue;
     const size = Number(sizeText);
     if (!Number.isFinite(size) || size < 0) continue;
-    out.set(name, buf.toString('utf8', offset, offset + size));
+    if (offset + size + 1 > buf.length) break;
+    if (type === 'blob') out.set(name, buf.toString('utf8', offset, offset + size));
     offset += size + 1; // git terminates each body with a newline
   }
   return out;

@@ -243,7 +243,7 @@ export class SkillsUpdateService {
       // boot that a check already happened.
       this.states.set(repoRoot, state); return state;
     }
-    const lockPath = join(this.cacheDir, 'skills-update.lock');
+    const lockPath = join(this.home, '.cache', 'cez', 'skills-update.lock');
     let release: (() => Promise<void>) | undefined;
     try {
       release = await this.acquireLock(lockPath, rejectIfBusy);
@@ -294,7 +294,7 @@ export class SkillsUpdateService {
     if (!current?.checkedAt) current = await this.performCheck(repoRoot, false, rejectIfBusy);
     if (!current.available) return current;
 
-    const lockPath = join(this.cacheDir, 'skills-update.lock');
+    const lockPath = join(this.home, '.cache', 'cez', 'skills-update.lock');
     let release: (() => Promise<void>) | undefined;
     const completed = new Set<SkillsUpdateScope>();
     const outcomes: SkillsUpdateScopeState[] = [];
