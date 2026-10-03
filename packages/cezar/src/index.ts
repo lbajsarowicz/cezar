@@ -229,7 +229,7 @@ async function serveCommand(
     { detectEnvironment },
     { sweepStartupWorktrees },
     { isSupervised, restartProcess },
-    { printSkillsBanner },
+    { printSkillsBanner, printStarBanner },
   ] = await Promise.all([
     import('./workspace/boot.ts'),
     import('./workspace/semaphore.ts'),
@@ -256,7 +256,7 @@ async function serveCommand(
   // the previous process exited are re-queued or resumed instead of failed.
   const store = await openStore(repoRoot, { keepLive: true });
   const manager = new RunManager(store, repoRoot, { semaphore, projectId: bootProjectId, resolveTrackerEnv: resolveTrackerAgentEnv });
-  const providerAuth = new ProviderAuthService();
+  const providerAuth = new ProviderAuthService({ cwd: repoRoot });
   const workspaceEvents = new WorkspaceEventBus();
   const providerRuntimeAuth = new ProviderRuntimeAuthObserver(providerAuth, (status) => {
     workspaceEvents.emit('provider-status', status);
@@ -344,6 +344,8 @@ async function serveCommand(
   console.log(`\n  cockpit → ${url}\n`);
   // Silenced by CEZ_NO_BANNER=1 or by dismissing the cockpit's banner (#391).
   await printSkillsBanner(repoRoot);
+  // The star ask's terminal line — same block, same two off switches.
+  await printStarBanner(repoRoot);
 
   const shutdown = () => {
     store.flush();
@@ -501,7 +503,7 @@ async function runCommand(
     return;
   }
 
-  const providerAuth = new ProviderAuthService();
+  const providerAuth = new ProviderAuthService({ cwd: repoRoot });
   const requiredProviders = providersRequiredByWorkflow(
     workflow,
     (await loadConfig(repoRoot)).defaultRunner,

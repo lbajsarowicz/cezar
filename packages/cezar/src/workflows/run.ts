@@ -115,8 +115,6 @@ async function configuredModelProvider(
 ): Promise<string | undefined> {
   return readAgentModelProvider(backend, repoRoot).catch(() => undefined);
 }
-/** An interactive session that hears nothing from the user closes itself. */
-export const IDLE_TIMEOUT_MS = 15 * 60_000;
 /** Maximum time a live provider gets to honor cancellation before its slot is reaped. */
 const CANCEL_GRACE_MS = 1_000;
 /**
@@ -3697,7 +3695,7 @@ export class RunManager {
             // `CEZ:ASK` → park `waiting` (attention) AND surface the structured
             // question as an ask card (#473). `CEZ:MONITORING` → non-attention
             // `running`/`activity:'monitoring'` (#490). Both share the waiting
-            // lifecycle (free the slot, keep the idle timer). Monitoring is
+            // lifecycle (free the slot), while only plain waiting keeps the idle timer. Monitoring is
             // checked before the autonomous nudge, so it remains non-attention.
             if (ask) this.recordAsk(runId, sink, ask);
             if (monitoring) {
@@ -4562,7 +4560,7 @@ export class RunManager {
           // still working on its own downstream work with `CEZ:MONITORING`, which
           // parks as `running`/`activity:'monitoring'`, a non-attention state,
           // instead of raising "needs you" (#490). Lifecycle is identical: the
-          // run frees its slot and keeps the idle timer. The autonomous nudge
+          // run frees its slot; only plain waiting keeps the idle timer. The autonomous nudge
           // above still wins over either.
           if (ask) this.recordAsk(runId, sink, ask);
           // The final interactive step already parks at `waiting` by its own
@@ -5387,15 +5385,18 @@ export class RunManager {
 
   private armIdleTimer(runId: string, state: ActiveRun): void {
     this.clearIdleTimer(state);
+    const timeoutMinutes = this.semaphore.idleTimeoutMinutes();
+    if (timeoutMinutes === null || timeoutMinutes === 0) return;
+    const timeoutMs = timeoutMinutes * 60_000;
     state.idleTimer = setTimeout(() => {
       if (state.session?.open && !state.cancelled) {
         this.store.appendEvent(runId, {
           type: 'lifecycle',
-          message: `session closed after ${Math.round(IDLE_TIMEOUT_MS / 60_000)}m of inactivity`,
+          message: `session closed after ${Math.round(timeoutMs / 60_000)}m of inactivity`,
         });
         state.session.end();
       }
-    }, IDLE_TIMEOUT_MS);
+    }, timeoutMs);
     state.idleTimer.unref?.();
   }
 
