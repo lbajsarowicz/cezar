@@ -101,6 +101,7 @@ import { autoNamingActive, generateRunName, liveTitleUpdatesEnabled, postValidat
 import { reviewGateEnabled } from '../runs/review-gate.ts';
 import { resolveProfileEnvForRoot } from '../workspace/agent-profiles.ts';
 import { DEFAULT_AGENT_ACCOUNT_ID } from '../workspace/agent-accounts.ts';
+import { DEFAULT_IDLE_TIMEOUT_MINUTES } from '../workspace/config.ts';
 import { WorkspaceSemaphore, type AccountHolds } from '../workspace/semaphore.ts';
 import { UiEventSink } from '../runs/ui-event-sink.ts';
 import type { UiEvent } from '../core/ui-events.ts';
@@ -117,12 +118,8 @@ async function configuredModelProvider(
 }
 /** Maximum time a live provider gets to honor cancellation before its slot is reaped. */
 const CANCEL_GRACE_MS = 1_000;
-/**
- * How long a run may sit parked on `CEZ:MONITORING` with nothing waking it and no dispatched
- * child still in flight before it is handed to the user as `waiting`. Only a bound, never a
- * close: a monitor watching slow CI must not be settled as `done` behind its back (#661).
- */
-export const MONITORING_LIVENESS_MS = 4 * IDLE_TIMEOUT_MS;
+/** Fallback monitoring window when the waiting-session idle timeout is disabled. */
+export const MONITORING_LIVENESS_MS = 4 * DEFAULT_IDLE_TIMEOUT_MINUTES * 60_000;
 /**
  * Task-completion marker from the agent contract (HANDOFF_INSTRUCTIONS): a
  * turn whose text ends with `CEZ:DONE` means "goal achieved, nothing to ask" —
@@ -5541,6 +5538,10 @@ export class RunManager {
     // disabling the configured re-checks. Liveness therefore bounds only a park-mode (null) run;
     // at the wake-up cap (`atCap`) those re-checks no longer fire, so it is an exit again.
     if (!atCap && this.semaphore.monitoringWakeIntervalMinutes() !== null) return;
+    const timeoutMinutes = this.semaphore.idleTimeoutMinutes();
+    const timeoutMs = timeoutMinutes === null || timeoutMinutes === 0
+      ? MONITORING_LIVENESS_MS
+      : 4 * timeoutMinutes * 60_000;
     state.monitoringLivenessTimer = setTimeout(() => {
       state.monitoringLivenessTimer = undefined;
       if (!this.monitoring.has(runId) || !state.session?.open || state.cancelled) return;
@@ -5553,9 +5554,9 @@ export class RunManager {
       this.parkMonitorAsWaiting(
         runId,
         state,
-        `monitoring with no activity for ${Math.round(MONITORING_LIVENESS_MS / 60_000)}m; parked for your reply`,
+        `monitoring with no activity for ${Math.round(timeoutMs / 60_000)}m; parked for your reply`,
       );
-    }, MONITORING_LIVENESS_MS);
+    }, timeoutMs);
     state.monitoringLivenessTimer.unref?.();
   }
 
@@ -5570,9 +5571,9 @@ export class RunManager {
   }
 
   /**
-   * Turn a monitoring park into a `waiting` park: attention raised, the idle timer armed, the
+   * Turn a monitoring park into a `waiting` park: attention raised, idle timer armed if enabled,
    * session left open so a reply still lands in it. Parked like a `CEZ:ASK` (`askPark`), so a
-   * hand-off nobody answers settles `failed` with Continue, never as a finished run.
+   * hand-off nobody answers settles `failed` with Continue when the idle timer closes it.
    */
   private parkMonitorAsWaiting(runId: string, state: ActiveRun, message: string): void {
     if (!this.monitoring.has(runId) || !state.session?.open || state.cancelled) return;

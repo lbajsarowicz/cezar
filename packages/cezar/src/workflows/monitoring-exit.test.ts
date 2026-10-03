@@ -6,10 +6,10 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { handoffPath } from '../handoff.ts';
 import { RunStore, type RunRecord } from '../runs/store.ts';
+import { DEFAULT_IDLE_TIMEOUT_MINUTES } from '../workspace/config.ts';
 import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import {
   endsWithDoneMarker,
-  IDLE_TIMEOUT_MS,
   MAX_AUTO_CONTINUES,
   MONITORING_LIVENESS_MS,
   RunManager,
@@ -17,6 +17,7 @@ import {
 import type { WorkflowDef } from './types.ts';
 
 const run = promisify(execFile);
+const IDLE_TIMEOUT_MS = DEFAULT_IDLE_TIMEOUT_MINUTES * 60_000;
 const GIT_ID = ['-c', 'user.name=test', '-c', 'user.email=test@local'];
 const SINGLE_STEP: WorkflowDef = {
   name: 'quick-task',
@@ -147,6 +148,57 @@ describe('a parked monitor always has an exit', () => {
     expect(parked?.askParked).toBe(true);
     expect(stateOf(id)?.session?.open).toBe(true);
     expect(stateOf(id)?.idleTimer).toBeDefined();
+  }, 30_000);
+
+  it.each([5, 30])('tracks a configured idle timeout of %s minutes through hand-off and settlement', async (idleTimeoutMinutes) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+    manager = new RunManager(store, repoRoot, {
+      semaphore: new WorkspaceSemaphore({ initial: { monitoringWakeIntervalMinutes: null, idleTimeoutMinutes } }),
+    });
+    const id = await startMonitor();
+    const timeoutMs = idleTimeoutMinutes * 60_000;
+
+    vi.advanceTimersByTime(4 * timeoutMs - 1_000);
+    expect(store.getRun(id)?.activity).toBe('monitoring');
+    vi.advanceTimersByTime(1_000);
+    expect(store.getRun(id)?.status).toBe('waiting');
+    expect(store.getRun(id)?.askParked).toBe(true);
+    expect(stateOf(id)?.session?.open).toBe(true);
+    expect(stateOf(id)?.idleTimer).toBeDefined();
+    expect(notes(id)).toContain(`monitoring with no activity for ${4 * idleTimeoutMinutes}m; parked for your reply`);
+
+    vi.advanceTimersByTime(timeoutMs - 1_000);
+    expect(store.getRun(id)?.status).toBe('waiting');
+    expect(stateOf(id)?.session?.open).toBe(true);
+    vi.advanceTimersByTime(1_000);
+    await waitFor(id, (r) => r?.status === 'failed');
+    expect(store.getRun(id)?.error).toBe('the session closed before you replied — continue to reply');
+  }, 30_000);
+
+  it.each([null, 0])('rests at `waiting` with attention after the fallback bound when idle timeout is %s', async (idleTimeoutMinutes) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldAdvanceTime: true });
+    manager = new RunManager(store, repoRoot, {
+      semaphore: new WorkspaceSemaphore({ initial: { monitoringWakeIntervalMinutes: null, idleTimeoutMinutes } }),
+    });
+    const id = await startMonitor();
+    vi.advanceTimersByTime(MONITORING_LIVENESS_MS - 1_000);
+    expect(store.getRun(id)?.activity).toBe('monitoring');
+    vi.advanceTimersByTime(1_000);
+    expect(store.getRun(id)?.status).toBe('waiting');
+    expect(store.getRun(id)?.activity).toBeUndefined();
+    expect(store.getRun(id)?.askParked).toBe(true);
+    expect(stateOf(id)?.idleTimer).toBeUndefined();
+    expect(stateOf(id)?.monitoringLivenessTimer).toBeUndefined();
+    expect(stateOf(id)?.monitoringWakeTimer).toBeUndefined();
+
+    vi.advanceTimersByTime(24 * 60 * 60_000);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(store.getRun(id)?.status).toBe('waiting');
+    expect(store.getRun(id)?.askParked).toBe(true);
+    expect(store.getRun(id)?.error).toBeUndefined();
+    expect(stateOf(id)?.session?.open).toBe(true);
+    expect(stateOf(id)?.idleTimer).toBeUndefined();
+    expect(notes(id)).toContain('monitoring with no activity for 60m; parked for your reply');
   }, 30_000);
 
   it('settles an unanswered hand-off `failed` with Continue, never `done` or `review`', async () => {
