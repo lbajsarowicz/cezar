@@ -5,8 +5,9 @@ import { AGENT_MODELS_LOCKED_ENV } from './agent-model-policy.ts';
 import { profileEnv } from './agent-profiles.ts';
 import { resolveClaudeBin } from './claude-bin.ts';
 import { quoteExecutable, withEnvPrefix } from './shell-env.ts';
+import { probeJunieAuthentication } from './junie-auth-probe.ts';
 
-export const PROVIDER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi', 'copilot'] as const;
+export const PROVIDER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi', 'junie', 'copilot'] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 export type ProviderConnectionState =
   | 'connected'
@@ -143,7 +144,11 @@ const RUNTIME_AUTH_VERIFY_COOLDOWN_MS = 60_000;
  *  wrong answer, and it is now paid in the background; fixing it properly means per-provider
  *  timestamps and merging partial probe results. */
 function cacheTtlFor(rows: readonly ProviderStatus[]): number {
-  return rows.every((row) => row.status === 'connected') ? CONNECTED_TTL_MS : UNSETTLED_TTL_MS;
+  // Junie deliberately remains `unknown` after a successful handshake, so it must not force
+  // every other provider's cached credential result onto the short negative-answer window.
+  return rows.filter((row) => row.provider !== 'junie').every((row) => row.status === 'connected')
+    ? CONNECTED_TTL_MS
+    : UNSETTLED_TTL_MS;
 }
 const UNKNOWN_HINT = 'Authentication could not be verified. Try again.';
 const TIMEOUT_HINT = 'Authentication check timed out. Try again.';
@@ -245,6 +250,21 @@ function parseOpenCodeStatus(result: ProviderCommandResult): ProviderConnectionS
   return storedCount > 0 || environmentCount > 0 ? 'connected' : 'disconnected';
 }
 
+/**
+ * Dead code, on purpose: `probe()` special-cases `descriptor.id === 'junie'` and returns before
+ * `descriptor.parse` is ever reached, because a real Auth CHECK requires driving the ACP
+ * handshake itself (`initialize` → `authenticate` → `session/prompt`, confirmed live to be the
+ * only path that actually surfaces "no usable entitlement") — this synchronous
+ * execFile-and-regex probe has no seam for that. `junie --help`'s `Authentication:` section is
+ * write-only (`--auth=<token>`, `--<provider>-api-key=<key>`) so there is no `auth status`-shaped
+ * subcommand to parse in the first place. Kept only because `ProviderDescriptor.parse` is
+ * required on every entry — this is the junie descriptor's metadata-only placeholder, not a
+ * live code path.
+ */
+function parseJunieStatus(_result: ProviderCommandResult): ProviderConnectionState | null {
+  return null;
+}
+
 function parsePiStatus(result: ProviderCommandResult): ProviderConnectionState | null {
   if (result.exitCode !== 0) return null;
   const lines = normalizedLines(result.stdout);
@@ -332,6 +352,14 @@ const DESCRIPTORS: readonly ProviderDescriptor[] = [
     loginArgs: ['/login'],
     installHint: 'Install pi, then run `pi /login`.',
     parse: parsePiStatus,
+  },
+  {
+    id: 'junie',
+    executable: () => process.env.CEZ_JUNIE_BIN ?? 'junie',
+    statusArgs: [],
+    loginArgs: [],
+    installHint: 'Install Junie (https://junie.jetbrains.com/cli), then run `junie` once and log in.',
+    parse: parseJunieStatus,
   },
   {
     id: 'copilot',
@@ -441,6 +469,7 @@ export class ProviderAuthService {
   private readonly now: () => number;
   private readonly platform: NodeJS.Platform;
   private readonly createAuthFailureId: () => string;
+  private readonly probeJunie: () => Promise<{ connected: boolean; hint?: string; notInstalled?: boolean }>;
   private readonly runtimeFailures = new Map<ProviderId, RuntimeAuthFailure>();
   /** One self-check at a time per provider, and not more often than the cooldown. Both guard the
    *  same thing — a CLI spawn per auth-shaped error line — from the two directions it can arrive
@@ -469,11 +498,21 @@ export class ProviderAuthService {
     now?: () => number;
     platform?: NodeJS.Platform;
     createAuthFailureId?: () => string;
+    /** Working directory the junie ACP probe opens its session in. Defaults to `process.cwd()`,
+     *  but the server passes the boot project root so this agrees with the model catalog's own
+     *  discovery cwd (`server.ts`'s `bootRoot`) instead of silently diverging from it. */
+    cwd?: string;
+    probeJunie?: () => Promise<{ connected: boolean; hint?: string; notInstalled?: boolean }>;
   }) {
     this.runCommand = options?.runCommand ?? defaultRunProviderCommand;
     this.now = options?.now ?? Date.now;
     this.platform = options?.platform ?? process.platform;
     this.createAuthFailureId = options?.createAuthFailureId ?? randomUUID;
+    // Bounded to the SAME budget every other provider's status probe respects (#M2 review) — the
+    // discovery module's own 15s default exists for the explicit "Check again" / model-picker
+    // path, not for a status read that runs on every poll and warm-up.
+    this.probeJunie = options?.probeJunie
+      ?? (() => probeJunieAuthentication({ cwd: options?.cwd ?? process.cwd(), timeoutMs: COMMAND_TIMEOUT_MS }));
   }
 
   /**
@@ -766,6 +805,28 @@ export class ProviderAuthService {
   }
 
   private async probe(descriptor: ProviderDescriptor, configDir?: string | null): Promise<ProviderStatus> {
+    // Junie exposes no read-only auth status command. Its prompt-free model probe establishes
+    // both authentication and model access; invoking `junie --version` cannot establish either.
+    if (descriptor.id === 'junie') {
+      try {
+        const result = await this.probeJunie();
+        if (result.notInstalled) return { provider: 'junie', status: 'not-installed', hint: descriptor.installHint };
+        return result.connected
+          ? { provider: 'junie', status: 'connected' }
+          : { provider: 'junie', status: 'unknown', hint: result.hint };
+      } catch (error) {
+        // Same distinction as the try path above: a missing binary is "not-installed" (so the
+        // GUI never offers a runner that cannot run), everything else stays "unknown" (#M1).
+        if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+          return { provider: 'junie', status: 'not-installed', hint: descriptor.installHint };
+        }
+        return {
+          provider: 'junie',
+          status: 'unknown',
+          hint: `Junie authentication check failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
     const precheck = descriptor.precheck?.();
     if (precheck !== undefined) return { provider: descriptor.id, status: precheck };
     let result: ProviderCommandResult;

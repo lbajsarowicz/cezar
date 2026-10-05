@@ -104,6 +104,7 @@ const RUNNER_LABEL: Record<RunnerId, string> = {
   opencode: 'OpenCode',
   cursor: 'Cursor',
   pi: 'pi',
+  junie: 'Junie',
   copilot: 'GitHub Copilot',
 };
 

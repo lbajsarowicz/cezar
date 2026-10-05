@@ -51,6 +51,7 @@ const PROVIDER_HOME: Record<ProviderId, (home: ReturnType<typeof agentHomePaths>
   opencode: (home) => home.opencodeConfig,
   cursor: (home) => home.cursor,
   pi: (home) => home.claude,
+  junie: (home) => home.junie,
   copilot: (home) => home.copilot,
 };
 

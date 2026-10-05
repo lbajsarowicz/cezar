@@ -51,6 +51,7 @@ export interface RunnerOption {
 export const RUNNERS: readonly RunnerOption[] = [
   { id: 'claude', label: 'claude', desc: 'Claude Code CLI' },
   { id: 'codex', label: 'codex', desc: 'OpenAI Codex (app-server)' },
+  { id: 'junie', label: 'junie', desc: 'JetBrains Junie CLI' },
   { id: 'opencode', label: 'opencode', desc: 'OpenCode (serve)' },
   { id: 'cursor', label: 'cursor', desc: 'Cursor Agent CLI' },
   { id: 'pi', label: 'pi', desc: 'pi CLI (provider/model)' },
@@ -86,6 +87,9 @@ export const MODELS_BY_RUNNER: Record<Runner, readonly ModelPreset[]> = {
   ],
   opencode: [
     { id: '', label: 'auto', desc: 'Use your OpenCode default model' },
+  ],
+  junie: [
+    { id: '', label: 'auto', desc: 'Use your Junie default model' },
   ],
   cursor: [
     { id: '', label: 'auto', desc: 'Use your Cursor default model' },
@@ -195,6 +199,7 @@ const DISCOVERY_RUNNER_LABEL: Record<ModelDiscoveryRunner, string> = {
   claude: 'Claude',
   codex: 'Codex',
   opencode: 'OpenCode',
+  junie: 'Junie',
   cursor: 'Cursor',
 }
 

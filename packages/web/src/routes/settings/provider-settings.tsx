@@ -20,6 +20,7 @@ import { providerStatusFor } from '@/lib/provider-status'
 export const PROVIDERS = [
   { id: 'claude', label: 'Claude Code', login: 'claude auth login' },
   { id: 'codex', label: 'Codex', login: 'codex login' },
+  { id: 'junie', label: 'Junie', login: 'junie login' },
   { id: 'opencode', label: 'OpenCode', login: 'opencode auth login' },
   { id: 'cursor', label: 'Cursor', login: 'agent login' },
   { id: 'pi', label: 'pi', login: 'pi /login' },
@@ -29,6 +30,7 @@ export const PROVIDERS = [
 const providerWriteState = <T,>(value: T): Record<ProviderId, T> => ({
   claude: value,
   codex: value,
+  junie: value,
   opencode: value,
   cursor: value,
   pi: value,
@@ -244,7 +246,7 @@ export function ProviderSettings() {
                       </p>
                     ) : state === 'unknown' || (status.isError && !state) ? (
                       <p className="mt-1.5 text-xs text-soft-foreground">
-                        Verification failed. Check again when the provider is available.
+                        {current?.hint ?? 'Verification failed. Check again when the provider is available.'}
                       </p>
                     ) : current?.hint ? (
                       <p className="mt-1.5 text-xs text-soft-foreground">{current.hint}</p>

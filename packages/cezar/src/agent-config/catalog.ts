@@ -37,6 +37,8 @@ export interface AgentHomePaths {
   cursor: string;
   /** `$COPILOT_HOME` or `~/.copilot` */
   copilot: string;
+  /** `~/.junie` — no relocation var documented (see `PROFILE_ENV_VAR.junie`) */
+  junie: string;
 }
 
 export interface ConfigFileDef {

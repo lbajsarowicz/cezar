@@ -35,7 +35,7 @@ id — that is the whole point of the seam.
 ### Identity
 
 ```ts
-const RUNNER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi'] as const;  // the source of truth
+const RUNNER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi', 'junie'] as const;  // the source of truth
 type RunnerId     = (typeof RUNNER_IDS)[number];                             // user-selectable
 type AgentBackend = RunnerId | 'claude-cli';                                 // + legacy id, still parses
 ```
@@ -383,7 +383,10 @@ or a new fixture set forgets one — a named row fails. The matrix:
 - sub-agent **nesting** via `parentItemId` — only where the wire attributes work
   to its parent (claude's `parent_tool_use_id`, opencode's child-session parts
   under a `subtask`); codex, cursor and pi have no parent attribution in their
-  wire format, so their matrix cell is the task-kind tool items above instead
+  wire format, so their matrix cell is the task-kind tool items above instead.
+  junie (core ACP) has no parent attribution either, and its task-kind
+  substitute is unavailable for the same protocol reason (core ACP's
+  `tool_call.kind` has no `task` value), so that row carries a cited `except`
 
 A new backend is not "done" until it produces every row its wire format is
 capable of. **Documented exceptions are allowed** when a capability provably

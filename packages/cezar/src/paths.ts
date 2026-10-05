@@ -168,6 +168,7 @@ export function agentHomePaths(env: NodeJS.ProcessEnv = process.env): AgentHomeP
     opencodeConfig: join(xdgConfig, 'opencode'),
     cursor: env.CURSOR_CONFIG_DIR?.trim() || join(home, '.cursor'),
     copilot: env.COPILOT_HOME?.trim() || join(home, '.copilot'),
+    junie: join(home, '.junie'),
   };
 }
 

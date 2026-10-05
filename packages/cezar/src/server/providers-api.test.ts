@@ -25,8 +25,18 @@ vi.mock('../core/claude-bin.ts', async (importOriginal) => ({
   resolveClaudeBin: () => process.env.CEZ_CLAUDE_BIN ?? 'claude',
 }));
 
-/** One status command per provider — the size of a full probe round. */
-const PROBE_ROUND = PROVIDER_IDS.length;
+// Junie has no read-only auth-status command, so `ProviderAuthService` probes it through a real
+// ACP session instead of `runCommand`. Left unmocked, every status probe in this suite spawned a
+// real `junie` process — authenticating against JetBrains for real on a machine that has it
+// installed and logged in (#M3 review). Every test here expects junie 'connected', so a constant
+// stub matches every case.
+vi.mock('../core/junie-auth-probe.ts', () => ({
+  probeJunieAuthentication: vi.fn(async () => ({ connected: true })),
+}));
+
+/** One status command per provider — the size of a full probe round. Junie is probed through
+ *  `probeJunieAuthentication` (mocked above), never `runCommand`, so it is not counted. */
+const PROBE_ROUND = PROVIDER_IDS.filter((provider) => provider !== 'junie').length;
 
 const CONNECTED_OUTPUT: Record<ProviderId, string> = {
   claude: '{"loggedIn":true}',
@@ -42,6 +52,10 @@ const CONNECTED_OUTPUT: Record<ProviderId, string> = {
     userInfo: { email: 'dev@example.com' },
   }),
   pi: 'provider  model  context  max-out  thinking  images\nanthropic  claude  200K  64K  yes  yes',
+  // junie never reaches `runCommand`/`parse` at all — `probe()` special-cases it onto
+  // `probeJunieAuthentication` (mocked above), so this value is only here to satisfy
+  // `Record<ProviderId, string>` and is never read.
+  junie: 'Junie version: 26.9.22 (3419.7)',
   // Copilot's probe drives its ACP server, so its "connected" evidence is the `session/new`
   // answer (`.ai/runs/2026-09-27-copilot-cli-runner/copilot-acp-notes.md`).
   copilot: '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"3f1b6f2e-0000-4000-8000-1f2e3d4c5b6a"}}',
@@ -59,11 +73,12 @@ const DISCONNECTED_OUTPUT: Record<ProviderId, string> = {
     isAuthenticated: false,
   }),
   pi: 'No models available. Use /login to authenticate.',
+  junie: 'Junie version: 26.9.22 (3419.7)',
   copilot: '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Authentication required"}}',
 };
 
 const providerForExecutable = (executable: string): ProviderId => {
-  if (executable === 'claude' || executable === 'codex' || executable === 'opencode' || executable === 'pi' || executable === 'copilot') return executable;
+  if (executable === 'claude' || executable === 'codex' || executable === 'opencode' || executable === 'pi' || executable === 'junie' || executable === 'copilot') return executable;
   if (executable === 'agent') return 'cursor';
   throw new Error(`unexpected executable: ${executable}`);
 };
@@ -192,6 +207,7 @@ describe('workspace provider API', () => {
         },
         { provider: 'cursor', status: 'connected', enabled: true },
         { provider: 'pi', status: 'connected', enabled: true },
+        { provider: 'junie', status: 'connected', enabled: true },
         { provider: 'copilot', status: 'connected', enabled: true },
       ],
     });
@@ -214,6 +230,7 @@ describe('workspace provider API', () => {
         { provider: 'opencode', status: 'connected', enabled: true },
         { provider: 'cursor', status: 'connected', enabled: true },
         { provider: 'pi', status: 'connected', enabled: true },
+        { provider: 'junie', status: 'connected', enabled: true },
         { provider: 'copilot', status: 'connected', enabled: true },
       ],
     });

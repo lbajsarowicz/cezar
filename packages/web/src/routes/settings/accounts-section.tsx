@@ -92,6 +92,7 @@ import { AddAccountDialog } from './add-account-dialog'
 const PROVIDER_LABEL: Record<ProviderId, string> = {
   claude: 'Claude Code',
   codex: 'Codex',
+  junie: 'Junie',
   opencode: 'OpenCode',
   cursor: 'Cursor',
   pi: 'pi',
@@ -102,6 +103,7 @@ const PROVIDER_LABEL: Record<ProviderId, string> = {
 const PROVIDER_INSTALL: Record<ProviderId, string> = {
   claude: 'curl -fsSL https://claude.ai/install.sh | bash',
   codex: 'npm i -g @openai/codex',
+  junie: 'https://www.jetbrains.com/junie/',
   opencode: 'https://opencode.ai',
   cursor: 'curl https://cursor.com/install -fsS | bash',
   pi: 'https://github.com/badlogic/pi-mono',

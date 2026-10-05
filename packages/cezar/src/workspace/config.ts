@@ -159,6 +159,7 @@ const agentDefaultsSchema = z
         opencode: z.string().trim().min(1).max(200).optional().catch(undefined),
         cursor: z.string().trim().min(1).max(200).optional().catch(undefined),
         pi: z.string().trim().min(1).max(200).optional().catch(undefined),
+        junie: z.string().trim().min(1).max(200).optional().catch(undefined),
         copilot: z.string().trim().min(1).max(200).optional().catch(undefined),
       })
       .passthrough()

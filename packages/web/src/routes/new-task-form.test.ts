@@ -109,6 +109,11 @@ describe('model option resolution', () => {
     expect(modelsForRunner('codex', catalog, ['legacy-id']).at(-1)?.desc).toBe('Custom or legacy model')
   })
 
+  it('junie: auto plus host-discovered models', () => {
+    const catalog = { runner: 'junie' as const, models: [{ id: 'v1:model:junie:sonnet', label: 'Sonnet', description: 'Junie model' }], source: 'live' as const, stale: false }
+    expect(modelsForRunner('junie', catalog).map((m) => m.id)).toEqual(['', 'v1:model:junie:sonnet'])
+  })
+
   it('cursor: auto alone until the host catalog answers, plus host-discovered ids once it does', () => {
     expect(modelsForRunner('cursor').map((m) => m.id)).toEqual([''])
     expect(
@@ -134,6 +139,7 @@ describe('model option resolution', () => {
   it.each([
     ['codex', 'Codex'],
     ['claude', 'Claude'],
+    ['junie', 'Junie'],
     ['cursor', 'Cursor'],
   ] as const)('names %s in its stale/unavailable rows without exposing raw reasons', (runner, label) => {
     expect(modelCatalogStatus(runner, { runner, models: [], source: 'cache', stale: true, reason: 'raw' })).toBe(`Using cached ${label} model list`)
@@ -158,7 +164,7 @@ describe('model option resolution', () => {
     // #794 gave OpenCode a catalog, #784 gave Claude one and #807 gave Cursor one. The contract's
     // list is the single source both the route and the picker compile against — this asserts they
     // still agree on who discovers, and that a runner is never added to it by accident.
-    expect(MODEL_DISCOVERY_RUNNERS).toEqual(['claude', 'codex', 'opencode', 'cursor'])
+    expect(MODEL_DISCOVERY_RUNNERS).toEqual(['claude', 'codex', 'opencode', 'cursor', 'junie'])
     expect(MODEL_DISCOVERY_RUNNERS.every((runner) => runnerDiscoversModels(runner))).toBe(true)
   })
 

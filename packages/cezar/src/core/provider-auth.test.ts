@@ -15,6 +15,9 @@ vi.mock('./claude-bin.ts', async (importOriginal) => ({
   ...await importOriginal<typeof import('./claude-bin.ts')>(),
   resolveClaudeBin: (env: NodeJS.ProcessEnv = process.env) => env.CEZ_CLAUDE_BIN || 'claude',
 }));
+vi.mock('./junie-auth-probe.ts', () => ({
+  probeJunieAuthentication: vi.fn(async () => ({ connected: true })),
+}));
 
 import { PROVIDER_IDS } from './provider-auth.ts';
 import {
@@ -24,6 +27,7 @@ import {
   type ProviderCommandResult,
   type RunProviderCommand,
 } from './provider-auth.ts';
+import { probeJunieAuthentication } from './junie-auth-probe.ts';
 
 const connectedResults: Record<string, ProviderCommandResult> = {
   claude: { stdout: '{"loggedIn":true}', stderr: '', exitCode: 0 },
@@ -92,8 +96,10 @@ afterEach(() => {
 });
 
 /** One status command per provider — the size of a full probe round. Derived rather than
- *  written out so adding runner #6 does not mean editing a dozen literal counts in this file. */
-const PROBE_ROUND = PROVIDER_IDS.length;
+ *  written out so adding runner #6 does not mean editing a dozen literal counts in this file.
+ *  Junie is the exception: `probe()` routes it through `probeJunieAuthentication`, never
+ *  `runCommand`, so it is a status row but not a status command. */
+const PROBE_ROUND = PROVIDER_IDS.filter((provider) => provider !== 'junie').length;
 
 function resultFor(executable: string): ProviderCommandResult {
   if (executable === 'claude') return connectedResults.claude!;
@@ -617,6 +623,7 @@ describe('ProviderAuthService', () => {
         { provider: 'opencode' },
         { provider: 'cursor' },
         { provider: 'pi' },
+        { provider: 'junie', status: 'connected' },
         { provider: 'copilot' },
       ],
     });
@@ -1096,6 +1103,7 @@ describe('ProviderAuthService', () => {
         { provider: 'opencode', status: 'connected' },
         { provider: 'cursor', status: 'connected' },
         { provider: 'pi', status: 'connected' },
+        { provider: 'junie', status: 'connected' },
         { provider: 'copilot', status: 'connected' },
       ],
     });
@@ -1208,6 +1216,7 @@ describe('ProviderAuthService', () => {
         { provider: 'opencode', status: 'connected' },
         { provider: 'cursor', status: 'connected' },
         { provider: 'pi', status: 'connected' },
+        { provider: 'junie', status: 'connected' },
         { provider: 'copilot', status: 'connected' },
       ],
     });
@@ -1263,7 +1272,7 @@ describe('ProviderAuthService', () => {
       const before = spawns;
       now += 60 * 60_000; // an hour later
 
-      expect(service.peekStatus()?.providers).toHaveLength(PROBE_ROUND);
+      expect(service.peekStatus()?.providers).toHaveLength(PROVIDER_IDS.length);
       expect(service.peekProfileStatus('claude', 'work')).toBeDefined();
       expect(spawns).toBe(before); // …and still nothing spawned
     });
@@ -1286,7 +1295,7 @@ describe('ProviderAuthService', () => {
       await service.status();
       await service.profileStatus('claude', { id: 'work', configDir: '/work' });
       const before = spawns;
-      expect(service.peekStatus()?.providers).toHaveLength(PROBE_ROUND);
+      expect(service.peekStatus()?.providers).toHaveLength(PROVIDER_IDS.length);
       expect(service.peekProfileStatus('claude', 'work')?.profileId).toBe('work');
       expect(spawns).toBe(before);
     });

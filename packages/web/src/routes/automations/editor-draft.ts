@@ -221,6 +221,7 @@ export function templatePick(template: AutomationTemplate): TemplatePick {
 const isRunner = (value: string): value is Runner =>
   value === 'claude' ||
   value === 'codex' ||
+  value === 'junie' ||
   value === 'opencode' ||
   value === 'cursor' ||
   value === 'pi' ||

@@ -41,6 +41,8 @@ const RESUME_COMMAND_PREFIX: Record<Runner, string> = {
   codex: 'codex resume',
   opencode: 'opencode --session',
   cursor: 'agent --resume',
+  // Junie names the session by flag, not positionally — handled in resumeCommand.
+  junie: 'junie --resume',
   pi: 'pi --session',
   copilot: 'copilot --resume',
 }
@@ -55,6 +57,7 @@ const RESUME_COMMAND_PREFIX: Record<Runner, string> = {
  *  either. Fails closed: no hint beats a hint that runs `rm -rf ~` on paste. */
 export function resumeCommand(runner: Runner | undefined, sessionId: string): string | undefined {
   if (!SAFE_SESSION_ID.test(sessionId)) return undefined
+  if (runner === 'junie') return `${RESUME_COMMAND_PREFIX.junie} --session-id=${sessionId}`
   return `${RESUME_COMMAND_PREFIX[runner ?? 'claude']} ${sessionId}`
 }
 

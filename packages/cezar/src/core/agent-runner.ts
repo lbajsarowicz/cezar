@@ -11,7 +11,9 @@
  *  - `opencode` — `opencode serve`, HTTP + SSE;
  *  - `cursor`   — Cursor Agent CLI, headless print mode (`stream-json`);
  *  - `pi`       — pi coding CLI, RPC over JSONL stdin/stdout, selecting its
- *                 model with `provider/model`.
+ *                 model with `provider/model`;
+ *  - `junie`    — JetBrains Junie CLI, real Agent Client Protocol (ACP:
+ *                 `junie --acp=true`), JSON-RPC 2.0 (JSONL) over stdin/stdout.
  */
 
 import type { UiEvent } from './ui-events.ts';
@@ -22,7 +24,7 @@ import type { UiEvent } from './ui-events.ts';
  * server-install "at least one agent CLI" gate, the CLI-handoff registry) rather than repeating
  * the literals, so adding runner #7 is a one-line change here and typecheck finds the rest.
  */
-export const RUNNER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi', 'copilot'] as const;
+export const RUNNER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi', 'junie', 'copilot'] as const;
 
 /** The user-selectable runners (what config/GUI expose). */
 export type RunnerId = (typeof RUNNER_IDS)[number];

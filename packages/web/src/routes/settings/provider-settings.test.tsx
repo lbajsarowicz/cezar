@@ -128,7 +128,7 @@ describe('ProviderSettings', () => {
       [...document.querySelectorAll('[data-slot="provider-card"]')].map((item) =>
         item.querySelector('h3')?.textContent,
       ),
-    ).toEqual(['Claude Code', 'Codex', 'OpenCode', 'Cursor', 'pi', 'GitHub Copilot CLI'])
+    ).toEqual(['Claude Code', 'Codex', 'Junie', 'OpenCode', 'Cursor', 'pi', 'GitHub Copilot CLI'])
   })
 
   it('presents discovery truth, enablement, and runtime recovery without hiding diagnostics', async () => {
@@ -189,6 +189,7 @@ describe('ProviderSettings', () => {
         providers: [
           { provider: 'claude', status: 'connected', enabled: true },
           { provider: 'codex', status: 'unknown', enabled: true },
+          { provider: 'junie', status: 'unknown', enabled: true, hint: 'Junie authentication check failed: invalid credentials.' },
           { provider: 'opencode', status: 'connected', enabled: true },
           { provider: 'cursor', status: 'not-installed', enabled: true },
         ],
@@ -201,6 +202,7 @@ describe('ProviderSettings', () => {
     expect(within(card('codex')).getByRole('button', { name: 'Check again' })).toBeTruthy()
     expect(within(card('codex')).queryByText('Not connected')).toBeNull()
     expect(within(card('codex')).queryByRole('button', { name: 'Connect' })).toBeNull()
+    expect(within(card('junie')).getByText('Junie authentication check failed: invalid credentials.')).toBeTruthy()
   })
 
   it('connects with only the provider id, then explains the terminal flow and refreshes status', async () => {
