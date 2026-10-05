@@ -48,6 +48,7 @@ import {
   type PickVariantResponse,
   type RunIndexEntry,
   type RunsIndexResponse,
+  type StarCountPayload,
 } from '@open-mercato/cezar-contract';
 // A contract VALUE, like `workspaceUiStateSchema` in workspace/migrations.ts — the request
 // schema this route validates with is the same one the client compiles against.
@@ -67,6 +68,7 @@ import { discoverClaudeModels } from '../core/claude-model-catalog.ts';
 import { discoverCodexModels } from '../core/codex-model-catalog.ts';
 import { discoverCursorModels } from '../core/cursor-model-catalog.ts';
 import { discoverOpencodeModels } from '../core/opencode-model-catalog.ts';
+import { discoverJunieModels } from '../core/junie-model-catalog.ts';
 import {
   PROVIDER_IDS,
   ProviderAuthService,
@@ -93,8 +95,9 @@ import {
 import { planChain, slugify } from '../planner.ts';
 import { discoverSkills } from '../skills.ts';
 import { SkillsUpdateConflictError, SkillsUpdateCoordinator, SkillsUpdateService, type SkillsUpdateState } from '../skills-update.ts';
-import { selfUpdateApplyRequestSchema, selfUpdateChannelRequestSchema } from '@open-mercato/cezar-contract';
+import { selfUpdateApplyRequestSchema, selfUpdateChannelRequestSchema, selfUpdateDevelopmentQuerySchema } from '@open-mercato/cezar-contract';
 import { SelfUpdateBusyError, SelfUpdateService } from '../self-update/service.ts';
+import { StarCountReader } from './star-count.ts';
 import { getTeamSkillsCached, refreshTeamSkills, waitForTeamSkills } from '../skills-remote.ts';
 import { appendHandoffHeartbeat, handoffProgressExcerpt, readHandoff } from '../handoff.ts';
 import { markStarted, onTodosChanged, readTodos, removeTodo, todoTaskText, type TodoItem } from '../todos.ts';
@@ -146,7 +149,7 @@ import {
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { findConfigFile } from '../agent-config/catalog.ts';
 import { readConfigFile, statConfigPath, writeConfigFile } from '../agent-config/files.ts';
-import { readAgentModelDefaults } from '../agent-config/models.ts';
+import { type AgentModelDefaults, readAgentModelDefaults } from '../agent-config/models.ts';
 import { listAgentConfig } from '../agent-config/service.ts';
 import { listConfigFiles, type AgentHomePaths } from '../agent-config/catalog.ts';
 import { readAccountIdentity } from '../agent-config/account-identity.ts';
@@ -306,6 +309,10 @@ export interface ServerDeps {
    *  the CLI, which knows the entry file, the port and how to restart; absent in tests and for
    *  bare `createApp` callers, where the family answers a read-only "not available" status. */
   selfUpdate?: SelfUpdateService;
+  /** cezar's own GitHub star count behind `GET /api/v1/star-count` (the cockpit's ⭐ ask).
+   *  Defaults to a reader that asks github.com at most once per six hours and caches the answer
+   *  under `~/.cache/cez/`; tests inject their own so no suite ever reaches the network. */
+  starCount?: { read(): Promise<StarCountPayload> };
   /** WebSocket subscription hub (`/api/v1/ws`, src/server/ws.ts). `createApp`
    *  only registers topics on it — `startServer` builds one and attaches it
    *  to the HTTP server it binds. Optional so legacy callers/tests change
@@ -581,6 +588,7 @@ export interface WorkspaceConfigResponse {
   resources: {
     maxParallel: number;
     maxMonitoringSessions: number;
+    idleTimeoutMinutes: number | null;
     monitoringWakeIntervalMinutes: number | null;
     autoResumeOnUsageLimit: boolean;
     memoryLimitMb: number | null;
@@ -819,6 +827,11 @@ const uiStateSchema = z
     // The GitHub tab's last-selected sub-tab (#417): issues or PRs. ADDITIVE — an old
     // ui-state.json without the key behaves as the default (issues).
     githubView: z.enum(['issues', 'prs']).optional(),
+    // The GitHub tab's list order: newest first (what `gh` returns) or oldest first, for working
+    // the backlog from the long-waiting end. ADDITIVE, like `githubView` above — an old
+    // ui-state.json without the key behaves as the default (newest), and the sort is applied
+    // client-side, so this key changes presentation only, never what `GET /github` fetches.
+    githubSort: z.enum(['newest', 'oldest']).optional(),
     // Settings → Appearance (redesign R6): accent + density. ADDITIVE — the theme itself
     // stays in the browser (`cez-theme` localStorage, pre-paint). The cockpit always PUTs
     // the whole object because the top-level merge below is shallow.
@@ -1142,10 +1155,11 @@ export function createApp(deps: ServerDeps) {
       claude: { discover: () => discoverClaudeModels({ cwd: bootRoot }) },
       codex: { discover: () => discoverCodexModels({ cwd: bootRoot }) },
       opencode: { discover: () => discoverOpencodeModels({ cwd: bootRoot }) },
+      junie: { discover: () => discoverJunieModels({ cwd: bootRoot }) },
       cursor: { discover: () => discoverCursorModels() },
     },
   });
-  const providerAuth = deps.providerAuth ?? new ProviderAuthService();
+  const providerAuth = deps.providerAuth ?? new ProviderAuthService({ cwd: bootRoot });
   const workspaceConfig = deps.workspaceConfig ?? {
     load: loadWorkspaceConfig,
     mergeWrite: mergeWriteWorkspaceConfig,
@@ -1211,6 +1225,7 @@ export function createApp(deps: ServerDeps) {
       readOnly: true,
       trimPaths: () => !capabilities().localHandoff,
     });
+  const starCount = deps.starCount ?? new StarCountReader();
 
   // ---- workspace boot-project identity (multi-project spec) ----------------
   // The boot flow (`initWorkspace` in src/index.ts) registers the boot repo
@@ -1793,7 +1808,7 @@ export function createApp(deps: ServerDeps) {
     // `modelDiscoveryRunnerSchema` is the contract's own list of the runners with an
     // authoritative host-local catalog (#794, #784), so the client compiles against exactly what
     // this validates. A runner absent from it has no discovery path and this 400s.
-    .get('/models', queryZodValidator(z.object({ runner: z.union([z.string(), z.array(z.string()).transform((v) => v[0] as string)]).pipe(modelDiscoveryRunnerSchema) }), { message: 'runner must be claude, codex, opencode, or cursor' }), async (c) => {
+    .get('/models', queryZodValidator(z.object({ runner: z.union([z.string(), z.array(z.string()).transform((v) => v[0] as string)]).pipe(modelDiscoveryRunnerSchema) }), { message: 'runner must be claude, codex, opencode, cursor, or junie' }), async (c) => {
       const query = { data: c.req.valid('query') };
       return c.json(await modelCatalog.get(query.data.runner));
     });
@@ -1917,7 +1932,7 @@ export function createApp(deps: ServerDeps) {
       },
     )
 
-    .post('/providers/connect', jsonZodValidator(providerConnectSchema, { message: 'provider must be claude, codex, opencode, cursor, or pi' }), async (c) => {
+    .post('/providers/connect', jsonZodValidator(providerConnectSchema, { message: 'provider must be claude, codex, opencode, cursor, pi, or copilot' }), async (c) => {
       const body = { data: c.req.valid('json') };
 
       const provider = body.data.provider as ProviderId;
@@ -2972,12 +2987,25 @@ export function createApp(deps: ServerDeps) {
   // registry, so the request cannot inject code, and a VPS behind the installer's Basic auth
   // is exactly where "update from the cockpit" replaces `cezar server-deploy` — but hosted
   // applies are FORWARD-ONLY (see the guard on /apply below).
+  // ---- chained family: the star ask (workspace-level) ----------------------
+  // cezar's own star count, for the cockpit's ⭐ button. Workspace-level and single-mount, like
+  // `/health`: it says nothing about any project, and there is nothing for a project scope to
+  // change about it. Never fails — `{ available: false }` is the ordinary offline answer, so the
+  // cockpit's chip simply is not there rather than showing an error nobody asked for.
+  const starCountRoutes = new Hono().get('/star-count', async (c) => c.json(await starCount.read()));
+
   const selfUpdateRoutes = new Hono()
     .get('/workspace/self-update', async (c) => c.json(await selfUpdate.status()))
 
     .post('/workspace/self-update/refresh', async (c) => c.json(await selfUpdate.status({ refresh: true })))
 
-    .put('/workspace/self-update/channel', jsonZodValidator(selfUpdateChannelRequestSchema, { message: 'body must be { channel: "stable" | "nightly" }' }), async (c) => {
+    // The development channel's pickers: cezar's own worktrees and its open PRs' preview builds.
+    // A separate read because it costs a git call per worktree and a GitHub round trip.
+    .get('/workspace/self-update/development', queryZodValidator(selfUpdateDevelopmentQuerySchema), async (c) =>
+      c.json(await selfUpdate.development({ refresh: c.req.valid('query').refresh === '1' })),
+    )
+
+    .put('/workspace/self-update/channel', jsonZodValidator(selfUpdateChannelRequestSchema, { message: 'body must be { channel: "stable" | "nightly" | "development" }' }), async (c) => {
       const { channel } = c.req.valid('json');
       await selfUpdate.setChannel(channel);
       return c.json(await selfUpdate.status());
@@ -3052,6 +3080,7 @@ export function createApp(deps: ServerDeps) {
     resources: {
       maxParallel: config.resources.maxParallel,
       maxMonitoringSessions: config.resources.maxMonitoringSessions,
+      idleTimeoutMinutes: config.resources.idleTimeoutMinutes,
       monitoringWakeIntervalMinutes: config.resources.monitoringWakeIntervalMinutes,
       autoResumeOnUsageLimit: config.resources.autoResumeOnUsageLimit,
       memoryLimitMb: config.resources.memoryLimitMb,
@@ -3205,6 +3234,7 @@ export function createApp(deps: ServerDeps) {
       .object({
         maxParallel: z.number().int().min(1).max(16).optional(),
         maxMonitoringSessions: z.number().int().min(0).max(16).optional(),
+        idleTimeoutMinutes: z.number().int().min(0).max(1440).nullable().optional(),
         monitoringWakeIntervalMinutes: z.number().int().min(1).max(60).nullable().optional(),
         autoResumeOnUsageLimit: z.boolean().optional(),
         memoryLimitMb: z.number().int().min(0).max(1_048_576).nullable().optional(),
@@ -3223,6 +3253,8 @@ export function createApp(deps: ServerDeps) {
             opencode: z.string().trim().min(1).max(200).nullable().optional(),
             cursor: z.string().trim().min(1).max(200).nullable().optional(),
             pi: z.string().trim().min(1).max(200).nullable().optional(),
+            junie: z.string().trim().min(1).max(200).nullable().optional(),
+            copilot: z.string().trim().min(1).max(200).nullable().optional(),
           })
           .optional(),
       })
@@ -5901,6 +5933,20 @@ export function createApp(deps: ServerDeps) {
       return c.json({ branch: result.branch, created: result.created });
     });
 
+  // An explicit "auto" default becomes `''` on the wire (#906): the empty id IS
+  // auto in every model picker, so an older cockpit reading this answer shows
+  // auto too rather than tripping over an unknown sentinel. Only `true` counts —
+  // `false` is the absence of an opinion, not an opinion.
+  // Typed rather than left to `Object.fromEntries`' index signature: `configAnswer`'s return type
+  // is asserted `Exact` against `configResponseSchema` (contract-parity.workspace.test.ts), and an
+  // index signature leaking into the spread would widen `defaultModels` past the contract.
+  const autoModelOverrides = (auto: CezConfig['defaultModelsAuto']): AgentModelDefaults =>
+    Object.fromEntries(
+      Object.entries(auto ?? {})
+        .filter(([, isAuto]) => isAuto === true)
+        .map(([runner]) => [runner, '']),
+    );
+
   // The Settings → Agents knobs in one read (R6 Step 1.5) — an ADDITIVE
   // sibling of PUT /api/config below; /api/health keeps its protected shape.
   const configAnswer = async (repoRoot: string, config: CezConfig) => {
@@ -5912,9 +5958,17 @@ export function createApp(deps: ServerDeps) {
       systemPrompt: config.systemPrompt ?? null,
       // Native defaults seed each runner independently. A Cezar preset remains
       // selectable unless the operator opts into the fixed-model policy.
+      // An explicit auto override (#906) answers `''` for that runner — the one
+      // way to say "ignore the agent's own configured default" without editing
+      // the vendor's settings file. It layers over the native seed and under a
+      // repo preset, so setting a preset later simply wins.
       defaultModels: modelsLocked
         ? nativeModels
-        : { ...nativeModels, ...(config.defaultModels ?? {}) },
+        : {
+            ...nativeModels,
+            ...autoModelOverrides(config.defaultModelsAuto),
+            ...(config.defaultModels ?? {}),
+          },
       modelsLocked,
       maxParallel: config.maxParallel,
       memoryLimitMb: config.memoryLimitMb ?? null,
@@ -5939,7 +5993,12 @@ export function createApp(deps: ServerDeps) {
     .put('/config', jsonZodValidator(() => setConfigSchema), async (c) => {
       const { root: repoRoot, dataDir } = c.get('project');
       const parsed = { data: c.req.valid('json') };
-      if (agentModelsLocked(repoRoot) && parsed.data.defaultModels !== undefined) {
+      // The auto override is a model choice too (#906), so the fixed-model
+      // policy refuses it on exactly the same terms as a preset.
+      if (
+        agentModelsLocked(repoRoot) &&
+        (parsed.data.defaultModels !== undefined || parsed.data.defaultModelsAuto !== undefined)
+      ) {
         return c.json({ error: AGENT_MODELS_LOCKED_ERROR }, 409);
       }
       const configPath = join(dataDir, 'config.json');
@@ -6000,6 +6059,22 @@ export function createApp(deps: ServerDeps) {
         if (Object.keys(current).length === 0) delete raw.defaultModels;
         else raw.defaultModels = current;
       }
+      if (parsed.data.defaultModelsAuto !== undefined) {
+        // Same per-runner merge as the presets above, and the same "store only a
+        // real opinion" rule: `false`/`null` deletes rather than persisting a
+        // key that means nothing (#906).
+        const current =
+          raw.defaultModelsAuto && typeof raw.defaultModelsAuto === 'object'
+            ? { ...(raw.defaultModelsAuto as Record<string, unknown>) }
+            : {};
+        for (const [runner, isAuto] of Object.entries(parsed.data.defaultModelsAuto)) {
+          if (isAuto === undefined) continue;
+          if (isAuto) current[runner] = true;
+          else delete current[runner];
+        }
+        if (Object.keys(current).length === 0) delete raw.defaultModelsAuto;
+        else raw.defaultModelsAuto = current;
+      }
       try {
         await mkdir(dataDir, { recursive: true });
         await writeFile(configPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
@@ -6016,6 +6091,7 @@ export function createApp(deps: ServerDeps) {
   // the file. All fields optional + additive: `null` (and `''` for the
   // R6 keys) clears a knob back to its default.
   const modelPresetSchema = z.string().trim().max(200).nullable().optional();
+  const autoModelSchema = z.boolean().nullable().optional();
   const setConfigSchema = z.object({
     baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
     defaultRunner: z.enum(RUNNER_IDS).optional(),
@@ -6027,6 +6103,18 @@ export function createApp(deps: ServerDeps) {
         opencode: modelPresetSchema,
         cursor: modelPresetSchema,
         pi: modelPresetSchema,
+      })
+      .optional(),
+    // Per-runner "auto is the default" override (#906). Additive, and necessarily
+    // its own key: clearing a preset cannot express an explicit auto, because the
+    // answer then falls through to the coding agent's own settings file.
+    // `false`/`null` clears the override back to no opinion.
+    defaultModelsAuto: z
+      .object({
+        claude: autoModelSchema,
+        codex: autoModelSchema,
+        opencode: autoModelSchema,
+        pi: autoModelSchema,
       })
       .optional(),
     // Concurrency + memory guard (Settings → Resources). maxParallel clamps to
@@ -6344,6 +6432,7 @@ export function createApp(deps: ServerDeps) {
     .route('/', agentProfilesRoutes)
     .route('/', skillsUpdateRoutes)
     .route('/', selfUpdateRoutes)
+    .route('/', starCountRoutes)
     .route('/', workspaceConfigRoutes)
     .route('/', fsBrowseRoutes)
     .route('/', automationChecksRoutes)
@@ -6685,6 +6774,12 @@ export function quoteResumeBin(bin: string): string | null {
 export function resumeCommand(runner: string | undefined, sessionId: string): string | null {
   if (!isSafeSessionId(sessionId)) return null;
   switch (runner) {
+    case 'junie':
+      // Verified live (`junie --help`, 26.9.22): `--resume` alone reopens the LAST session;
+      // the target session is named by the separate `--session-id=<id>` flag, not a positional
+      // argument (junie's positional slot is `[<task>]`) — `junie --resume ${sessionId}` would
+      // silently resume the wrong session and read the id as a task prompt instead.
+      return `junie --resume --session-id=${sessionId}`;
     case 'codex':
       return `codex resume ${sessionId}`;
     case 'opencode':
@@ -6695,6 +6790,9 @@ export function resumeCommand(runner: string | undefined, sessionId: string): st
     }
     case 'pi':
       return `pi --session ${sessionId}`;
+    case 'copilot':
+      // `--resume <id>` takes a session id, a task id or an id prefix (`copilot --help`, 1.0.88).
+      return `copilot --resume ${sessionId}`;
     default:
       return `claude --resume ${sessionId}`;
   }
