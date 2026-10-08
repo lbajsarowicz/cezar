@@ -41,6 +41,20 @@ export const EOF_KILL_GRACE_MS = 4_000;
 /** Reopen window after a turn ends before an auto-ended session closes stdin. */
 export const AUTO_END_DELAY_MS = 250;
 
+/**
+ * Claude runs through cezar's headless stream-json transport. There is no
+ * cockpit permission response channel yet, so a denial must become actionable
+ * prose rather than an invitation to use Claude Code's interactive controls.
+ */
+export const CLAUDE_HEADLESS_GUIDANCE = `You are running Claude Code through cezar's headless integration. Permission prompts cannot be answered in the cezar cockpit. If a tool call is denied, do not suggest Shift+Tab, /permissions, changing Claude permission settings, or replying Continue to retry it. Report the exact blocked tool and path or command, stop retrying that operation, and explain that the task's actual Open in… action is the workaround: continue in an interactive claude --resume <session id> shell in the task worktree and approve the prompt there. Do not use filesystem workarounds or claim that cezar can approve the request.`;
+
+/** Keep caller-owned instructions intact while adding guidance owned by this backend. */
+export function appendClaudeSystemPrompt(systemPrompt?: string): string {
+  return systemPrompt
+    ? `${systemPrompt}\n\n---\n\n${CLAUDE_HEADLESS_GUIDANCE}`
+    : CLAUDE_HEADLESS_GUIDANCE;
+}
+
 export interface ClaudeCliRunnerOptions {
   /** Override the binary name/path; defaults to `claude` on PATH. */
   bin?: string;
@@ -368,7 +382,8 @@ export class ClaudeCliRunner implements AgentRunner {
  * `stream_event` token deltas the cockpit renders as live text;
  * `--permission-mode dontAsk` keeps headless runs non-interactive: tools in
  * `--allowedTools` proceed and everything else is denied instead of prompting.
- * `CEZ_APPROVAL_GATE=1` opts back into Claude's approval UI (#435).
+ * `CEZ_APPROVAL_GATE=1` selects Claude's `acceptEdits` mode, but cezar still
+ * has no cockpit permission response channel.
  */
 export function buildClaudeArgs(
   spec: AgentRunSpec,
@@ -385,9 +400,7 @@ export function buildClaudeArgs(
     '--permission-mode',
     env.CEZ_APPROVAL_GATE === '1' ? 'acceptEdits' : 'dontAsk',
   ];
-  if (spec.systemPrompt) {
-    args.push('--append-system-prompt', spec.systemPrompt);
-  }
+  args.push('--append-system-prompt', appendClaudeSystemPrompt(spec.systemPrompt));
   // Pin the session so the user can `claude --resume <sessionId>` in the repo
   // to take over interactively after a run. With `resume` we reopen the
   // existing on-disk conversation instead.
