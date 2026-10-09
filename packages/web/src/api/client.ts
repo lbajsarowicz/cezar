@@ -1,4 +1,4 @@
-import { trackerReadScope } from '@open-mercato/cezar-api-client'
+import { trackerReadScope, resolveApiUrl, workspaceBrandingLogoResponseSchema } from '@open-mercato/cezar-api-client'
 import type { TrackerAutomationOptions } from '@open-mercato/cezar-api-client'
 import { trackerWatchHandleSchema, trackerWatchSnapshotSchema, type TrackerWatchInput } from "@open-mercato/cezar-api-client"
 import type {
@@ -102,6 +102,10 @@ import type {
   WorktreeEntry,
   SaveWorkflowInput,
   SaveWorkflowResponse,
+  SaveWorkflowGraphInput,
+  ValidateWorkflowGraphResponse,
+  WorkflowGraph,
+  WorkflowNodeCatalogResponse,
   SetConfigInput,
   SetConfigResponse,
   SetAgentConfigInput,
@@ -2006,6 +2010,36 @@ export async function createWorkflow(input: SaveWorkflowInput): Promise<SaveWork
   )
 }
 
+/** Graph workflows (spec 2026-09-30-workflow-node-editor): the palette's node catalog. */
+export async function getWorkflowNodes(opts?: ReadOptions): Promise<WorkflowNodeCatalogResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].workflows.nodes.$get({ param: { projectId: queryScope() } }, init(opts)),
+    '/workflows/nodes',
+  )
+}
+
+/** Structural problems of a graph (`[]` when sound) — the editor calls it as you edit. */
+export async function validateWorkflowGraph(graph: WorkflowGraph): Promise<ValidateWorkflowGraphResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].workflows.validate.$post({
+      param: { projectId: queryScope() },
+      json: { graph },
+    }),
+    '/workflows/validate',
+  )
+}
+
+/** Save a `version: 2` graph workflow. A 409 carries `exists: true` like `createWorkflow`. */
+export async function saveWorkflowGraph(input: SaveWorkflowGraphInput): Promise<SaveWorkflowResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].workflows.graph.$post({
+      param: { projectId: queryScope() },
+      json: input,
+    }),
+    '/workflows/graph',
+  )
+}
+
 /** Import support for the builder (spec 012): the server parses + validates pasted workflow
  *  YAML (either form) and answers the normalized definition. */
 export async function parseWorkflow(yaml: string): Promise<ParsedWorkflow> {
@@ -2080,6 +2114,11 @@ export async function getWorkspaceConfig(opts?: ReadOptions): Promise<WorkspaceC
   )
   return {
     ...answer,
+    // Brand settings are additive; a cockpit served against an older cezar build falls back
+    // cleanly to its built-in identity instead of failing during shell render.
+    branding: answer.branding
+      ? { ...answer.branding, logoUrl: answer.branding.logoUrl ? resolveApiUrl(answer.branding.logoUrl) : null }
+      : { name: 'cezar', logoUrl: null },
     agentDefaults: answer.agentDefaults ?? {},
     resources: {
       ...answer.resources,
@@ -2090,6 +2129,29 @@ export async function getWorkspaceConfig(opts?: ReadOptions): Promise<WorkspaceC
         : answer.resources.idleTimeoutMinutes,
     },
   }
+}
+
+/** Upload the workspace logo through the shared API boundary (base URL, credentials, and errors). */
+export async function uploadWorkspaceBrandingLogo(file: File): Promise<string | null> {
+  const form = new FormData()
+  form.set('file', file)
+  const response = await send('/workspace/branding-logo', { method: 'POST', body: form })
+  const body = await response.text()
+  if (!response.ok) throw errorFor(response.status, response.statusText, body)
+  const parsed = parseJson(body)
+  const result = workspaceBrandingLogoResponseSchema.safeParse(parsed)
+  if (!result.success) throw new ApiError(response.status, 'the cezar server answered /workspace/branding-logo with an unexpected body')
+  return result.data.logoUrl ? resolveApiUrl(result.data.logoUrl) : null
+}
+
+/** Remove the workspace logo through the shared API boundary. */
+export async function deleteWorkspaceBrandingLogo(): Promise<string | null> {
+  const response = await send('/workspace/branding-logo', { method: 'DELETE' })
+  const body = await response.text()
+  if (!response.ok) throw errorFor(response.status, response.statusText, body)
+  const result = workspaceBrandingLogoResponseSchema.safeParse(parseJson(body))
+  if (!result.success) throw new ApiError(response.status, 'the cezar server answered /workspace/branding-logo with an unexpected body')
+  return result.data.logoUrl ? resolveApiUrl(result.data.logoUrl) : null
 }
 
 /**

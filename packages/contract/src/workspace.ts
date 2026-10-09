@@ -26,6 +26,10 @@ import { type Runner, runnerSchema } from './health.ts';
  * was wider than the server has ever been.
  */
 export const workspaceConfigResponseSchema = z.object({
+  branding: z.object({
+    name: z.string(),
+    logoUrl: z.string().nullable(),
+  }),
   /** Root exposed by the Add-project directory browser — stored as written (`~` kept). */
   browseRoot: z.string(),
   /** Checkout root for GUI-cloned projects — stored as written (`~` kept). */
@@ -81,6 +85,9 @@ export type WorkspaceConfigResponse = z.infer<typeof workspaceConfigResponseSche
  * the next load's `.catch`.
  */
 export const setWorkspaceConfigInputSchema = z.object({
+  branding: z.object({
+    name: z.string().trim().min(1).max(80).nullable().optional(),
+  }).optional(),
   browseRoot: z.string().trim().min(1).max(4096).optional(),
   projectsDir: z.string().trim().min(1).max(4096).optional(),
   skillsAutoUpdate: z.boolean().nullable().optional(),
@@ -121,6 +128,10 @@ export const setWorkspaceConfigInputSchema = z.object({
     .optional(),
 });
 export type SetWorkspaceConfigInput = z.infer<typeof setWorkspaceConfigInputSchema>;
+
+/** Multipart upload result for the workspace's local instance logo. */
+export const workspaceBrandingLogoResponseSchema = z.object({ logoUrl: z.string().nullable() });
+export type WorkspaceBrandingLogoResponse = z.infer<typeof workspaceBrandingLogoResponseSchema>;
 
 // ---- GUI prefs — the two open bags ----------------------------------------------------------
 
@@ -197,6 +208,14 @@ export const uiStateSchema = z.looseObject({
   dismissedSkillsBanner: z.boolean().optional(),
 });
 export type UiState = z.infer<typeof uiStateSchema>;
+
+/** Maximum persisted text for one reusable prompt template (#908).
+ *
+ * 20,000 characters accommodates long skills while keeping each ui-state entry bounded. The
+ * server write schema and cockpit editor mirror this documented value; the response schema above
+ * remains intentionally permissive so older/newer ui-state files round-trip safely.
+ */
+export const PROMPT_TEMPLATE_TEXT_MAX = 20_000;
 
 /**
  * `GET/PUT /api/v1/workspace/ui-state` — cross-project GUI prefs in `~/.cezar/ui-state.json`
