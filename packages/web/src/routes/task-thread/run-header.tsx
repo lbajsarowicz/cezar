@@ -68,7 +68,7 @@ import { OpenInMenu, type OpenInChoice } from '@/components/open-in-menu'
 import { toast } from '@/components/ui/toaster'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { DirectionalUsage } from '@/components/directional-usage'
-import { deriveAttention } from '@/lib/attention'
+import { budgetStop, deriveAttention } from '@/lib/attention'
 import { queuePositions, runTitle } from '@/lib/task-groups'
 import { usableRunners } from '@/lib/provider-status'
 import {
@@ -106,7 +106,7 @@ import { useDraft } from './thread-draft'
  */
 /** Which run-detail tab this header instance sits above — drives the active underline.
  *  A prop rather than a route match so the header stays testable with a bare render. */
-export type RunTab = 'session' | 'changes' | 'commits' | 'files'
+export type RunTab = 'session' | 'changes' | 'commits' | 'files' | 'graph'
 
 /** Which runs the reader has expanded the phone-width meta row for (#765). A module-level map for
  *  the same reason `WorkflowSteps` keeps one (`openByRun` in step-rail.tsx) — and it has to be BOTH
@@ -154,6 +154,7 @@ function RunHeaderView({
   continuationEngine,
 }: RunHeaderProps) {
   const attention = deriveAttention(run)
+  const budget = budgetStop(run)
   const flags = runActionFlags(run)
   const hint = resumeHint(run)
   const [notesOpen, setNotesOpen] = useState(false)
@@ -203,6 +204,11 @@ function RunHeaderView({
               {attention.label}
               {queuePosition !== undefined ? ` #${queuePosition}` : ''}
             </Pill>
+            {budget ? (
+              <span data-slot="budget-stop" className="text-xs text-muted-foreground tabular-nums">
+                Spent {formatCost(budget.spent) || '$0.00'} of {formatCost(budget.ceiling) || '$0.00'}
+              </span>
+            ) : null}
             {/* Phone-width only: above `md` the meta row never collapses, so a control to expand
                 it would be a permanently disabled-looking chevron next to always-visible content.
                 On the Session tab of a run with a plan it lands in the slot #764 freed by hiding
@@ -265,6 +271,12 @@ function RunHeaderView({
           <TabLink to={`/tasks/${run.id}/files`} active={tab === 'files'}>
             Files
           </TabLink>
+          {/* The live workflow graph — every run with a definition: a step list opens as its graph. */}
+          {run.workflowDef ? (
+            <TabLink to={`/tasks/${run.id}/graph`} active={tab === 'graph'}>
+              Graph
+            </TabLink>
+          ) : null}
 
           <div data-slot="run-actions" className="ml-auto hidden items-center gap-1 pb-1 md:flex">
             {flags.finish ? (

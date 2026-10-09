@@ -109,7 +109,10 @@ describe('task thread', () => {
     ) as string[]
     expect(bubbles).toHaveLength(2)
     expect(bubbles[0]).toContain('Summarize what this project does.')
-    expect(bubbles[1]).toBe('Thanks — now show the markdown summary. mock:md')
+    // The bubble renders a `MessageTime` under its text, so `textContent` ends in a wall clock
+    // that no assertion can pin. Match the message and require that a time follows, rather than
+    // freezing whatever the clock happened to read.
+    expect(bubbles[1]).toMatch(/^Thanks — now show the markdown summary\. mock:md\s*\d{1,2}:\d{2}/)
 
     // Right-aligned: the bubble hugs the column's right content edge (within its padding),
     // sits entirely right of the midline, while assistant content starts at the left edge.
@@ -252,6 +255,11 @@ describe('task thread', () => {
   })
 
   it('the step rail maps the record steps to checklist rows over the progress bar', () => {
+    // The rail is COLLAPSED by default — the trigger shows a one-line summary with its own bar,
+    // and the per-step rows only exist once it is open. Reading straight for the rows threw on
+    // a null progress bar.
+    browser.evaluate(`document.querySelector('[data-slot="workflow-steps"] button')?.click()`)
+    browser.waitForFunction(`document.querySelector('[data-slot="step-progress"] > div') !== null`)
     const rail = browser.evaluate(`(() => {
       const rows = [...document.querySelectorAll('[data-slot="step-row"]')]
       return {
@@ -269,7 +277,7 @@ describe('task thread', () => {
     expect(rail.bar).toBe('100%') // both steps terminal — (1 + 1) / 2
   })
 
-  it('the plan dock shows the LATEST snapshot (2/4), expanded on desktop, mirrored in the header', () => {
+  it('the plan dock shows the LATEST snapshot (2/4), settled for this finished run, mirrored in the header', () => {
     expect(browser.evaluate(`document.querySelector('[data-slot="plan-dock"]').dataset.state`)).toBe('open')
     expect(browser.evaluate(`document.querySelector('[data-slot="plan-count"]').textContent`)).toBe('· 2/4')
     expect(browser.evaluate(`document.querySelector('[data-slot="plan-mirror"]').textContent`)).toBe('Plan 2/4')
@@ -281,18 +289,34 @@ describe('task thread', () => {
     }))`) as Array<{ status: string; text: string }>
     expect(items.map((i) => i.status)).toEqual(['completed', 'completed', 'in_progress', 'pending'])
     expect(items[2]!.text).toContain('Summarize cockpit features')
-    expect(items[2]!.text).toContain('in progress')
+
+    // …and the RENDERING settles, because this fixture run's status is `done`: the agent's
+    // reported status survives as data (asserted above), but a closed session is never still
+    // working on it, so the tag and the pulse are gone and the head says 2/4 was as far as it
+    // got. The live counterpart lives in the unit suite (`task-thread.test.tsx`), which has a
+    // running run to render; every run this fixture serves is terminal by design.
+    expect(browser.evaluate(`document.querySelector('[data-slot="plan-dock"]').dataset.settled`)).toBe('true')
+    expect(items[2]!.text).not.toContain('in progress')
+    expect(browser.count('[data-slot="plan-tag"]')).toBe(0)
+    expect(browser.count('[data-slot="plan-dock"] .animate-pulse')).toBe(0)
+    expect(browser.evaluate(`document.querySelector('[data-slot="plan-unfinished"]').textContent`)).toBe(
+      '· left unfinished',
+    )
 
     // It sits in the dock region above the composer area, not in the thread flow.
     expect(browser.evaluate(`document.querySelector('[data-slot="thread-dock"] [data-slot="plan-dock"]') !== null`)).toBe(true)
   })
 
-  it('collapsing the dock folds it to the odometer + the activeForm of the current item', () => {
+  it('collapsing the dock folds it to the odometer — a settled run names no current item', () => {
     browser.click('[data-slot="plan-dock"] button')
     browser.waitForFunction(`document.querySelector('[data-slot="plan-dock"]').dataset.state === 'collapsed'`)
     expect(browser.count('[data-slot="plan-list"]')).toBe(0)
-    expect(browser.evaluate(`document.querySelector('[data-slot="plan-current"]').textContent`)).toBe(
-      '— Summarizing cockpit features',
+    // A live dock folds to "— <activeForm>". This one's session is closed, so there is no current
+    // item to name: the collapsed head is the odometer plus the unfinished note, nothing implying
+    // the agent is still on item 3.
+    expect(browser.count('[data-slot="plan-current"]')).toBe(0)
+    expect(browser.evaluate(`document.querySelector('[data-slot="plan-unfinished"]').textContent`)).toBe(
+      '· left unfinished',
     )
     // Re-expand so the desktop screenshot below captures the full checklist.
     browser.click('[data-slot="plan-dock"] button')
@@ -332,17 +356,35 @@ describe('task thread', () => {
     expect(meta).toContain('quick-task')
     expect(meta).toContain('cez/fcd519dd')
     expect(meta).toContain('+1 −0')
-    expect(meta).toContain('3.6k tokens')
+    // Tokens render as the DIRECTIONAL pair (`DirectionalUsage`), not one total — the header
+    // moved to input/output and the fixture never followed, so the token half of this line had
+    // quietly stopped rendering and the assertion was testing its own absence. The fixture now
+    // carries both (2900 + 720 = the 3620 it always claimed).
+    expect(meta).toContain('IN 2.9k')
+    expect(meta).toContain('OUT 720')
     expect(meta).toContain('$0.04')
-    // The fixture is a claude run — the runner stays out of the line, like the mockup.
-    expect(meta).not.toContain('claude')
+    // The runner stays OUT of the metadata parts — the original claim here, kept rather than
+    // inverted. It does appear inside `run-meta`, but only within the agent badge that #750
+    // (spec 2026-07-29-agent-profiles) added as a right-aligned sibling of the parts, so a bare
+    // `toContain` over the whole container could no longer express it. Subtracting the badge
+    // asks the question the line was written to ask.
+    const parts = browser.evaluate(`(() => {
+      const box = document.querySelector('[data-slot="run-meta"]').cloneNode(true)
+      box.querySelector('[data-slot="agent-badge"]')?.remove()
+      return box.textContent
+    })()`) as string
+    expect(parts).not.toContain('claude')
+    // …and the badge is where naming the agent does belong.
+    expect(
+      browser.evaluate(`document.querySelector('[data-slot="agent-badge"]').textContent`),
+    ).toContain('claude')
     // Branch renders as the mono chip, not plain text.
     expect(
       browser.evaluate(`document.querySelector('[data-slot="branch-chip"]').textContent`),
     ).toBe('cez/fcd519dd')
   })
 
-  it('tabs point at the routed Session/Changes/Files surfaces; the done run offers the closed-run actions', () => {
+  it('tabs point at the routed Session/Changes/Files/Graph surfaces; the done run offers the closed-run actions', () => {
     const tabs = browser.evaluate(`[...document.querySelectorAll('[data-slot="run-tabs"] a')].map((a) => ({
       text: a.textContent,
       href: a.getAttribute('href'),
@@ -353,12 +395,13 @@ describe('task thread', () => {
       { text: 'Changes', href: scoped(`/tasks/${RUN_ID}/changes`), current: null },
       { text: 'Commits', href: scoped(`/tasks/${RUN_ID}/commits`), current: null },
       { text: 'Files', href: scoped(`/tasks/${RUN_ID}/files`), current: null },
+      { text: 'Graph', href: scoped(`/tasks/${RUN_ID}/graph`), current: null },
     ])
 
     const actions = browser.evaluate(
       `[...document.querySelectorAll('[data-slot="run-actions"] button')].map((b) => b.textContent.trim())`,
     ) as string[]
-    expect(actions).toEqual(['Continue', 'Open in…', 'Notes', 'Archive', 'Delete'])
+    expect(actions).toEqual(['Continue', 'Open in…', 'Notes', 'Mark unread', 'Pin', 'Archive', 'Delete'])
 
     // The take-over hint, per-backend (the fixture's last agent session, in its worktree).
     const hint = browser.evaluate(

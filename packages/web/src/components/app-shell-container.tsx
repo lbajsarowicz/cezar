@@ -1,11 +1,12 @@
-import { memo, useMemo, type ReactNode } from 'react'
+import { memo, useEffect, useMemo, type ReactNode } from 'react'
 import { useLocation } from 'react-router'
 
-import { useHealth, useProjectRuns, useProjects, useRuns, useSkillsUpdate, useTodos } from '@/api/queries'
+import { useHealth, useProjectRuns, useProjects, useRunsForProject, useSkillsUpdate, useStarCount, useTodos, useWorkspaceConfig } from '@/api/queries'
 import type { HealthResponse, SkillsUpdateState } from '@open-mercato/cezar-api-client'
 import { AppShell, type RepoChip } from '@/components/app-shell'
 import { CommandPalette } from '@/components/command-palette'
 import { ListViewProvider } from '@/components/list-view'
+import { HostUsageWidget } from '@/components/host-usage-widget'
 import { ProviderBannerContainer } from '@/components/provider-banner-container'
 import { ProjectGroups } from '@/components/project-groups'
 import { TaskQuickListContainer } from '@/components/task-quick-list'
@@ -57,6 +58,12 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
   const { pathname } = useLocation()
   const projectId = useActiveProjectId()
   const health = useHealth()
+  const workspaceConfig = useWorkspaceConfig()
+  const branding = workspaceConfig.data?.branding
+  const customBranding = branding !== undefined && (
+    branding.name !== 'cezar' || branding.logoUrl !== null
+  )
+  const starCount = useStarCount(!customBranding && workspaceConfig.data !== undefined)
   // The global inbox is opt-in (#471). With the capability off there is no Inbox nav item to
   // badge and the endpoint can only answer [], so the query parks rather than polls.
   const inboxAvailable = health.data?.capabilities.followups === true
@@ -68,15 +75,17 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
   // mobile drawer, and grouped sidebar). Routes reuse this TanStack Query cache entry.
   const skillsUpdate = useSkillsUpdate(projectId ?? '', projectId !== null)
   const skillsUpdateAvailable = skillsUpdateMarkerOf(skillsUpdate.data)
-  // Unread done items (#unread-done-items) for the Tasks badge. Reads the same active-scope run
-  // list the sidebar quick-list and Tasks table already hold — one cache entry, no extra fetch.
-  const unreadDoneCountSelector = useMemo(() => unreadDoneCount, [])
-  const runs = useRuns(unreadDoneCountSelector)
   const registry = useProjects().data
   const titleContext = pageTitleContext(pathname)
   const bootProjectId = registry?.bootProject ?? health.data?.bootProject ?? null
+  // Unread done items (#unread-done-items) for the Tasks badge. This shell sits ABOVE the routed
+  // project provider, so name the URL project explicitly instead of reading the module scope.
+  const unreadDoneCountSelector = useMemo(() => unreadDoneCount, [])
+  const runs = useRunsForProject(projectId, bootProjectId, unreadDoneCountSelector)
   const isBootProject = projectId !== null && projectId === bootProjectId
   const activeProject = registry?.projects.find((project) => project.id === projectId)
+  const bootProject = registry?.projects.find((project) => project.id === bootProjectId)
+  const tracker = projectId === null ? bootProject?.tracker : activeProject?.tracker
   const titleRunId = titleContext.taskId
   const titleLabel = useProjectRuns(
     projectId ?? '',
@@ -104,7 +113,7 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
       (isBootProject ? (repoChipOf(health.data)?.name ?? null) : null))
   const pageLabel = titleLabel ?? titleContext.pageLabel
 
-  useDocumentTitle({ projectName, pageLabel })
+  useDocumentTitle({ projectName, pageLabel, brandName: workspaceConfig.data?.branding.name, brandLogoUrl: workspaceConfig.data?.branding.logoUrl })
 
   // Multi-project sidebar only from the SECOND project on (multi-project spec, "Sidebar").
   // With one registered project — or with the registry still loading, or unreachable — the
@@ -118,6 +127,11 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
   )
   const banner = useMemo(() => <ProviderBannerContainer />, [])
   const taskQuickList = useMemo(() => <TaskQuickListContainer />, [])
+  // The sidebar glance. Created here, not inside `AppShell`, because the shell stays presentational
+  // and QueryClient-free: the widget's own wrapper evaluates the viewport and transport gates and
+  // mounts nothing below `md` or in remote, so neither the CSS-hidden column nor a hosted cockpit
+  // ever pays for a sample it cannot show.
+  const hostWidget = useMemo(() => <HostUsageWidget />, [])
   const projectGroups = useMemo(
     () =>
       projects ? (
@@ -150,8 +164,14 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
     <ListViewProvider>
       <AppShell
         repo={repo}
+        brandName={workspaceConfig.data?.branding.name ?? 'cezar'}
+        brandLogoUrl={workspaceConfig.data?.branding.logoUrl ?? null}
         version={health.data?.version ?? null}
         latestVersion={health.data?.latestVersion ?? null}
+        // The ⭐ ask's count. Same honesty rule as the chips above: `available: false` — offline,
+        // a rate-limited IP, or promos silenced with `CEZ_NO_BANNER=1` — is `null` here, and
+        // AppShell renders no chip for it rather than a button that cannot count.
+        starCount={!customBranding && starCount.data?.available ? (starCount.data.count ?? null) : null}
         // `?? null` rather than `?? 0`: no badge while the inbox is unknown, and no badge when it
         // is known to be empty — AppShell renders neither for a falsy count.
         inboxCount={todos.data?.length ?? null}
@@ -168,9 +188,11 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
         inboxAvailable={inboxAvailable}
         // Hidden unless health reports the opt-in automations capability (#801).
         automationsAvailable={automationsAvailable}
+        tracker={tracker}
         banner={banner}
         singleProject={health.data?.capabilities.singleProject === true}
         taskQuickList={taskQuickList}
+        hostWidget={hostWidget}
         // Present only in a multi-project workspace; `AppShell` renders the flat nav and the
         // quick-list above whenever this slot is absent.
         projectGroups={projectGroups}

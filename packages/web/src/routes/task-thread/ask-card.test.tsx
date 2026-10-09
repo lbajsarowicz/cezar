@@ -25,6 +25,7 @@ afterEach(() => {
       { provider: 'claude', status: 'connected', enabled: true },
       { provider: 'codex', status: 'not-installed', enabled: true },
       { provider: 'opencode', status: 'not-installed', enabled: true },
+      { provider: 'cursor', status: 'not-installed', enabled: true },
     ],
   }
 })
@@ -113,6 +114,16 @@ const twoQuestionAsk: ThreadAsk = {
   ],
 }
 
+describe('AskCard — who asks', () => {
+  it('names the agent by default and the workflow for a graph gate/question', () => {
+    const { unmount } = renderAsk(singleAsk)
+    expect(screen.getByText('The agent is asking')).toBeTruthy()
+    unmount()
+    renderAsk({ ...singleAsk, fromWorkflow: true })
+    expect(screen.getByText('The workflow is asking')).toBeTruthy()
+  })
+})
+
 describe('AskCard', () => {
   it('renders the header, question and each option with its description', () => {
     renderAsk(singleAsk)
@@ -185,6 +196,7 @@ describe('AskCard', () => {
         claude,
         { provider: 'codex', status: 'connected', enabled: true },
         { provider: 'opencode', status: 'not-installed', enabled: true },
+        { provider: 'cursor', status: 'not-installed', enabled: true },
       ],
     }
 
@@ -287,6 +299,7 @@ describe('AskCard — answering after the session has ended', () => {
         { provider: 'claude', status: 'disconnected', enabled: true },
         { provider: 'codex', status: 'connected', enabled: true },
         { provider: 'opencode', status: 'not-installed', enabled: true },
+        { provider: 'cursor', status: 'not-installed', enabled: true },
       ],
     }
 

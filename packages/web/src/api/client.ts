@@ -1,3 +1,6 @@
+import { trackerReadScope, resolveApiUrl, workspaceBrandingLogoResponseSchema } from '@open-mercato/cezar-api-client'
+import type { TrackerAutomationOptions } from '@open-mercato/cezar-api-client'
+import { trackerWatchHandleSchema, trackerWatchSnapshotSchema, type TrackerWatchInput } from "@open-mercato/cezar-api-client"
 import type {
   AgentConfigFileContent,
   AgentAccountDetailsResponse,
@@ -61,6 +64,7 @@ import type {
   GithubPrChangesData,
   GroupResponse,
   HealthResponse,
+  HostUsage,
   AttachmentInput,
   LaunchKeyResponse,
   MessageInput,
@@ -94,9 +98,14 @@ import type {
   RunnerModelCatalogResponse,
   RunRecord,
   RunsIndexResponse,
+  StarCountPayload,
   WorktreeEntry,
   SaveWorkflowInput,
   SaveWorkflowResponse,
+  SaveWorkflowGraphInput,
+  ValidateWorkflowGraphResponse,
+  WorkflowGraph,
+  WorkflowNodeCatalogResponse,
   SetConfigInput,
   SetConfigResponse,
   SetAgentConfigInput,
@@ -111,6 +120,18 @@ import type {
   WorkspaceConfigResponse,
   WorkspaceUiState,
   SkillsUpdateState,
+  SelfUpdateDevelopment,
+  SelfUpdateStatus,
+  UpdateChannel,
+  TrackerAssociation,
+  TrackerAssociationInput,
+  TrackerAssociationResponse,
+  TrackerAssociationSavedResponse,
+  TrackerCandidatesResponse,
+  TrackerClearedResponse,
+  TrackerItemResponse,
+  TrackerItemsResponse,
+  TrackerKind, TrackerCredentials, TrackerConnectionResponse,
 } from '@open-mercato/cezar-api-client'
 import { parseProviderStatusResponse } from '@/lib/provider-status'
 import {
@@ -237,7 +258,7 @@ function errorFor(status: number, statusText: string, body: string): ApiError {
  * `Record<string, unknown>`) infers a weaker response than the DTO it replaces, so those wait
  * until the server tightens its own return types.
  */
-const cez = createCezarClient<AppType>({
+export const cez = createCezarClient<AppType>({
   // The base URL is resolved per request, not baked in at construction: this module is imported
   // before `main.tsx` configures it, and a `<meta>`-configured deployment must still take
   // effect. `hc` builds a root-relative URL, so prefixing here is the whole job.
@@ -298,7 +319,7 @@ const init = (opts?: ReadOptions) => ({ init: { signal: opts?.signal } })
  * resolves to a branded error type rather than to `never`, which would have been assignable to
  * every caller's declared return type and failed only at runtime.
  */
-async function unwrap<R extends ClientResponse<unknown, number, ResponseFormat>>(
+export async function unwrap<R extends ClientResponse<unknown, number, ResponseFormat>>(
   res: R,
   label: string,
 ): Promise<OkJson<R>> {
@@ -406,7 +427,14 @@ export async function getHealth(opts?: ReadOptions): Promise<HealthResponse> {
   return unwrap(await cez.api.v1.health.$get({}, init(opts)), '/health')
 }
 
-/** Host-local catalog for one discovery runner (`claude`, `codex`, `opencode` — #794, #784).
+/** cezar's own GitHub star count, behind the sidebar's ⭐ ask. Workspace-level: the number is
+ *  about cezar, never about the project on screen. `available: false` is the ordinary offline
+ *  answer and the chip renders nothing for it. */
+export async function getStarCount(opts?: ReadOptions): Promise<StarCountPayload> {
+  return unwrap(await cez.api.v1['star-count'].$get({}, init(opts)), '/star-count')
+}
+
+/** Host-local catalog for one discovery runner (`claude`, `codex`, `opencode`, `cursor` — #794, #784).
  *  Workspace-level: one CLI/account serves every project. */
 export async function getRunnerModels(
   runner: ModelDiscoveryRunner,
@@ -778,6 +806,128 @@ export async function getGithub(
       init(opts),
     ),
     '/github',
+  )
+}
+
+// ---- read-only issue trackers --------------------------------------------------------------
+
+export async function getTrackerAutomationOptions(query: { search?: string; cursor?: string } = {}, opts?: ReadOptions): Promise<TrackerAutomationOptions> {
+  return unwrap(await cez.api.v1.p[':projectId'].tracker['automation-options'].$get(
+    { param: { projectId: queryScope() }, query }, init(opts)), '/tracker/automation-options')
+}
+
+export async function getTrackerConnection(opts?: ReadOptions): Promise<TrackerConnectionResponse> {
+  return unwrap(await cez.api.v1.p[':projectId'].tracker.connection.$get(
+    { param: { projectId: queryScope() } }, init(opts)), '/tracker/connection')
+}
+export async function saveTrackerConnection(input: TrackerCredentials): Promise<TrackerConnectionResponse> {
+  return unwrap(await cez.api.v1.p[':projectId'].tracker.connection.$put(
+    { param: { projectId: queryScope() }, json: input }), '/tracker/connection')
+}
+export async function removeTrackerConnection(): Promise<TrackerClearedResponse> {
+  return unwrap(await cez.api.v1.p[':projectId'].tracker.connection.$delete(
+    { param: { projectId: queryScope() } }), '/tracker/connection')
+}
+
+export async function getTrackerAssociation(opts?: ReadOptions): Promise<TrackerAssociationResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].tracker.association.$get(
+      { param: { projectId: queryScope() } },
+      init(opts),
+    ),
+    '/tracker/association',
+  )
+}
+
+export async function getTrackerCandidates(
+  kind: TrackerKind,
+  params: { q?: string; cursor?: string; limit?: number } = {},
+  opts?: ReadOptions,
+): Promise<TrackerCandidatesResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].tracker.candidates.$get(
+      { param: { projectId: queryScope() }, query: { kind, q: params.q, cursor: params.cursor, limit: params.limit === undefined ? undefined : String(params.limit) } },
+      init(opts),
+    ),
+    '/tracker/candidates',
+  )
+}
+
+export async function saveTrackerAssociation(
+  input: TrackerAssociationInput,
+): Promise<TrackerAssociationSavedResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].tracker.association.$put({
+      param: { projectId: queryScope() },
+      json: input,
+    }),
+    '/tracker/association',
+  )
+}
+
+export async function clearTrackerAssociation(): Promise<TrackerClearedResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].tracker.association.$delete({
+      param: { projectId: queryScope() },
+    }),
+    '/tracker/association',
+  )
+}
+
+export type TrackerBrowseParams = {
+  association?: TrackerAssociation
+  cursor?: string
+  limit?: number
+  refresh?: boolean
+  state?: 'active' | 'all'
+  labels?: readonly string[]
+}
+
+function trackerBrowseQuery(params: TrackerBrowseParams) {
+  return {
+    expectedScope: params.association ? trackerReadScope(params.association) : undefined,
+    cursor: params.cursor,
+    limit: params.limit === undefined ? undefined : String(params.limit),
+    refresh: params.refresh ? ('1' as const) : undefined,
+    state: params.state,
+    labels: params.labels?.length ? JSON.stringify(params.labels) : undefined,
+  }
+}
+
+export async function getTrackerItems(
+  params: TrackerBrowseParams = {},
+  opts?: ReadOptions,
+): Promise<TrackerItemsResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].tracker.$get(
+      { param: { projectId: queryScope() }, query: trackerBrowseQuery(params) },
+      init(opts),
+    ),
+    '/tracker',
+  )
+}
+
+export async function searchTrackerItems(
+  q: string,
+  params: TrackerBrowseParams = {},
+  opts?: ReadOptions,
+): Promise<TrackerItemsResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].tracker.search.$get(
+      { param: { projectId: queryScope() }, query: { ...trackerBrowseQuery(params), q } },
+      init(opts),
+    ),
+    '/tracker/search',
+  )
+}
+
+export async function getTrackerItem(id: string, opts?: ReadOptions & { association?: TrackerAssociation }): Promise<TrackerItemResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].tracker[':id'].$get(
+      { param: { projectId: queryScope(), id: encodeURIComponent(id) }, query: { expectedScope: opts?.association ? trackerReadScope(opts.association) : undefined } },
+      init(opts),
+    ),
+    `/tracker/${encodeURIComponent(id)}`,
   )
 }
 
@@ -1860,6 +2010,36 @@ export async function createWorkflow(input: SaveWorkflowInput): Promise<SaveWork
   )
 }
 
+/** Graph workflows (spec 2026-09-30-workflow-node-editor): the palette's node catalog. */
+export async function getWorkflowNodes(opts?: ReadOptions): Promise<WorkflowNodeCatalogResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].workflows.nodes.$get({ param: { projectId: queryScope() } }, init(opts)),
+    '/workflows/nodes',
+  )
+}
+
+/** Structural problems of a graph (`[]` when sound) — the editor calls it as you edit. */
+export async function validateWorkflowGraph(graph: WorkflowGraph): Promise<ValidateWorkflowGraphResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].workflows.validate.$post({
+      param: { projectId: queryScope() },
+      json: { graph },
+    }),
+    '/workflows/validate',
+  )
+}
+
+/** Save a `version: 2` graph workflow. A 409 carries `exists: true` like `createWorkflow`. */
+export async function saveWorkflowGraph(input: SaveWorkflowGraphInput): Promise<SaveWorkflowResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].workflows.graph.$post({
+      param: { projectId: queryScope() },
+      json: input,
+    }),
+    '/workflows/graph',
+  )
+}
+
 /** Import support for the builder (spec 012): the server parses + validates pasted workflow
  *  YAML (either form) and answers the normalized definition. */
 export async function parseWorkflow(yaml: string): Promise<ParsedWorkflow> {
@@ -1932,7 +2112,60 @@ export async function getWorkspaceConfig(opts?: ReadOptions): Promise<WorkspaceC
     await cez.api.v1.workspace.config.$get({}, init(opts)),
     '/workspace/config',
   )
-  return { ...answer, agentDefaults: answer.agentDefaults ?? {} }
+  return {
+    ...answer,
+    // Brand settings are additive; a cockpit served against an older cezar build falls back
+    // cleanly to its built-in identity instead of failing during shell render.
+    branding: answer.branding
+      ? { ...answer.branding, logoUrl: answer.branding.logoUrl ? resolveApiUrl(answer.branding.logoUrl) : null }
+      : { name: 'cezar', logoUrl: null },
+    agentDefaults: answer.agentDefaults ?? {},
+    resources: {
+      ...answer.resources,
+      // Older servers omit this additive key; preserve an explicit null (disabled) while
+      // defaulting only an absent value.
+      idleTimeoutMinutes: answer.resources.idleTimeoutMinutes === undefined
+        ? 15
+        : answer.resources.idleTimeoutMinutes,
+    },
+  }
+}
+
+/** Upload the workspace logo through the shared API boundary (base URL, credentials, and errors). */
+export async function uploadWorkspaceBrandingLogo(file: File): Promise<string | null> {
+  const form = new FormData()
+  form.set('file', file)
+  const response = await send('/workspace/branding-logo', { method: 'POST', body: form })
+  const body = await response.text()
+  if (!response.ok) throw errorFor(response.status, response.statusText, body)
+  const parsed = parseJson(body)
+  const result = workspaceBrandingLogoResponseSchema.safeParse(parsed)
+  if (!result.success) throw new ApiError(response.status, 'the cezar server answered /workspace/branding-logo with an unexpected body')
+  return result.data.logoUrl ? resolveApiUrl(result.data.logoUrl) : null
+}
+
+/** Remove the workspace logo through the shared API boundary. */
+export async function deleteWorkspaceBrandingLogo(): Promise<string | null> {
+  const response = await send('/workspace/branding-logo', { method: 'DELETE' })
+  const body = await response.text()
+  if (!response.ok) throw errorFor(response.status, response.statusText, body)
+  const result = workspaceBrandingLogoResponseSchema.safeParse(parseJson(body))
+  if (!result.success) throw new ApiError(response.status, 'the cezar server answered /workspace/branding-logo with an unexpected body')
+  return result.data.logoUrl ? resolveApiUrl(result.data.logoUrl) : null
+}
+
+/**
+ * Live host totals (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`) — the REMOTE
+ * cockpit's snapshot of the machine's CPU/memory/swap/load. A local cockpit reads the same
+ * sample pushed over the `host` WS topic and never calls this; a remote one cannot open that
+ * socket (browser WebSocket carries no proxy credentials), so it reads here instead, on mount
+ * and on the existing visibility/reconnect reconcile.
+ */
+export async function getWorkspaceHostUsage(opts?: ReadOptions): Promise<HostUsage> {
+  return unwrap(
+    await cez.api.v1.workspace['host-usage'].$get({}, init(opts)),
+    '/workspace/host-usage',
+  )
 }
 
 /**
@@ -2086,6 +2319,41 @@ export async function applySkillsUpdate(projectId: string): Promise<SkillsUpdate
   )
 }
 
+/** cezar's own update state: install kind, channel, what the registry has, installed versions
+ *  and the in-flight job. The GET answers the cached registry view and refreshes it behind. */
+export async function getSelfUpdate(opts?: ReadOptions): Promise<SelfUpdateStatus> {
+  return unwrap(await cez.api.v1.workspace['self-update'].$get({}, init(opts)), '/workspace/self-update')
+}
+
+/** Force a registry round trip. */
+export async function refreshSelfUpdate(): Promise<SelfUpdateStatus> {
+  return unwrap(await cez.api.v1.workspace['self-update'].refresh.$post({}), '/workspace/self-update/refresh')
+}
+
+/** The development channel's pickers: cezar worktrees and open PRs with a preview build. */
+export async function getSelfUpdateDevelopment(opts?: ReadOptions & { refresh?: boolean }): Promise<SelfUpdateDevelopment> {
+  return unwrap(
+    await cez.api.v1.workspace['self-update'].development.$get({ query: opts?.refresh ? { refresh: '1' } : {} }, init(opts)),
+    '/workspace/self-update/development',
+  )
+}
+
+/** Persist the release channel (`stable`, `nightly` or `development`) in `~/.cezar/config.json`. */
+export async function setSelfUpdateChannel(channel: UpdateChannel): Promise<SelfUpdateStatus> {
+  return unwrap(
+    await cez.api.v1.workspace['self-update'].channel.$put({ json: { channel } }),
+    '/workspace/self-update/channel',
+  )
+}
+
+/** Install `version`, activate it and restart. A version string is the only browser input. */
+export async function applySelfUpdate(version: string): Promise<SelfUpdateStatus> {
+  return unwrap(
+    await cez.api.v1.workspace['self-update'].apply.$post({ json: { version } }),
+    '/workspace/self-update/apply',
+  )
+}
+
 /** Partial update — absent keys stay untouched; answers the merged config. A `projectsDir`
  *  the server cannot write to comes back as a 400 `ApiError` whose message is the reason,
  *  which is exactly what the Projects pane renders inline (step 4.4). */
@@ -2141,4 +2409,18 @@ export async function removeRunWorktree(id: string): Promise<RemoveWorktreeRespo
     }),
     runPath(id, '/remove-worktree'),
   )
+}
+
+// Capture project at observer creation: async continuations never consult a newly selected project.
+export async function openTrackerWatch(projectId: string, input: TrackerWatchInput, signal: AbortSignal) {
+  return trackerWatchHandleSchema.parse(await unwrap(await cez.api.v1.p[':projectId'].tracker.watch.$post(
+    { param: { projectId }, json: input }, { init: { signal } }), '/tracker/watch'))
+}
+export async function readTrackerWatch(projectId: string, watchId: string, signal: AbortSignal, after?: number) {
+  return trackerWatchSnapshotSchema.parse(await unwrap(await cez.api.v1.p[':projectId'].tracker.watch[':watchId'].$get(
+    { param: { projectId, watchId }, query: { after: after === undefined ? undefined : String(after) } }, { init: { signal } }), '/tracker/watch'))
+}
+export async function refreshTrackerWatch(projectId: string, watchId: string, signal: AbortSignal) {
+  return trackerWatchSnapshotSchema.parse(await unwrap(await cez.api.v1.p[':projectId'].tracker.watch[':watchId'].$post(
+    { param: { projectId, watchId } }, { init: { signal } }), '/tracker/watch'))
 }

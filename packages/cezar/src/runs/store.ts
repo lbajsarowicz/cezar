@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { StreamRedaction } from './stream-redaction.ts';
 import { collectSecretValues, redactDeep, redactSecrets } from '../core/secret-redaction.ts';
 // Sibling module, files only — a draft belongs to a run and is deleted with it (#939).
 import { deleteRunDrafts } from './drafts.ts';
@@ -12,7 +13,7 @@ import { MAX_REF } from './task-refs.ts';
 import { workflowDefSchema } from '../workflows/types.ts';
 // A contract VALUE, like `workspaceUiStateSchema` in `workspace/migrations.ts`: the persisted
 // `dispatch` object and its wire half are literally the same schema, so they cannot drift.
-import { dispatchSchema } from '@open-mercato/cezar-contract';
+import { dispatchSchema, trackerAssociationSchema, trackerAutomationEventSchema } from '@open-mercato/cezar-contract';
 
 import { RUNNER_IDS } from '../core/agent-runner.ts';
 
@@ -40,7 +41,7 @@ export type StepStatus =
 const usageCounterSchema = z.number().finite().nonnegative();
 
 /**
- * A runner id as it may appear in a PERSISTED record, normalized to the three
+ * A runner id as it may appear in a PERSISTED record, normalized to the
  * ids the rest of cezar speaks (#547).
  *
  * `claude-cli` is the legacy spelling of `claude` — still a member of
@@ -52,11 +53,11 @@ const usageCounterSchema = z.number().finite().nonnegative();
  *
  * Parse-and-fold rather than widen: the legacy id is accepted on the way in and
  * collapsed to `claude`, so no consumer, wire type or contract schema ever sees
- * a fourth runner. The narrowing is one-way and permanent (the index is
+ * an extra runner. The narrowing is one-way and permanent (the index is
  * re-serialized from the parsed records), which is what "old run records
  * normalise identically to `claude`" in `core/model-identity.ts` has always
  * claimed. Use ONLY for read-back of stored state — request bodies, settings and
- * workflow step defs stay the three selectable ids (`RunnerId`), because nothing
+ * workflow step defs stay the selectable ids (`RunnerId`), because nothing
  * should be able to ASK for the legacy spelling.
  */
 const storedRunnerSchema = z
@@ -106,6 +107,16 @@ const queuedMessageSchema = z.object({
   images: z.array(z.string()).optional(),
   createdAt: z.string(),
 });
+
+/** One authoritative PR association for a task. Older records project their scalar fields
+ * into this list on first append, so no migration is needed. */
+const prRefSchema = z.object({
+  number: z.number().int().positive().max(MAX_REF),
+  url: z.string().url().optional(),
+  origin: z.enum(['created', 'marker', 'legacy', 'derived']),
+  at: z.string().datetime(),
+});
+export type RunPrRef = z.infer<typeof prRefSchema>;
 
 /** Exported for `./run-index.ts`, the read-only reader of the same file. Nothing else should
  *  parse `runs.json` — see `reconcileLoadedRun` for why a second parser is a correctness risk. */
@@ -197,6 +208,26 @@ export const runRecordSchema = z.object({
       occurrenceAt: z.string(),
     })
     .optional(),
+  /** Provenance for a task a tracker (Jira/Linear) automation launched. Its own key, same reason
+   *  as `automationTrigger`: a pre-tracker cezar strips it instead of failing the whole index.
+   *  The optional association binds credentials to the exact source, scope and connection
+   *  that fired the run. Legacy records without that snapshot receive no tracker credentials.
+   *  No secret is stored on this record. */
+  automationTracker: z
+    .object({
+      automationId: z.string(),
+      automationRevision: z.number().int().positive(),
+      receiptId: z.string(),
+      provider: z.enum(['jira', 'linear']),
+      association: trackerAssociationSchema.optional(),
+      eventId: z.string().optional(),
+      event: trackerAutomationEventSchema.optional(),
+      timestamp: z.string().optional(),
+      change: z.object({ fromId: z.string().optional(), toId: z.string().optional(), labelId: z.string().optional(), labelName: z.string().optional() }).optional(),
+      key: z.string(),
+      url: z.string().url(),
+    })
+    .optional(),
   /** This run's place in a dispatch tree (spec 2026-09-10-dispatch): root, parent, kind,
    *  budget, its own report and the reports waiting for its next session.
    *
@@ -232,6 +263,16 @@ export const runRecordSchema = z.object({
    *  `reconcileLoadedRun` retire it on any other status, so no caller has to. */
   askParked: z.boolean().optional(),
   /**
+   * When the run's session ended — the inactivity timer, a crash, a cezar restart — while a
+   * `CEZ:ASK` question was still unanswered. The run is `failed` on the record (no process, no
+   * slot), but the question is still the user's to answer, so the cockpit keeps it under
+   * "needs you" instead of filing it as an outcome; Continue (or the ask card) reopens the session
+   * with the answer. Additive and optional (BACKWARD_COMPATIBILITY §3). Invariant: only a
+   * `failed` run carries it — `updateRun` and `reconcileLoadedRun` retire it on any other status,
+   * so a Continue, a Finish or a cancel clears it without the caller's help.
+   */
+  awaitingAnswerSince: z.string().datetime().optional().catch(undefined),
+  /**
    * Exact deadline at which a run stopped by a provider USAGE LIMIT resumes itself
    * (spec 2026-08-03-auto-resume-after-usage-limit) — the reset instant the provider named plus a
    * short grace. Present only while such a resume is pending: the run is `failed`, the timer is
@@ -260,6 +301,8 @@ export const runRecordSchema = z.object({
    *  regex-extracted from the task prompt, upgradable by the namer's
    *  cross-checked output. Display tier — never gates actions. */
   prNumber: z.number().optional(),
+  /** Ordered, deduplicated PR associations. Optional for pre-list runs.json records. */
+  prRefs: z.array(prRefSchema).max(8).optional().catch(undefined),
   issueNumber: z.number().optional(),
   /** Provenance for an `issueNumber` seeded by referenced-issue discovery.
    *  Persisted so ambiguity can revoke only the janitor's own value, including
@@ -349,6 +392,21 @@ export const runRecordSchema = z.object({
    *  `workflowStepSchema` only with that in mind: a narrowing here silently eats
    *  queued runs rather than degrading them. */
   workflowDef: workflowDefSchema.optional().catch(undefined),
+  /** Where a graph workflow's walk has been (spec 2026-09-30-workflow-node-editor, phase 3):
+   *  per-loop counters and every edge taken, in order, as `<node>.<port>-><target>` (`to` empty
+   *  when an unwired port ended the run). Written by `executeGraph` for the task view's live
+   *  graph; absent on v1 runs and on every record that predates it. Capped (`GRAPH_TAKEN_CAP`). */
+  graphState: z
+    .object({
+      loops: z.record(z.string(), z.number()),
+      taken: z.array(z.string()),
+      /** The node being run — where a restart resumes the walk. Absent once the walk ended. */
+      cursor: z.string().optional(),
+      /** `{{nodes.<id>.<field>}}` values so far, restored on resume. */
+      outputs: z.record(z.string(), z.record(z.string(), z.union([z.string(), z.number()]))).optional(),
+    })
+    .optional()
+    .catch(undefined),
 });
 
 export type StepState = z.infer<typeof stepStateSchema>;
@@ -439,6 +497,14 @@ function isRepoScopedRef(url: string, task: string, handle?: RepoHandle | null):
 function clearPendingAutoResume(run: RunRecord): void {
   run.autoResumeAt = undefined;
   run.autoResumeAttempts = undefined;
+}
+
+/**
+ * Archiving is resigning from a task, so it also resigns from the question the task was left
+ * waiting on — an archived run must not keep a "needs you" signal alive in the attention layer.
+ */
+function clearAwaitingAnswer(run: RunRecord): void {
+  run.awaitingAnswerSince = undefined;
 }
 
 /**
@@ -585,6 +651,81 @@ function refUrlNumber(url: string | undefined): number | undefined {
   return Number.isInteger(n) && n > 0 && n < MAX_REF ? n : undefined;
 }
 
+const PR_REF_CAP = 8;
+const PR_REF_RANK: Record<RunPrRef['origin'], number> = {
+  created: 0,
+  marker: 1,
+  legacy: 2,
+  derived: 3,
+};
+
+function legacyPrRefs(run: RunRecord): RunPrRef[] {
+  const at = run.createdAt;
+  const refs: RunPrRef[] = [];
+  const created = refUrlNumber(run.pullRequestUrl);
+  if (created !== undefined) refs.push({ number: created, url: run.pullRequestUrl, origin: 'created', at });
+  const declared = run.markerRefs?.pr;
+  const referenced = refUrlNumber(run.referencedPullRequestUrl);
+  if (declared !== undefined) {
+    refs.push({
+      number: declared,
+      ...(referenced === declared && run.referencedPullRequestUrl
+        ? { url: run.referencedPullRequestUrl }
+        : {}),
+      origin: 'marker',
+      at,
+    });
+  }
+  else if (referenced !== undefined && referenced !== created) refs.push({ number: referenced, url: run.referencedPullRequestUrl, origin: 'legacy', at });
+  if (run.prNumber !== undefined && !refs.some((ref) => ref.number === run.prNumber)) {
+    refs.push({ number: run.prNumber, origin: 'derived', at });
+  }
+  return refs;
+}
+
+function primaryPrRef(refs: RunPrRef[]): RunPrRef | undefined {
+  return refs.reduce<RunPrRef | undefined>((best, ref) =>
+    !best || PR_REF_RANK[ref.origin] < PR_REF_RANK[best.origin] ? ref : best,
+  undefined);
+}
+
+function appendPrRefToRun(run: RunRecord, ref: Omit<RunPrRef, 'at'> & { at?: string }): boolean {
+  const hadList = !!run.prRefs;
+  const refs = run.prRefs ?? legacyPrRefs(run);
+  const at = ref.at ?? new Date().toISOString();
+  const existing = refs.find(
+    (candidate) =>
+      candidate.number === ref.number &&
+      (!candidate.url || !ref.url || candidate.url === ref.url),
+  );
+  let changed = !hadList;
+  if (existing) {
+    if (PR_REF_RANK[ref.origin] < PR_REF_RANK[existing.origin]) {
+      existing.origin = ref.origin;
+      changed = true;
+    }
+    if (!existing.url && ref.url) {
+      existing.url = ref.url;
+      changed = true;
+    }
+  } else {
+    refs.push({ ...ref, at });
+    changed = true;
+    while (refs.length > PR_REF_CAP) {
+      const primary = primaryPrRef(refs);
+      const removable = refs.findIndex((candidate) => candidate !== primary && candidate.origin === 'derived');
+      refs.splice(removable >= 0 ? removable : primary ? refs.findIndex((candidate) => candidate !== primary) : 0, 1);
+    }
+  }
+  run.prRefs = refs;
+  const primary = primaryPrRef(refs);
+  const nextNumber = primary?.number;
+  if (run.prNumber !== nextNumber) changed = true;
+  if (nextNumber === undefined) delete run.prNumber;
+  else run.prNumber = nextNumber;
+  return changed;
+}
+
 /**
  * The PR declaration the REFERENCED tier is allowed to act on.
  *
@@ -650,9 +791,14 @@ export function reconcileLoadedRun(run: RunRecord, opts?: { keepLive?: boolean }
     !opts?.keepLive &&
     (run.status === 'running' || run.status === 'queued' || run.status === 'waiting')
   ) {
+    // A run parked on an unanswered `CEZ:ASK` still owes the user that question — the same
+    // answer `RunManager.recover()` gives, so this reader and the manager agree on "needs you".
+    const askParked = run.status === 'waiting' && run.askParked === true;
     run.status = 'failed';
     run.error = 'interrupted — cezar process exited during the run';
     run.finishedAt = run.finishedAt ?? new Date().toISOString();
+    // Stamped from `finishedAt`, so every cold read of the same record agrees on the instant.
+    if (askParked) run.awaitingAnswerSince = run.finishedAt;
     for (const step of run.steps) {
       if (step.status === 'running' || step.status === 'waiting') step.status = 'failed';
     }
@@ -665,6 +811,8 @@ export function reconcileLoadedRun(run: RunRecord, opts?: { keepLive?: boolean }
   // hours) — `RunManager.recover()` re-arms it from this field. It can only mean
   // anything on a `failed` run, so anywhere else it is stale bookkeeping.
   if (run.status !== 'failed') run.autoResumeAt = undefined;
+  // Likewise an unanswered question only means anything on the `failed` run it stopped.
+  if (run.status !== 'failed') run.awaitingAnswerSince = undefined;
   // The wake counter is intentionally process-local, so a restarted process
   // starts a fresh epoch instead of displaying a stale cap.
   run.monitoringWakeCapReached = undefined;
@@ -708,7 +856,15 @@ export function reconcileLoadedRun(run: RunRecord, opts?: { keepLive?: boolean }
  */
 export class RunStore extends EventEmitter {
   private runs = new Map<string, RunRecord>();
+  /** Ids this process removed on purpose — see `forget`, which is the only thing that writes it. */
+  private forgotten = new Set<string>();
   private saveTimer: NodeJS.Timeout | null = null;
+  // Preserve failed-load evidence even after a later save rewrites the index. A workspace
+  // summary must not call an owner that silently dropped records a complete empty project.
+  private indexReadHealth: { state: 'complete' | 'unavailable'; omittedRuns: number; reason?: string } = { state: 'complete', omittedRuns: 0 };
+
+  getIndexReadHealth() { return { ...this.indexReadHealth }; }
+
   /** The repository this project IS (#945), armed after `open()` by `setRepoHandle`. Undefined
    *  until it arrives and `null` when it cannot be known — both mean "unscoped", which is
    *  exactly the pre-#945 behavior. */
@@ -732,8 +888,11 @@ export class RunStore extends EventEmitter {
           for (const run of parsed.data) {
             store.runs.set(run.id, reconcileLoadedRun(run, opts));
           }
+        } else {
+          store.indexReadHealth = { state: 'unavailable', omittedRuns: Array.isArray(raw) ? raw.length : 0, reason: 'Task index could not be loaded by this server' };
         }
       } catch {
+        store.indexReadHealth = { state: 'unavailable', omittedRuns: 0, reason: 'Task index could not be loaded by this server' };
         // corrupt index — start fresh; event files stay on disk untouched
       }
     }
@@ -801,6 +960,16 @@ export class RunStore extends EventEmitter {
 
   listRuns(): RunRecord[] {
     return [...this.runs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  /** Fresh durable evidence for receipt reconciliation; never replaces live in-memory runs. */
+  listPersistedRuns(): RunRecord[] {
+    try {
+      return z.array(runRecordSchema).parse(JSON.parse(readFileSync(join(this.dataDir, 'runs.json'), 'utf8')));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw new Error('Could not read persisted runs to verify automation delivery.');
+    }
   }
 
   getRun(id: string): RunRecord | undefined {
@@ -888,7 +1057,26 @@ export class RunStore extends EventEmitter {
     if (normalized.status && normalized.status !== 'waiting') {
       normalized.askParked = undefined;
     }
-    Object.assign(run, this.redactPatch(normalized));
+    // An unanswered question belongs to the `failed` run its closed session left behind: the
+    // Continue that answers it (`running`/`queued`), and every settlement, retire it.
+    if (normalized.status && normalized.status !== 'failed') {
+      normalized.awaitingAnswerSince = undefined;
+    }
+    // Seed the list from the old values BEFORE applying a patch. Callers that update a scalar
+    // projection often provide the replacement URL/number in the same patch; seeding afterward
+    // would make the historical association unrecoverable.
+    if (!run.prRefs && !normalized.prRefs) run.prRefs = legacyPrRefs(run);
+    Object.assign(run, this.redactPatch(normalized, id));
+    // Keep legacy writers (including workflow resume/naming paths) in sync without requiring
+    // every caller to know about the additive list. The list's provenance still decides the
+    // compatibility scalar, so an inferred number cannot displace a declared/created one.
+    if (normalized.pullRequestUrl) {
+      const number = refUrlNumber(normalized.pullRequestUrl);
+      if (number !== undefined) appendPrRefToRun(run, { number, url: normalized.pullRequestUrl, origin: 'created' });
+    }
+    if (normalized.prNumber !== undefined) {
+      appendPrRefToRun(run, { number: normalized.prNumber, origin: 'derived' });
+    }
     this.touch(run);
     return run;
   }
@@ -909,12 +1097,13 @@ export class RunStore extends EventEmitter {
    */
   private redactPatch(
     patch: Partial<Omit<RunRecord, 'id' | 'steps'>>,
+    runId: string,
   ): Partial<Omit<RunRecord, 'id' | 'steps'>> {
     if (process.env.CEZ_REDACT_SECRETS === '0') return patch;
     const out = { ...patch };
     for (const field of ['title', 'titleSummary', 'error'] as const) {
       const value = out[field];
-      if (typeof value === 'string') out[field] = this.redactText(value);
+      if (typeof value === 'string') out[field] = this.redactText(value, runId);
     }
     return out;
   }
@@ -926,10 +1115,10 @@ export class RunStore extends EventEmitter {
    * over SSE, so an unscrubbed copy leaked to `runs.json` AND to the browser.
    * The remaining fields are ids, enums, counters and timestamps.
    */
-  private redactStepPatch(patch: Partial<Omit<StepState, 'id'>>): Partial<Omit<StepState, 'id'>> {
+  private redactStepPatch(patch: Partial<Omit<StepState, 'id'>>, runId: string): Partial<Omit<StepState, 'id'>> {
     if (process.env.CEZ_REDACT_SECRETS === '0') return patch;
     if (typeof patch.error !== 'string') return patch;
-    return { ...patch, error: this.redactText(patch.error) };
+    return { ...patch, error: this.redactText(patch.error, runId) };
   }
 
   /** Append a step to an existing run (used by "Continue" — spec 003). */
@@ -944,7 +1133,7 @@ export class RunStore extends EventEmitter {
     const run = this.runs.get(runId);
     const step = run?.steps.find((s) => s.id === stepId);
     if (!run || !step) return;
-    Object.assign(step, this.redactStepPatch(patch));
+    Object.assign(step, this.redactStepPatch(patch, runId));
     run.tokensUsed = run.steps.reduce((sum, s) => sum + s.tokensUsed, 0);
     const startedAgentSteps = run.steps.filter((candidate) => candidate.kind === 'agent' && candidate.iterations > 0);
     const directionalComplete =
@@ -969,7 +1158,8 @@ export class RunStore extends EventEmitter {
       ? startedAgentSteps.reduce((sum, candidate) => sum + (candidate.outputTokens ?? 0), 0)
       : undefined;
     const cost = run.steps.reduce((sum, s) => sum + (s.costUsd ?? 0), 0);
-    run.costUsd = cost > 0 ? cost : undefined;
+    // A reported zero is still a measurement; an unreported run is not free.
+    run.costUsd = run.steps.some((s) => s.costUsd !== undefined) ? cost : undefined;
     this.touch(run);
   }
 
@@ -980,6 +1170,7 @@ export class RunStore extends EventEmitter {
     run.archivedAt = archived ? new Date().toISOString() : undefined;
     if (archived) {
       clearPendingAutoResume(run);
+      clearAwaitingAnswer(run);
       clearPin(run);
     }
     this.touch(run);
@@ -1010,10 +1201,16 @@ export class RunStore extends EventEmitter {
   archiveFinished(): number {
     let count = 0;
     for (const run of this.runs.values()) {
-      if (!run.archived && ['done', 'failed', 'cancelled'].includes(run.status)) {
+      // An unanswered question is a gate, not an outcome — like `review`, the bulk sweep leaves it.
+      if (
+        !run.archived &&
+        ['done', 'failed', 'cancelled'].includes(run.status) &&
+        run.awaitingAnswerSince === undefined
+      ) {
         run.archived = true;
         run.archivedAt = new Date().toISOString();
         clearPendingAutoResume(run);
+        clearAwaitingAnswer(run);
         clearPin(run);
         this.touch(run);
         count++;
@@ -1065,6 +1262,8 @@ export class RunStore extends EventEmitter {
    *   - and a `failed` run with a pending `autoResumeAt` is not a done item AT ALL
    *     (`isScheduledResume`, spec 2026-08-03-auto-resume-after-usage-limit): it has an
    *     appointment to pick the work back up, so there is no outcome to have missed.
+   *   - nor is a `failed` run still `awaitingAnswerSince` a question: it sits under
+   *     "needs you", and its signal is that, not an unread outcome.
    *
    *  Keeping the two rules identical is what makes the returned count the number the
    *  cockpit's unread badge was showing. The `autoResumeAt` clause is the one that drifted
@@ -1087,6 +1286,7 @@ export class RunStore extends EventEmitter {
         !run.archived &&
         (run.status === 'done' || run.status === 'failed') &&
         !(run.status === 'failed' && run.autoResumeAt !== undefined) &&
+        !(run.status === 'failed' && run.awaitingAnswerSince !== undefined) &&
         run.finishedAt !== undefined &&
         (run.seenAt === undefined || run.seenAt < run.finishedAt);
       if (!unread) continue;
@@ -1100,11 +1300,12 @@ export class RunStore extends EventEmitter {
   appendEvent(runId: string, event: { type: string; stepId?: string; [key: string]: unknown }): RunEvent {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`unknown run: ${runId}`);
+    this.drainStreamRedaction(runId, event);
     const seq = this.nextSeq(runId);
     // Scrub credentials before the event touches disk or the live wire (#427):
     // tool-result output is persisted verbatim and served back over the API, so
     // a secret in an agent's command output would otherwise land in `.ai/cezar/`.
-    const full: RunEvent = this.redact({ ...event, seq, ts: new Date().toISOString() });
+    const full: RunEvent = this.redact({ ...event, seq, ts: new Date().toISOString() }, runId);
     // Sync append keeps event order without a write queue; local NDJSON
     // appends at agent-event rates are effectively free.
     appendFileSync(this.eventsPath(runId), `${JSON.stringify(full)}\n`, 'utf8');
@@ -1129,6 +1330,7 @@ export class RunStore extends EventEmitter {
         const created = CREATED_PR_RE.test(claim) ? createdPrUrl(`${claim} ${haystack}`) : undefined;
         if (created) {
           this.updateRun(runId, { pullRequestUrl: created });
+          this.recordPrRef(runId, { number: refUrlNumber(created)!, url: created, origin: 'created' });
           // Adopting the created tier can RELEASE a declaration the referenced tier was holding
           // (see `referencedPrDeclaration`), so re-resolve here too: the about-PR must come back
           // whether the marker arrived before the creation evidence or after it.
@@ -1251,12 +1453,9 @@ export class RunStore extends EventEmitter {
       ...(refs.pr !== undefined ? { pr: refs.pr } : {}),
       ...(refs.issue !== undefined ? { issue: refs.issue } : {}),
     };
-    // `prNumber` is the about-PR as well (it is what paints a numeric-only chip), so a
-    // re-declaration naming the created PR only FILLS it — it never overwrites the number the
-    // task came in with, which is still the PR this task is about.
-    if (refs.pr !== undefined && (run.prNumber === undefined || refs.pr !== refUrlNumber(run.pullRequestUrl))) {
-      run.prNumber = refs.pr;
-    }
+    // `prNumber` remains a compatibility projection; the ordered list decides which association
+    // is primary, while `referencedPullRequestUrl` retains its existing marker semantics below.
+    if (refs.pr !== undefined) this.recordPrRef(runId, { number: refs.pr, origin: 'marker' });
     if (refs.issue !== undefined) {
       run.issueNumber = refs.issue;
       delete run.referencedIssueNumberSeeded;
@@ -1281,6 +1480,14 @@ export class RunStore extends EventEmitter {
     return run;
   }
 
+  /** Record an authoritative PR association and recompute the compatibility scalar projection. */
+  recordPrRef(runId: string, ref: Omit<RunPrRef, 'at'> & { at?: string }): RunRecord | undefined {
+    const run = this.runs.get(runId);
+    if (!run || !Number.isInteger(ref.number) || ref.number <= 0 || ref.number >= MAX_REF) return run;
+    if (appendPrRefToRun(run, ref)) this.touch(run);
+    return run;
+  }
+
   /**
    * Fan an event out to live subscribers WITHOUT writing it to the NDJSON
    * file — the channel for coalesced `item.delta` flushes (protocol-v2
@@ -1290,9 +1497,21 @@ export class RunStore extends EventEmitter {
    * (gaps are fine — dedup compares with `>`).
    */
   emitEphemeral(runId: string, event: { type: string; stepId?: string; [key: string]: unknown }): RunEvent {
-    const full: RunEvent = this.redact({ ...event, seq: this.nextSeq(runId), ts: new Date().toISOString() });
+    this.drainStreamRedaction(runId, event);
+    const full: RunEvent = this.redact({ ...event, seq: this.nextSeq(runId), ts: new Date().toISOString() }, runId);
     this.emit('event', { runId, event: full });
     return full;
+  }
+
+  private readonly streamRedaction = new StreamRedaction();
+
+  private drainStreamRedaction(runId: string, event: { type: string; stepId?: string; [key: string]: unknown }): void {
+    for (const tail of this.streamRedaction.drain(runId, event)) {
+      // Bypass transform: a terminal proper prefix must be released, not held again.
+      const safe = process.env.CEZ_REDACT_SECRETS === '0' ? tail : redactDeep(tail, this.secretsForRun(runId));
+      const full = { ...safe, seq: this.nextSeq(runId), ts: new Date().toISOString() };
+      this.emit('event', { runId, event: full });
+    }
   }
 
   /** Lazily-collected concrete secret values from the host env (#427). */
@@ -1302,16 +1521,39 @@ export class RunStore extends EventEmitter {
    * Scrub known credential values / token shapes from an event before it is
    * persisted or fanned out. On by default; `CEZ_REDACT_SECRETS=0` opts out.
    */
-  private redact(event: RunEvent): RunEvent {
+  private redact(event: RunEvent, runId: string): RunEvent {
     if (process.env.CEZ_REDACT_SECRETS === '0') return event;
-    return redactDeep(event, this.hostSecrets());
+    const secrets = this.secretsForRun(runId);
+    return redactDeep(this.streamRedaction.transform(runId, event, secrets), secrets) as RunEvent;
   }
 
   /** Best-effort scrub of one free-text string bound for `runs.json`. Honors
    *  the `CEZ_REDACT_SECRETS=0` opt-out itself so every caller inherits it. */
-  private redactText(text: string): string {
+  private redactText(text: string, runId?: string): string {
     if (process.env.CEZ_REDACT_SECRETS === '0') return text;
-    return redactSecrets(text, this.hostSecrets());
+    return redactSecrets(text, this.secretsForRun(runId));
+  }
+
+  /** Capture safe text before asynchronous derived work can outlive this run's registry. */
+  redactRunText(runId: string, text: string): string { return this.redactText(text, runId); }
+
+  private readonly runSecrets = new Map<string, readonly string[]>();
+
+  /** Memory only: register before spawn; retain through the final event drain. */
+  registerRunSecrets(runId: string, values: readonly string[]): void {
+    if (values.length === 0) return;
+    this.runSecrets.set(runId, [...new Set([...(this.runSecrets.get(runId) ?? []), ...values.filter(Boolean)])]
+      .sort((a, b) => b.length - a.length));
+  }
+
+  clearRunSecrets(runId: string): void {
+    this.runSecrets.delete(runId);
+    this.streamRedaction.clear(runId);
+  }
+
+  private secretsForRun(runId?: string): readonly string[] {
+    return [...this.hostSecrets(), ...(runId ? this.runSecrets.get(runId) ?? [] : [])]
+      .sort((a, b) => b.length - a.length);
   }
 
   private hostSecrets(): readonly string[] {
@@ -1339,7 +1581,7 @@ export class RunStore extends EventEmitter {
   }
 
   deleteRun(id: string): boolean {
-    const existed = this.runs.delete(id);
+    const existed = this.forget(id);
     if (existed) {
       try {
         rmSync(this.eventsPath(id), { force: true });
@@ -1359,12 +1601,12 @@ export class RunStore extends EventEmitter {
   }
 
   /** Write the index out now (used on shutdown). */
-  flush(): void {
+  flush(options: { throwOnError?: boolean } = {}): void {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    this.saveNow();
+    this.saveNow(options.throwOnError);
   }
 
   // ---- internals -----------------------------------------------------------
@@ -1410,6 +1652,16 @@ export class RunStore extends EventEmitter {
     this.emit('run', run);
   }
 
+  /** Forget a run, and remember that we did. Dropping it from the map is no longer enough on its
+   *  own: `saveNow` unions the on-disk index back in, and the copy it re-reads is one THIS process
+   *  wrote moments ago — so a plain `delete` would come straight back as a record whose event file
+   *  `deleteRun` has already removed. A set of uuid strings that lives as long as the process,
+   *  which is exactly how long a deletion has to outlive its own index entry. */
+  private forget(id: string): boolean {
+    this.forgotten.add(id);
+    return this.runs.delete(id);
+  }
+
   private pruneOldRuns(): void {
     const all = this.listRuns();
     const stalePool = [
@@ -1417,7 +1669,7 @@ export class RunStore extends EventEmitter {
       ...all.filter((r) => r.archived).slice(MAX_ARCHIVED_KEPT),
     ];
     for (const stale of stalePool) {
-      this.runs.delete(stale.id);
+      this.forget(stale.id);
       try {
         rmSync(this.eventsPath(stale.id), { force: true });
         rmSync(this.handoffPath(stale.id), { force: true });
@@ -1439,15 +1691,80 @@ export class RunStore extends EventEmitter {
     this.saveTimer.unref?.();
   }
 
-  private saveNow(): void {
+  private saveNow(throwOnError = false): void {
     const indexPath = join(this.dataDir, 'runs.json');
     const tmpPath = `${indexPath}.tmp`;
     try {
-      writeFileSync(tmpPath, JSON.stringify(this.listRuns(), null, 2), 'utf8');
+      writeFileSync(tmpPath, JSON.stringify(this.mergeWithIndexOnDisk(indexPath), null, 2), 'utf8');
       renameSync(tmpPath, indexPath);
     } catch (err) {
+      if (throwOnError) throw new Error('Could not persist automation run provenance; the launch was not confirmed.');
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[cez] failed to save runs.json: ${message}`);
     }
+  }
+
+  /**
+   * What `saveNow` writes: our own records, plus every record on disk we have never seen.
+   *
+   * `serve` and headless `run` each open their own store over the same data directory — a shared
+   * index is the whole intent — but `open()` reads `runs.json` exactly once and nothing re-reads
+   * it. Serializing a process-local map over the entire file therefore DELETED every run the other
+   * process had started: the cockpit, open before a `cezar run`, wiped that run from the index on
+   * its next save and left an orphaned `.ndjson` behind.
+   *
+   * Ours wins for an id we hold (we know more about it than the file does), an unknown id is
+   * adopted verbatim, and one `forget` recorded is never re-adopted. Best-effort, not a lock: two
+   * writers can still interleave between this read and the `rename`, so a foreign record updated
+   * inside the same debounce window can still lose that update. That residual race costs a field;
+   * the overwrite it replaces cost the whole record.
+   *
+   * Adopted records are written back but deliberately NOT loaded into `this.runs` — showing a
+   * foreign run in an already-live cockpit is a separate change. They are equally deliberately not
+   * passed through `reconcileLoadedRun` (and so not read via `readRunIndexFromDisk`, which looks
+   * like the right helper and is not): demoting a live-looking row to `interrupted` is correct when
+   * opening a store and wrong here, where that row may be a run still executing in the process that
+   * owns it. An index that cannot be read contributes nothing rather than costing us our own runs,
+   * exactly as in `open()`.
+   */
+  private mergeWithIndexOnDisk(indexPath: string): RunRecord[] {
+    const mine = this.listRuns();
+    const foreign = this.foreignRecordsOnDisk(indexPath);
+    if (foreign.length === 0) return mine;
+    // Same ordering rule `listRuns` applies, so the file's shape is unchanged.
+    return [...mine, ...foreign].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  /**
+   * The records in `runs.json` this process knows nothing about — the ones a save has to carry
+   * over rather than overwrite.
+   *
+   * Validated one record at a time, and only for the ids we are actually adopting, which is the
+   * difference between this and `open()`'s whole-array parse. `saveNow` runs on a 300 ms debounce
+   * for as long as an agent is streaming, so this runs several times a second on the main thread of
+   * the process also serving the cockpit's SSE, while retention lets the index reach
+   * `MAX_RUNS_KEPT + MAX_ARCHIVED_KEPT` records — and in the ordinary single-process case every one
+   * of them is ours, so a `z.array(...)` parse would spend all of its time validating records the
+   * next line throws away. The id check is cheap and rejects nearly everything; zod sees what is
+   * left, which is normally nothing. Per-record also degrades better than `open()` can afford to:
+   * one unreadable row costs only itself instead of every foreign record in the file.
+   */
+  private foreignRecordsOnDisk(indexPath: string): RunRecord[] {
+    if (!existsSync(indexPath)) return [];
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(indexPath, 'utf8'));
+    } catch {
+      return []; // not JSON — an index we cannot read contributes nothing, and costs us nothing
+    }
+    if (!Array.isArray(raw)) return [];
+    const foreign: RunRecord[] = [];
+    for (const entry of raw) {
+      const id: unknown = (entry as { id?: unknown } | null)?.id;
+      if (typeof id !== 'string' || this.runs.has(id) || this.forgotten.has(id)) continue;
+      const parsed = runRecordSchema.safeParse(entry);
+      if (parsed.success) foreign.push(parsed.data);
+    }
+    return foreign;
   }
 }

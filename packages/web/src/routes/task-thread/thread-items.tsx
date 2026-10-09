@@ -9,12 +9,13 @@ import {
   LoaderCircleIcon,
   PaperclipIcon,
   SearchIcon,
+  SparklesIcon,
   SquarePenIcon,
   SquareTerminalIcon,
   Trash2Icon,
   WrenchIcon,
 } from 'lucide-react'
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { ZoomableImage } from '@/components/zoomable-image'
@@ -22,12 +23,14 @@ import { Link } from '@/lib/project-router'
 import { isImageAttachmentName, type FileDiff, type ToolKind, type UiToolItem } from '@open-mercato/cezar-api-client'
 import { cn } from '@/lib/utils'
 
+import { parseReviewMessage } from './diff-comments'
 import { Markdown } from './markdown'
+import { ReviewCommentsBlock } from './review-comments-block'
 import { useDraft } from './thread-draft'
 import { splitToolTitle, streakLabel, type ContextGroupBlock } from './thread-groups'
 import { useThreadCardCache } from './thread-open-cards'
 import { isNearBottom } from './thread-scroll'
-import { MessageTime } from './thread-time'
+import { MessageTime, clockLabel, elapsedSince, exactLabel, useNow } from './thread-time'
 import type { ThreadEntry, ThreadImage, ThreadNote, ThreadProviderAuthRequired } from './thread-state'
 
 // The stick rule lives with the rest of the scroll math now; re-exported because this is
@@ -251,7 +254,7 @@ export function UserBubble({
         </span>
       ) : null}
       {actionError ? <p role="alert" className="mb-1 text-xs text-danger">{actionError}</p> : null}
-      <Markdown breaks>{text}</Markdown>
+      <UserText text={text} />
       {images.length > 0 ? (
         <span data-slot="user-images" className="mt-2 flex flex-wrap items-center justify-end gap-1.5">
           {/* One list carries both kinds (#950), so the NAME decides how each entry renders: an
@@ -294,6 +297,22 @@ export function UserBubble({
   )
 }
 
+/**
+ * A user message's text. A message that carries a diff review (comments drafted on the Changes
+ * tab) renders the review as comment cards under whatever was typed; anything else is the plain
+ * Markdown it always was.
+ */
+function UserText({ text }: { text: string }) {
+  const review = useMemo(() => parseReviewMessage(text), [text])
+  if (!review) return <Markdown breaks>{text}</Markdown>
+  return (
+    <>
+      {review.lead !== '' ? <Markdown breaks>{review.lead}</Markdown> : null}
+      <ReviewCommentsBlock items={review.items} />
+    </>
+  )
+}
+
 /** An assistant message item, as markdown. */
 export function AssistantMessage({ text }: { text: string }) {
   return (
@@ -320,8 +339,11 @@ export function NoteLine({ note }: { note: ThreadNote }) {
 const PROVIDER_LABEL: Record<ThreadProviderAuthRequired['provider'], string> = {
   claude: 'Claude Code',
   codex: 'Codex',
+  junie: 'Junie',
   opencode: 'OpenCode',
+  cursor: 'Cursor',
   pi: 'pi',
+  copilot: 'GitHub Copilot CLI',
 }
 
 /** Persisted recovery guidance for an authoritative runtime authentication rejection. */
@@ -401,15 +423,35 @@ export function ReasoningItem({ text }: { text: string }) {
  * with nothing on screen the user cannot tell whether more output is coming.
  * This spinner + shimmering label sits at the tail of the thread for exactly
  * the `running` window, so the session never looks stalled when it is not.
+ *
+ * A live turn has no closing `TurnTime` yet, so the indicator carries the clock instead: how long
+ * the current turn has been going (`since`) and when the agent last produced anything
+ * (`lastActivityAt`) — a long silence reads as a long silence, not as a spinner that looks the
+ * same at 5s and at 20m. Either stamp missing or unparseable drops just its part.
  */
-export function WorkingIndicator() {
+export function WorkingIndicator({ since, lastActivityAt }: { since?: string; lastActivityAt?: string } = {}) {
+  const now = useNow()
+  const elapsed = elapsedSince(since, now)
+  const quiet = elapsedSince(lastActivityAt, now)
+  const lastClock = clockLabel(lastActivityAt)
   return (
     <div
       data-slot="working-indicator"
-      className="flex items-center gap-2 py-1 text-[13px] text-soft-foreground"
+      // Wraps rather than overflows: with both stamps the line outgrows a 320px phone column.
+      className="flex flex-wrap items-center gap-x-2 gap-y-0.5 py-1 text-[13px] text-soft-foreground"
     >
       <LoaderCircleIcon role="status" aria-label="Working" className="size-3.5 shrink-0 animate-spin" />
       <span className="shimmer font-medium">Working…</span>
+      {elapsed !== undefined ? (
+        <span data-slot="working-elapsed" title={`Started ${exactLabel(since)}`} className="font-mono text-xs tabular-nums">
+          {elapsed}
+        </span>
+      ) : null}
+      {quiet !== undefined && lastClock !== undefined ? (
+        <span data-slot="working-last-activity" title={exactLabel(lastActivityAt)} className="text-xs">
+          · last activity {lastClock} ({quiet} ago)
+        </span>
+      ) : null}
     </div>
   )
 }
@@ -423,7 +465,10 @@ const TOOL_ICONS: Record<ToolKind, typeof WrenchIcon> = {
   execute: SquareTerminalIcon,
   think: BrainIcon,
   fetch: GlobeIcon,
+  // A skill is not an agent (#1202): the bot belongs to `task` alone, so a reader can tell a
+  // dispatched sub-agent from a skill the main agent loaded at a glance.
   task: BotIcon,
+  skill: SparklesIcon,
   plan: ListTodoIcon,
   other: WrenchIcon,
 }
