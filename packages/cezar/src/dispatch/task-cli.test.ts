@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { dispatchInputSchema, dispatchReportSchema, taskTreeNodeSchema } from '@open-mercato/cezar-contract';
+import { RUNNER_IDS } from '../core/agent-runner.ts';
 import { runTaskCommand, type TaskCliIo } from './task-cli.ts';
+
+function containsRunnerToken(text: string, runner: string): boolean {
+  return new RegExp(`(?:^|[^A-Za-z0-9_-])${runner}(?=$|[^A-Za-z0-9_-])`).test(text);
+}
 
 /** The `cez task` CLI is a thin client: what is pinned is the request it builds from flags and
  *  env, and how it answers a refusal — never the engine, which has its own tests. */
@@ -158,6 +163,29 @@ describe('cez task', () => {
     expect(JSON.parse(h.out[0]!)).toEqual([{ id: 'run-1', depth: 0, status: 'running', title: 'Me' }]);
     expect(await runTaskCommand(['list'], env, h.io)).toBe(0);
     expect(h.out[1]).toBe('run-1  running  Me');
+  });
+
+  it('help says --runner and --model default to the caller\u2019s own, and how to choose a runner', async () => {
+    const h = harness({ status: 200, body: {} });
+    expect(await runTaskCommand(['help'], {}, h.io)).toBe(0);
+    const usage = h.out.join('\n');
+    expect(usage).toContain('who runs the child (default: yours)');
+    expect(usage).toContain('use the runner the user named, else a cheaper or faster one');
+    expect(usage).toContain("the child's model (default: yours)");
+  });
+
+  it('help keeps --budget optional so an uncapped parent does not invent a cap', async () => {
+    const h = harness({ status: 200, body: {} });
+    expect(await runTaskCommand(['help'], {}, h.io)).toBe(0);
+    const usage = h.out.join('\n');
+    expect(usage).toContain('Omit it unless the user or your order named a cost limit');
+    expect(usage).toContain('under a capped parent a child without one gets the whole remainder, under an uncapped parent it is uncapped');
+  });
+
+  it('advertises every supported runner in help as a standalone token', async () => {
+    const h = harness({ status: 200, body: {} });
+    expect(await runTaskCommand(['help'], {}, h.io)).toBe(0);
+    for (const runner of RUNNER_IDS) expect(containsRunnerToken(h.out[0] ?? '', runner)).toBe(true);
   });
 
   it('list prints the tree this task belongs to, indented, with status, cost and verdicts', async () => {

@@ -8,7 +8,8 @@
  * set the same three and use it too. No server, no dispatch: the command says so and exits 2.
  */
 import { parseArgs } from 'node:util';
-import { DISPATCH_MAX_IN_FLIGHT, runnerSchema, taskTreeNodeSchema, type TaskTreeNode } from '@open-mercato/cezar-contract';
+import { DISPATCH_MAX_IN_FLIGHT, taskTreeNodeSchema, type TaskTreeNode } from '@open-mercato/cezar-contract';
+import { RUNNER_IDS } from '../core/agent-runner.ts';
 
 export interface TaskCliEnv {
   CEZ_API_URL?: string;
@@ -35,7 +36,7 @@ cez task create "<objective>" [flags]    dispatch ONE child task; prints its run
   --success "<text>"            how the child knows it is done
   --evidence "<text>"           what the child must show in its report
   --tools A,B                   the tools the child may use (default: the run-wide default)
-  --runner ${runnerSchema.options.join('|')}  who runs the child (default: yours); use the runner the user named, else a cheaper or faster one for narrow, well-specified work
+  --runner ${RUNNER_IDS.join('|')}  who runs the child (default: yours); use the runner the user named, else a cheaper or faster one for narrow, well-specified work
   --model <model>               the child's model (default: yours)
   --retry-limit <0-3>           the most times cezar auto-continues the child after a turn that ended unfinished; past it the child parks
   Rules: COMMIT before dispatching (children fork your committed tip). At most ${DISPATCH_MAX_IN_FLIGHT} children in flight under one task; one more is refused. When a dispatch succeeds, end your turn with CEZ:MONITORING to wait for its report.

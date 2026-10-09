@@ -52,7 +52,7 @@
 ## Features
 
 - 💯&nbsp;Free and open source.
-- 🖥️&nbsp;Uses your own `claude`, `codex`, `opencode` or `pi` login. No API key needed.
+- 🖥️&nbsp;Uses your own `claude`, `codex`, `copilot`, `cursor`, `junie`, `opencode` or `pi` login. No API key needed.
 - ☁️&nbsp;Easy to set up on a VPS, so your agents keep working when your laptop is closed.
 - 📱&nbsp;Fully responsive. Start and review tasks from your phone.
 - 🔀&nbsp;Every task gets its own git worktree, so several agents can work at the same time. Extra tasks wait in a queue.
@@ -83,7 +83,7 @@
 
 [![Variants: Run a task ×2 or ×3 and keep the best diff.](docs/screenshots/variants-compare.png)](docs/screenshots/variants-compare.png)
 
-**Workflows** — Drag skills and checks into a chain, saved as YAML.
+**Workflows** — Build a task's pipeline as a node graph: agents, checks, loops, gates, PRs and CI, saved as YAML.
 
 [![Workflows: Drag skills and checks into a chain, saved as YAML.](docs/screenshots/workflow-builder.png)](docs/screenshots/workflow-builder.png)
 
@@ -121,7 +121,8 @@
 
 You need **Node 20+** and at least one agent CLI you're logged into:
 [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex),
-[OpenCode](https://opencode.ai), [Cursor Agent](https://cursor.com/docs/cli/overview) or [pi](https://github.com/badlogic/pi-mono).
+[GitHub Copilot CLI](https://github.com/github/copilot-cli), [OpenCode](https://opencode.ai),
+[Cursor Agent](https://cursor.com/docs/cli/overview), [Junie](https://junie.jetbrains.com/cli) or [pi](https://github.com/badlogic/pi-mono).
 `git` and `gh` are optional.
 
 ```bash
@@ -169,7 +170,10 @@ steps:
     onFail: { retry: implement, max: 2 }
 ```
 
-The built-in `quick-task` workflow runs with no setup.
+The built-in `quick-task` workflow runs with no setup. A check can also be a
+browser: [browser and mobile e2e as a verification step](docs/e2e-verification.md)
+turns an agentic e2e run — or an independent QA exploration — into the gate a
+task has to pass.
 
 ## Automations
 
