@@ -57,6 +57,7 @@ import {
   getTrackerItems,
   getUiState,
   getWorkflows,
+  getWorkflowNodes,
   getWorkspaceConfig,
   getWorkspaceUiState,
   getSkillsUpdate,
@@ -185,6 +186,9 @@ export const queryKeys = {
   },
   get workflows() {
     return [queryScope(), 'workflows'] as const
+  },
+  get workflowNodes() {
+    return [queryScope(), 'workflow-nodes'] as const
   },
   get skills() {
     return [queryScope(), 'skills'] as const
@@ -375,8 +379,7 @@ export const workspaceQueryKeys = {
    *  GUI prefs, e.g. the sidebar's per-project collapse map (step 3.3), and — since step 3.5 —
    *  appearance + notifications, which describe the user rather than a repo. */
   uiState: ['workspace', 'ui-state'] as const,
-  /** `~/.cezar/config.json`'s settings slice via `GET/PUT /api/workspace/config` (step 2.7):
-   *  the global Resources knobs and the checkout root. */
+  /** `~/.cezar/config.json`'s workspace settings slice, including instance branding. */
   config: ['workspace', 'config'] as const,
   /** Live host totals (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`). One cache for
    *  both transports: local cockpits fold pushed `host` frames into it, remote ones refetch it
@@ -1171,9 +1174,19 @@ export function useTodos(enabled = true) {
   })
 }
 
-export function useWorkflows() {
+/** The graph editor's node catalog — static per server build, so it never refetches. */
+export function useWorkflowNodes() {
+  return useQuery({
+    queryKey: queryKeys.workflowNodes,
+    queryFn: ({ signal }) => getWorkflowNodes({ signal }),
+    staleTime: Infinity,
+  })
+}
+
+export function useWorkflows(opts: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: queryKeys.workflows,
+    enabled: opts.enabled ?? true,
     queryFn: ({ signal }) => getWorkflows({ signal }),
   })
 }
@@ -1373,10 +1386,11 @@ export function useAgentProfiles() {
  * trip that cannot produce a different answer — and a decorative count is the last thing in the
  * cockpit that should retry, poll, or hold the query client's attention. One read per session.
  */
-export function useStarCount() {
+export function useStarCount(enabled = true) {
   return useQuery({
     queryKey: workspaceQueryKeys.starCount,
     queryFn: ({ signal }) => getStarCount({ signal }),
+    enabled,
     staleTime: Infinity,
     retry: false,
     refetchOnMount: false,

@@ -83,7 +83,7 @@
 
 [![Variants: Run a task ×2 or ×3 and keep the best diff.](docs/screenshots/variants-compare.png)](docs/screenshots/variants-compare.png)
 
-**Workflows** — Drag skills and checks into a chain, saved as YAML.
+**Workflows** — Build a task's pipeline as a node graph: agents, checks, loops, gates, PRs and CI, saved as YAML.
 
 [![Workflows: Drag skills and checks into a chain, saved as YAML.](docs/screenshots/workflow-builder.png)](docs/screenshots/workflow-builder.png)
 
@@ -170,7 +170,10 @@ steps:
     onFail: { retry: implement, max: 2 }
 ```
 
-The built-in `quick-task` workflow runs with no setup.
+The built-in `quick-task` workflow runs with no setup. A check can also be a
+browser: [browser and mobile e2e as a verification step](docs/e2e-verification.md)
+turns an agentic e2e run — or an independent QA exploration — into the gate a
+task has to pass.
 
 ## Automations
 

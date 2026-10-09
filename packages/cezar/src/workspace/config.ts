@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
@@ -188,6 +188,10 @@ const disabledProvidersSchema = z
 
 const workspaceConfigSchema = z
   .object({
+    /** Optional instance name shown in the cockpit; absent keeps the product default. */
+    branding: z.object({
+      name: z.string().trim().min(1).max(80).optional().catch(undefined),
+    }).passthrough().default(() => ({})).catch(() => ({})),
     /** Migration cursor (src/workspace/migrations.ts). Absent/bad → 0, which
      *  means "run every migration" — each one is idempotent, so that is safe. */
     schemaVersion: z.number().int().min(0).default(0).catch(0),
@@ -369,8 +373,29 @@ export function atomicWriteJsonSync(path: string, value: unknown): void {
   assertCezarHomeWriteIsSandboxed(path);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = atomicTmpPath(path);
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  renameSync(tmp, path);
+  let fd = -1;
+  try {
+    fd = openSync(tmp, 'w', 0o600);
+    writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8' });
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = -1;
+    renameSync(tmp, path);
+  } catch (error) {
+    if (fd !== -1) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Preserve the original write/fsync/rename error.
+      }
+    }
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // Preserve the original write/fsync/rename error.
+    }
+    throw error;
+  }
   try {
     chmodSync(path, 0o600); // best-effort — ignored on some filesystems
   } catch {

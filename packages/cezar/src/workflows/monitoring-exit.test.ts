@@ -213,6 +213,7 @@ describe('a parked monitor always has an exit', () => {
     const settled = store.getRun(id);
     expect(settled?.status).toBe('failed');
     expect(settled?.error).toBe('the session closed before you replied — continue to reply');
+    expect(settled?.awaitingAnswerSince).toBe(settled?.finishedAt);
     expect(settled?.steps.map((s) => s.status)).toEqual(['failed']);
     expect(settled?.askParked).toBeUndefined();
     await waitFor(id, () => stateOf(id) === undefined);
