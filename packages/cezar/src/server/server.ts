@@ -7,7 +7,7 @@ import { createTrackerService } from './tracker/index.ts';
 import { TrackerWatches } from './tracker/watch.ts';
 import { readTrackerAssociation, writeTrackerAssociation, clearTrackerAssociation } from '../tracker-association.ts';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { AutomationStore } from '../automations/store.ts';
 import { AutomationCoordinator } from '../automations/coordinator.ts';
 import { GithubPoller } from '../automations/github-poller.ts';
@@ -29,7 +29,7 @@ import {
 } from '../automations/types.ts';
 import { trackerTriggerSchema, trackerAutomationOptionsSchema, trackerAutomationOptionsQuerySchema, automationScheduleSchema, localTimeZone, nextOccurrence } from '@open-mercato/cezar-contract';
 import type { IncomingMessage } from 'node:http';
-import { access, constants as fsConstants, mkdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
+import { access, constants as fsConstants, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,17 +38,21 @@ import type { Next } from 'hono';
 import { serve, type ServerType } from '@hono/node-server';
 import { bodyLimit } from 'hono/body-limit';
 import { streamSSE } from 'hono/streaming';
-import { jsonZodValidator, paramZodValidator, queryZodValidator } from './validators.ts';
+import { jsonZodValidator, multipartZodValidator, paramZodValidator, queryZodValidator } from './validators.ts';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { z } from 'zod';
 import {
+  PROMPT_TEMPLATE_TEXT_MAX,
   setWorkspaceUiStateInputSchema,
+  setWorkspaceConfigInputSchema,
   type GroupResponse,
   type GroupVariant,
   type PickVariantResponse,
   type RunIndexEntry,
   type RunsIndexResponse,
   type StarCountPayload,
+  type WorkspaceConfigResponse,
+  workspaceBrandingLogoResponseSchema,
 } from '@open-mercato/cezar-contract';
 // A contract VALUE, like `workspaceUiStateSchema` in workspace/migrations.ts — the request
 // schema this route validates with is the same one the client compiles against.
@@ -82,6 +86,13 @@ import { currentUsage, currentTimedUsage, onUsage } from '../core/process-usage.
 import { DashboardReader } from '../workspace/dashboard.ts';
 import { dashboardRoutes } from './dashboard.ts';
 import { WORKFLOWS_DIR, loadWorkflows } from '../workflows/load.ts';
+import {
+  NODE_CATALOG,
+  graphIssues,
+  graphToSteps,
+  workflowGraphFileSchema,
+  workflowGraphSchema,
+} from '../workflows/graph.ts';
 import {
   QUICK_TASK_WORKFLOW,
   normalizeWorkflowDoc,
@@ -150,7 +161,7 @@ import {
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { findConfigFile } from '../agent-config/catalog.ts';
 import { readConfigFile, statConfigPath, writeConfigFile } from '../agent-config/files.ts';
-import { readAgentModelDefaults } from '../agent-config/models.ts';
+import { type AgentModelDefaults, readAgentModelDefaults } from '../agent-config/models.ts';
 import { listAgentConfig } from '../agent-config/service.ts';
 import { listConfigFiles, type AgentHomePaths } from '../agent-config/catalog.ts';
 import { readAccountIdentity } from '../agent-config/account-identity.ts';
@@ -202,7 +213,7 @@ import { checkoutRepo, type CloneRunner } from './checkout.ts';
 import { ProjectContextError, ProjectContexts, type ProjectContext } from './project-context.ts';
 import { reviewGateEnabled } from '../runs/review-gate.ts';
 import { readUiState, uiStatePath } from '../ui-state.ts';
-import { agentHomePaths, expandTilde } from '../paths.ts';
+import { agentHomePaths, cezarHomeDir, expandTilde } from '../paths.ts';
 import { isLoopbackHostHeader, normalizeHostname, resolveCapabilities } from './capabilities.ts';
 import { createSocketHub, type SocketHub, type WsUpgradeVerdict } from './ws.ts';
 import { browseDirectory, isInsideBrowseRoot, isLexicallyInsideBrowseRoot, resolveBrowseRoot } from './fs-browse.ts';
@@ -569,40 +580,6 @@ export interface UpdateProjectResponse {
   project: ProjectListEntry;
 }
 
-/** `GET/PUT /api/workspace/config` (multi-project spec, step 2.7) — the
- *  settings slice of `~/.cezar/config.json`: global knobs ONLY, never the
- *  project registry (that is `GET /api/projects`' job). */
-export interface WorkspaceConfigResponse {
-  /** Root exposed by the Add project directory browser (`~` kept). */
-  browseRoot: string;
-  /** Checkout root for GUI-cloned projects — stored as written (`~` kept). */
-  projectsDir: string;
-  /** Stored override; null means inherit CEZ_SKILLS_AUTO_UPDATE, then true. */
-  skillsAutoUpdate: boolean | null;
-  effectiveSkillsAutoUpdate: boolean;
-  composerDefaults: {
-    autonomous: boolean | null;
-    worktree: boolean | null;
-    inheritedAutonomous: boolean | 'source-dependent';
-    inheritedWorktree: boolean;
-  };
-  resources: {
-    maxParallel: number;
-    maxMonitoringSessions: number;
-    idleTimeoutMinutes: number | null;
-    monitoringWakeIntervalMinutes: number | null;
-    autoResumeOnUsageLimit: boolean;
-    memoryLimitMb: number | null;
-    worktreeRetentionDefault: number;
-  };
-  /** What a repo that has set none of its own runs (spec 2026-07-29-agent-profiles). Both keys
-   *  optional: absent means "no opinion", which must stay distinguishable from a chosen value. */
-  agentDefaults: {
-    runner?: ProviderId;
-    models?: { claude?: string; codex?: string; opencode?: string };
-  };
-}
-
 // ---- workspace SSE (multi-project spec, step 2.8) --------------------------
 
 /** Workspace-level event names carried ONLY on `GET /api/workspace/events`
@@ -739,6 +716,14 @@ const saveWorkflowSchema = z
     message: 'provide either "steps" or "skills", not both',
   });
 
+const validateGraphSchema = z.object({ graph: workflowGraphSchema });
+const saveGraphSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  description: z.string().max(2_000, 'must be at most 2000 characters').optional(),
+  graph: workflowGraphSchema,
+  overwrite: z.boolean().optional(),
+});
+
 const parseWorkflowSchema = z.object({
   yaml: z.string().min(1).max(100_000),
 });
@@ -846,7 +831,7 @@ const uiStateSchema = z
         z.object({
           id: z.string().min(1).max(64),
           label: z.string().trim().min(1).max(80),
-          text: z.string().trim().min(1).max(2000),
+          text: z.string().trim().min(1).max(PROMPT_TEMPLATE_TEXT_MAX),
           // Skill names this template auto-applies for. Optional and additive: templates
           // written before this key existed keep validating, and stay manual-only.
           skills: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
@@ -985,6 +970,80 @@ const pinSchema = z.object({
 // it only ever carries small GUI prefs.
 const GLOBAL_BODY_LIMIT = 32 * 1024 * 1024; // 32 MiB
 const UI_STATE_BODY_LIMIT = 128 * 1024; // 128 KiB
+const BRANDING_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+const BRANDING_LOGO_TYPES = {
+  'image/png': { ext: '.png', signature: (b: Buffer) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  'image/jpeg': { ext: '.jpg', signature: (b: Buffer) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  'image/webp': { ext: '.webp', signature: (b: Buffer) => b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP' },
+  'image/gif': { ext: '.gif', signature: (b: Buffer) => ['GIF87a', 'GIF89a'].includes(b.toString('ascii', 0, 6)) },
+  'image/avif': { ext: '.avif', signature: (b: Buffer) => b.toString('ascii', 4, 8) === 'ftyp' && /avif|avis/.test(b.toString('ascii', 8, 16)) },
+  'image/svg+xml': { ext: '.svg', signature: (b: Buffer) => isSafeBrandSvg(b.toString('utf8')) },
+} as const;
+const BRANDING_LOGO_EXTENSIONS = Object.values(BRANDING_LOGO_TYPES).map(({ ext }) => ext);
+const BRANDING_LOGO_FILE = 'branding-logo';
+
+function brandingLogoType(bytes: Buffer): [string, (typeof BRANDING_LOGO_TYPES)[keyof typeof BRANDING_LOGO_TYPES]] | null {
+  for (const [mime, type] of Object.entries(BRANDING_LOGO_TYPES)) {
+    if (type.signature(bytes)) return [mime, type];
+  }
+  return null;
+}
+
+function isSafeBrandSvg(svg: string): boolean {
+  const checked = svg.replace(/xmlns=(['"])http:\/\/www\.w3\.org\/2000\/svg\1/i, '');
+  if (checked.length === 0 || /<!DOCTYPE|<!ENTITY|<script\b|<foreignObject\b|<image\b|<use\b|<iframe\b|<style\b|\bon\w+\s*=|(?:href|src)\s*=|url\s*\(/i.test(checked)) return false;
+  return /^\s*<svg\b[\s\S]*<\/svg>\s*$/i.test(checked) && !/javascript:|data:|https?:|file:/i.test(checked);
+}
+
+/**
+ * `POST /workspace/branding-logo`'s request boundary — presence, size, declared type and (since
+ * those three are only what the browser CLAIMS about the file) the real content-sniffed format,
+ * all as one schema so the route type records a `File` field rather than the handler trusting
+ * whatever `parseBody()` handed it.
+ *
+ * EVERY check in the chain runs — zod does not stop at the first failure — so each one has to
+ * stand on its own against input the one before it would have rejected. A request can therefore
+ * collect more than one message, which is the honest trade for never letting a later check
+ * dereference something an earlier one only *meant* to have filtered out.
+ */
+export const brandingLogoUploadSchema = z.object({
+  file: z
+    .instanceof(File, { message: 'Choose an image file' })
+    .refine((f) => f.size >= 1 && f.size <= BRANDING_LOGO_MAX_BYTES, { message: 'Logo must be smaller than 2 MB' })
+    // `Object.hasOwn`, not `in`: `in` walks the prototype chain, so a part declaring
+    // `Content-Type: constructor` (or `toString`, `valueOf`, `hasOwnProperty`, `__proto__`)
+    // passed this gate, and the sniff below then read `.signature` off `Object` — undefined —
+    // and threw. A throw inside an async refine is NOT caught by `safeParseAsync`, so the
+    // request answered 500 instead of this message.
+    .refine((f) => Object.hasOwn(BRANDING_LOGO_TYPES, f.type), { message: 'Use PNG, JPEG, WebP, GIF, AVIF, or a safe SVG image' })
+    .refine(
+      async (f) => {
+        // Looked up defensively even though the refine above already rejected an unsupported
+        // type: zod runs EVERY check in a chain, it does not stop at the first failure, so this
+        // still executes for a type that is not in the table. Reading `.signature` off whatever
+        // the chain handed back then threw, and a throw inside an async refine escapes
+        // `safeParseAsync` — the route answered 500 instead of a validation error.
+        if (!Object.hasOwn(BRANDING_LOGO_TYPES, f.type)) return false;
+        const imageType = BRANDING_LOGO_TYPES[f.type as keyof typeof BRANDING_LOGO_TYPES];
+        return imageType.signature(Buffer.from(await f.arrayBuffer()));
+      },
+      { message: 'File contents do not match a supported image format' },
+    ),
+});
+
+function logoAssetUrl(): string | null {
+  for (const filename of [BRANDING_LOGO_FILE, ...BRANDING_LOGO_EXTENSIONS.map((ext) => `${BRANDING_LOGO_FILE}${ext}`)]) {
+    const path = join(cezarHomeDir(), filename);
+    if (!existsSync(path)) continue;
+    try {
+      const bytes = readFileSync(path);
+      if (!brandingLogoType(bytes)) continue;
+      const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+      return `/api/v1/workspace/branding-logo?v=${digest}`;
+    } catch { /* unreadable logo degrades to no logo */ }
+  }
+  return null;
+}
 
 /** The name half of a Host header — `localhost:4321` → `localhost`,
  *  `[::1]:4321` → `[::1]`. A bracketed IPv6 literal keeps its brackets
@@ -3059,6 +3118,10 @@ export function createApp(deps: ServerDeps) {
   // /api/projects above, and schemaVersion (a migration cursor, not a
   // setting) is deliberately omitted.
   const workspaceConfigBody = (config: WorkspaceConfig): WorkspaceConfigResponse => ({
+    branding: {
+      name: config.branding.name ?? 'cezar',
+      logoUrl: logoAssetUrl(),
+    },
     browseRoot: config.browseRoot,
     projectsDir: config.projectsDir,
     skillsAutoUpdate: config.skillsAutoUpdate ?? null,
@@ -3106,9 +3169,9 @@ export function createApp(deps: ServerDeps) {
     // window exists (the card renders `sampling…` and follows up once ~2.5 s later).
     .get('/workspace/host-usage', async (c) => c.json(hostSampler.sampleHostUsage()))
 
-    .put('/workspace/config', jsonZodValidator(() => workspaceConfigUpdateSchema), async (c) => {
+    .put('/workspace/config', jsonZodValidator(() => setWorkspaceConfigInputSchema), async (c) => {
       const parsed = { data: c.req.valid('json') };
-      const { browseRoot, projectsDir, skillsAutoUpdate, composerDefaults, resources, agentDefaults } = parsed.data;
+      const { browseRoot, projectsDir, skillsAutoUpdate, composerDefaults, resources, agentDefaults, branding } = parsed.data;
       for (const [configuredRoot, create] of [
         [browseRoot, false],
         [projectsDir, true],
@@ -3139,6 +3202,8 @@ export function createApp(deps: ServerDeps) {
       let written: WorkspaceConfig;
       try {
         written = await mergeWriteWorkspaceConfig((config) => {
+          if (branding?.name === null) delete config.branding.name;
+          else if (branding?.name !== undefined) config.branding.name = branding.name;
           // Roots are stored as written (`~` kept); only the probe expands them.
           if (browseRoot !== undefined) config.browseRoot = browseRoot;
           if (projectsDir !== undefined) config.projectsDir = projectsDir;
@@ -3155,6 +3220,9 @@ export function createApp(deps: ServerDeps) {
           if (resources?.maxParallel !== undefined) config.resources.maxParallel = resources.maxParallel;
           if (resources?.maxMonitoringSessions !== undefined) {
             config.resources.maxMonitoringSessions = resources.maxMonitoringSessions;
+          }
+          if (resources?.idleTimeoutMinutes !== undefined) {
+            config.resources.idleTimeoutMinutes = resources.idleTimeoutMinutes;
           }
           if (resources?.monitoringWakeIntervalMinutes !== undefined) {
             config.resources.monitoringWakeIntervalMinutes = resources.monitoringWakeIntervalMinutes;
@@ -3191,6 +3259,41 @@ export function createApp(deps: ServerDeps) {
       return c.json(workspaceConfigBody(written));
     })
 
+    .use('/workspace/branding-logo', bodyLimit({ maxSize: BRANDING_LOGO_MAX_BYTES + 64 * 1024 }))
+
+    .get('/workspace/branding-logo', async (c) => {
+      for (const filename of [BRANDING_LOGO_FILE, ...BRANDING_LOGO_EXTENSIONS.map((ext) => `${BRANDING_LOGO_FILE}${ext}`)]) {
+        try {
+          const bytes = await readFile(join(cezarHomeDir(), filename));
+          const imageType = brandingLogoType(bytes);
+          if (!imageType) continue;
+          const [mime] = imageType;
+          return c.body(new Uint8Array(bytes), 200, { 'content-type': mime, 'cache-control': 'public, max-age=31536000, immutable', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox" });
+        } catch { /* check the next supported image */ }
+      }
+      return c.json({ error: 'Brand logo not found' }, 404);
+    })
+    .post('/workspace/branding-logo', multipartZodValidator(() => brandingLogoUploadSchema), async (c) => {
+      const { file } = c.req.valid('form');
+      const bytes = Buffer.from(await file.arrayBuffer());
+      await mkdir(cezarHomeDir(), { recursive: true, mode: 0o700 });
+      const path = join(cezarHomeDir(), BRANDING_LOGO_FILE);
+      const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tmp, bytes, { mode: 0o600, flag: 'wx' });
+        await rename(tmp, path);
+      } catch (error) {
+        await unlink(tmp).catch(() => {});
+        throw error;
+      }
+      return c.json(workspaceBrandingLogoResponseSchema.parse({ logoUrl: logoAssetUrl() }));
+    })
+    .delete('/workspace/branding-logo', async (c) => {
+      await Promise.all([BRANDING_LOGO_FILE, ...BRANDING_LOGO_EXTENSIONS.map((ext) => `${BRANDING_LOGO_FILE}${ext}`)]
+        .map((filename) => unlink(join(cezarHomeDir(), filename)).catch(() => {})));
+      return c.json(workspaceBrandingLogoResponseSchema.parse({ logoUrl: null }));
+    })
+
     // Global GUI state (`~/.cezar/ui-state.json`) — same parse/key-cap/shallow-
     // merge semantics as the per-repo /api/v1/ui-state route below (the shared half
     // is `uiStateBodySchema`), but backed by the workspace file.
@@ -3221,46 +3324,6 @@ export function createApp(deps: ServerDeps) {
   // Partial updates only — absent keys stay untouched. Bounds mirror the
   // workspace schema (src/workspace/config.ts, step 1.2) exactly, so a value
   // this route accepts can never be degraded away by the next load's `.catch`.
-  const workspaceConfigUpdateSchema = z.object({
-    browseRoot: z.string().trim().min(1).max(4096).optional(),
-    projectsDir: z.string().trim().min(1).max(4096).optional(),
-    skillsAutoUpdate: z.boolean().nullable().optional(),
-    composerDefaults: z
-      .object({
-        autonomous: z.boolean().nullable().optional(),
-        worktree: z.boolean().nullable().optional(),
-      })
-      .optional(),
-    resources: z
-      .object({
-        maxParallel: z.number().int().min(1).max(16).optional(),
-        maxMonitoringSessions: z.number().int().min(0).max(16).optional(),
-        idleTimeoutMinutes: z.number().int().min(0).max(1440).nullable().optional(),
-        monitoringWakeIntervalMinutes: z.number().int().min(1).max(60).nullable().optional(),
-        autoResumeOnUsageLimit: z.boolean().optional(),
-        memoryLimitMb: z.number().int().min(0).max(1_048_576).nullable().optional(),
-        worktreeRetentionDefault: z.number().int().min(0).max(1000).optional(),
-      })
-      .optional(),
-    // Bounds mirror `src/workspace/config.ts`, so a value this accepts is never degraded away by
-    // the next load's `.catch`. `null` clears a key back to "no opinion".
-    agentDefaults: z
-      .object({
-        runner: z.enum(PROVIDER_IDS).nullable().optional(),
-        models: z
-          .object({
-            claude: z.string().trim().min(1).max(200).nullable().optional(),
-            codex: z.string().trim().min(1).max(200).nullable().optional(),
-            opencode: z.string().trim().min(1).max(200).nullable().optional(),
-            cursor: z.string().trim().min(1).max(200).nullable().optional(),
-            pi: z.string().trim().min(1).max(200).nullable().optional(),
-            junie: z.string().trim().min(1).max(200).nullable().optional(),
-            copilot: z.string().trim().min(1).max(200).nullable().optional(),
-          })
-          .optional(),
-      })
-      .optional(),
-  });
   // ---- chained family: filesystem browse (workspace-level) ----
   const fsBrowseRoutes = new Hono<ProjectApiEnv>()
     .get(
@@ -3420,6 +3483,41 @@ export function createApp(deps: ServerDeps) {
       return c.json({ ok: true, path: target });
     })
 
+    // Graph workflows (spec 2026-09-30-workflow-node-editor): the palette's node catalog, a
+    // structural validator the editor calls as you edit, and the `version: 2` save.
+    .get('/workflows/nodes', (c) => c.json({ nodes: NODE_CATALOG }))
+    .post('/workflows/validate', jsonZodValidator(validateGraphSchema), (c) =>
+      c.json({ issues: graphIssues(c.req.valid('json').graph) }),
+    )
+    .post('/workflows/graph', jsonZodValidator(saveGraphSchema), async (c) => {
+      const { root: repoRoot } = c.get('project');
+      const body = c.req.valid('json');
+      const issues = graphIssues(body.graph);
+      if (issues.length) return c.json({ error: issues.join('; ') }, 400);
+      const slug = slugify(body.name) || 'workflow';
+      const dir = join(repoRoot, WORKFLOWS_DIR);
+      const path = join(dir, `${slug}.yaml`);
+      const { nodes, edges, layout } = body.graph;
+      const doc = {
+        version: 2,
+        name: body.name,
+        ...(body.description ? { description: body.description } : {}),
+        nodes,
+        edges,
+        ...(layout ? { layout } : {}),
+      };
+      try {
+        await mkdir(dir, { recursive: true });
+        await writeFile(path, stringifyYaml(doc), { encoding: 'utf8', flag: body.overwrite ? 'w' : 'wx' });
+      } catch (err) {
+        if (err instanceof Error && 'code' in err && err.code === 'EEXIST') {
+          return c.json({ error: `workflow file already exists: ${path}`, exists: true }, 409);
+        }
+        return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
+      }
+      return c.json({ path, name: body.name }, 201);
+    })
+
     // Import support for the builder (spec 012): parse + validate a pasted
     // workflow YAML (either form) and hand back the normalized definition. The
     // server owns YAML parsing — the GUI stays dependency-free.
@@ -3431,6 +3529,25 @@ export function createApp(deps: ServerDeps) {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return c.json({ error: `not valid YAML: ${message}` }, 400);
+      }
+      const rawVersion = raw && typeof raw === 'object' ? (raw as { version?: unknown }).version : undefined;
+      // Accept a quoted `version: "2"` as the same intent as the numeric literal — a hand-edited
+      // YAML easily picks up the quotes, and without this it falls through to the v1 parser below
+      // with a confusing "missing steps" error instead of a graph validation message.
+      if (raw && typeof raw === 'object' && (rawVersion === 2 || rawVersion === '2')) {
+        const graphDoc = workflowGraphFileSchema.safeParse({ ...(raw as object), version: 2 });
+        if (!graphDoc.success) {
+          return c.json({ error: graphDoc.error.issues.map((i) => i.message).join('; ') }, 400);
+        }
+        const problems = graphIssues(graphDoc.data);
+        if (problems.length) return c.json({ error: problems.join('; ') }, 400);
+        const { name, description, nodes, edges, layout } = graphDoc.data;
+        return c.json({
+          name,
+          ...(description ? { description } : {}),
+          steps: graphToSteps(graphDoc.data),
+          graph: { nodes, edges, ...(layout ? { layout } : {}) },
+        });
       }
       const doc = workflowFileSchema.safeParse(raw);
       if (!doc.success) {
@@ -5935,6 +6052,20 @@ export function createApp(deps: ServerDeps) {
       return c.json({ branch: result.branch, created: result.created });
     });
 
+  // An explicit "auto" default becomes `''` on the wire (#906): the empty id IS
+  // auto in every model picker, so an older cockpit reading this answer shows
+  // auto too rather than tripping over an unknown sentinel. Only `true` counts —
+  // `false` is the absence of an opinion, not an opinion.
+  // Typed rather than left to `Object.fromEntries`' index signature: `configAnswer`'s return type
+  // is asserted `Exact` against `configResponseSchema` (contract-parity.workspace.test.ts), and an
+  // index signature leaking into the spread would widen `defaultModels` past the contract.
+  const autoModelOverrides = (auto: CezConfig['defaultModelsAuto']): AgentModelDefaults =>
+    Object.fromEntries(
+      Object.entries(auto ?? {})
+        .filter(([, isAuto]) => isAuto === true)
+        .map(([runner]) => [runner, '']),
+    );
+
   // The Settings → Agents knobs in one read (R6 Step 1.5) — an ADDITIVE
   // sibling of PUT /api/config below; /api/health keeps its protected shape.
   const configAnswer = async (repoRoot: string, config: CezConfig) => {
@@ -5946,9 +6077,17 @@ export function createApp(deps: ServerDeps) {
       systemPrompt: config.systemPrompt ?? null,
       // Native defaults seed each runner independently. A Cezar preset remains
       // selectable unless the operator opts into the fixed-model policy.
+      // An explicit auto override (#906) answers `''` for that runner — the one
+      // way to say "ignore the agent's own configured default" without editing
+      // the vendor's settings file. It layers over the native seed and under a
+      // repo preset, so setting a preset later simply wins.
       defaultModels: modelsLocked
         ? nativeModels
-        : { ...nativeModels, ...(config.defaultModels ?? {}) },
+        : {
+            ...nativeModels,
+            ...autoModelOverrides(config.defaultModelsAuto),
+            ...(config.defaultModels ?? {}),
+          },
       modelsLocked,
       maxParallel: config.maxParallel,
       memoryLimitMb: config.memoryLimitMb ?? null,
@@ -5973,7 +6112,12 @@ export function createApp(deps: ServerDeps) {
     .put('/config', jsonZodValidator(() => setConfigSchema), async (c) => {
       const { root: repoRoot, dataDir } = c.get('project');
       const parsed = { data: c.req.valid('json') };
-      if (agentModelsLocked(repoRoot) && parsed.data.defaultModels !== undefined) {
+      // The auto override is a model choice too (#906), so the fixed-model
+      // policy refuses it on exactly the same terms as a preset.
+      if (
+        agentModelsLocked(repoRoot) &&
+        (parsed.data.defaultModels !== undefined || parsed.data.defaultModelsAuto !== undefined)
+      ) {
         return c.json({ error: AGENT_MODELS_LOCKED_ERROR }, 409);
       }
       const configPath = join(dataDir, 'config.json');
@@ -6034,6 +6178,22 @@ export function createApp(deps: ServerDeps) {
         if (Object.keys(current).length === 0) delete raw.defaultModels;
         else raw.defaultModels = current;
       }
+      if (parsed.data.defaultModelsAuto !== undefined) {
+        // Same per-runner merge as the presets above, and the same "store only a
+        // real opinion" rule: `false`/`null` deletes rather than persisting a
+        // key that means nothing (#906).
+        const current =
+          raw.defaultModelsAuto && typeof raw.defaultModelsAuto === 'object'
+            ? { ...(raw.defaultModelsAuto as Record<string, unknown>) }
+            : {};
+        for (const [runner, isAuto] of Object.entries(parsed.data.defaultModelsAuto)) {
+          if (isAuto === undefined) continue;
+          if (isAuto) current[runner] = true;
+          else delete current[runner];
+        }
+        if (Object.keys(current).length === 0) delete raw.defaultModelsAuto;
+        else raw.defaultModelsAuto = current;
+      }
       try {
         await mkdir(dataDir, { recursive: true });
         await writeFile(configPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
@@ -6050,6 +6210,7 @@ export function createApp(deps: ServerDeps) {
   // the file. All fields optional + additive: `null` (and `''` for the
   // R6 keys) clears a knob back to its default.
   const modelPresetSchema = z.string().trim().max(200).nullable().optional();
+  const autoModelSchema = z.boolean().nullable().optional();
   const setConfigSchema = z.object({
     baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
     defaultRunner: z.enum(RUNNER_IDS).optional(),
@@ -6061,6 +6222,18 @@ export function createApp(deps: ServerDeps) {
         opencode: modelPresetSchema,
         cursor: modelPresetSchema,
         pi: modelPresetSchema,
+      })
+      .optional(),
+    // Per-runner "auto is the default" override (#906). Additive, and necessarily
+    // its own key: clearing a preset cannot express an explicit auto, because the
+    // answer then falls through to the coding agent's own settings file.
+    // `false`/`null` clears the override back to no opinion.
+    defaultModelsAuto: z
+      .object({
+        claude: autoModelSchema,
+        codex: autoModelSchema,
+        opencode: autoModelSchema,
+        pi: autoModelSchema,
       })
       .optional(),
     // Concurrency + memory guard (Settings → Resources). maxParallel clamps to
@@ -6225,6 +6398,7 @@ export function createApp(deps: ServerDeps) {
     ...(run.seenAt !== undefined ? { seenAt: run.seenAt } : {}),
     archived: run.archived,
     ...(run.autoResumeAt !== undefined ? { autoResumeAt: run.autoResumeAt } : {}),
+    ...(run.awaitingAnswerSince !== undefined ? { awaitingAnswerSince: run.awaitingAnswerSince } : {}),
     workflow: run.workflow,
     ...(run.branch !== undefined ? { branch: run.branch } : {}),
     ...(run.dispatch !== undefined
