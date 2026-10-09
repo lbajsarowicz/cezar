@@ -26,6 +26,10 @@ import { type Runner, runnerSchema } from './health.ts';
  * was wider than the server has ever been.
  */
 export const workspaceConfigResponseSchema = z.object({
+  branding: z.object({
+    name: z.string(),
+    logoUrl: z.string().nullable(),
+  }),
   /** Root exposed by the Add-project directory browser — stored as written (`~` kept). */
   browseRoot: z.string(),
   /** Checkout root for GUI-cloned projects — stored as written (`~` kept). */
@@ -43,6 +47,7 @@ export const workspaceConfigResponseSchema = z.object({
   resources: z.object({
     maxParallel: z.number(),
     maxMonitoringSessions: z.number(),
+    idleTimeoutMinutes: z.number().nullable(),
     monitoringWakeIntervalMinutes: z.number().nullable(),
     /** Resume a run a provider usage limit stopped, once the limit resets. Default `true`. */
     autoResumeOnUsageLimit: z.boolean(),
@@ -65,6 +70,8 @@ export const workspaceConfigResponseSchema = z.object({
       opencode: z.string().optional(),
       cursor: z.string().optional(),
       pi: z.string().optional(),
+      junie: z.string().optional(),
+      copilot: z.string().optional(),
     }).optional(),
   }),
 });
@@ -78,6 +85,9 @@ export type WorkspaceConfigResponse = z.infer<typeof workspaceConfigResponseSche
  * the next load's `.catch`.
  */
 export const setWorkspaceConfigInputSchema = z.object({
+  branding: z.object({
+    name: z.string().trim().min(1).max(80).nullable().optional(),
+  }).optional(),
   browseRoot: z.string().trim().min(1).max(4096).optional(),
   projectsDir: z.string().trim().min(1).max(4096).optional(),
   skillsAutoUpdate: z.boolean().nullable().optional(),
@@ -97,8 +107,10 @@ export const setWorkspaceConfigInputSchema = z.object({
           claude: z.string().trim().min(1).max(200).nullable().optional(),
           codex: z.string().trim().min(1).max(200).nullable().optional(),
           opencode: z.string().trim().min(1).max(200).nullable().optional(),
+          junie: z.string().trim().min(1).max(200).nullable().optional(),
           cursor: z.string().trim().min(1).max(200).nullable().optional(),
           pi: z.string().trim().min(1).max(200).nullable().optional(),
+          copilot: z.string().trim().min(1).max(200).nullable().optional(),
         })
         .optional(),
     })
@@ -107,6 +119,7 @@ export const setWorkspaceConfigInputSchema = z.object({
     .object({
       maxParallel: z.number().int().min(1).max(16).optional(),
       maxMonitoringSessions: z.number().int().min(0).max(16).optional(),
+      idleTimeoutMinutes: z.number().int().min(0).max(1440).nullable().optional(),
       monitoringWakeIntervalMinutes: z.number().int().min(1).max(60).nullable().optional(),
       autoResumeOnUsageLimit: z.boolean().optional(),
       memoryLimitMb: z.number().int().min(0).max(1_048_576).nullable().optional(),
@@ -115,6 +128,10 @@ export const setWorkspaceConfigInputSchema = z.object({
     .optional(),
 });
 export type SetWorkspaceConfigInput = z.infer<typeof setWorkspaceConfigInputSchema>;
+
+/** Multipart upload result for the workspace's local instance logo. */
+export const workspaceBrandingLogoResponseSchema = z.object({ logoUrl: z.string().nullable() });
+export type WorkspaceBrandingLogoResponse = z.infer<typeof workspaceBrandingLogoResponseSchema>;
 
 // ---- GUI prefs — the two open bags ----------------------------------------------------------
 
@@ -192,6 +209,14 @@ export const uiStateSchema = z.looseObject({
 });
 export type UiState = z.infer<typeof uiStateSchema>;
 
+/** Maximum persisted text for one reusable prompt template (#908).
+ *
+ * 20,000 characters accommodates long skills while keeping each ui-state entry bounded. The
+ * server write schema and cockpit editor mirror this documented value; the response schema above
+ * remains intentionally permissive so older/newer ui-state files round-trip safely.
+ */
+export const PROMPT_TEMPLATE_TEXT_MAX = 20_000;
+
 /**
  * `GET/PUT /api/v1/workspace/ui-state` — cross-project GUI prefs in `~/.cezar/ui-state.json`
  * (multi-project spec, step 2.7).
@@ -264,6 +289,8 @@ export const workspaceUiStateSchema = z.looseObject({
       opencode: z.string().optional(),
       cursor: z.string().optional(),
       pi: z.string().optional(),
+      junie: z.string().optional(),
+      copilot: z.string().optional(),
     })
     .optional(),
   /** Settings → Appearance, GLOBAL since step 3.5: accent + density describe the person at the
@@ -321,6 +348,8 @@ export const setWorkspaceUiStateInputSchema = z
         codex: z.string().min(1).max(128).optional(),
         opencode: z.string().min(1).max(128).optional(),
         pi: z.string().min(1).max(128).optional(),
+        junie: z.string().min(1).max(128).optional(),
+        copilot: z.string().min(1).max(128).optional(),
       })
       .optional(),
     importedSkills: z
@@ -351,15 +380,19 @@ export type SetWorkspaceUiStateInput = z.infer<typeof setWorkspaceUiStateInputSc
 // ---- per-repo agent knobs (`GET/PUT /api/v1/config`) ----------------------------------------
 
 /** Per-runner default model preset (Settings → Agents): the composer preselects this model id for
- *  the runner. Absent = auto (the runner decides). Keyed by runner name rather than derived from
- *  `runnerSchema` because the server's own `defaultModels` object (src/config.ts:92) is spelled
- *  the same way — one key per runner, each independently optional. */
+ *  the runner. Absent = auto (the runner decides), and so is `''` — the explicit auto a
+ *  `defaultModelsAuto` override answers with (#906), which is why it beats the coding agent's own
+ *  configured default instead of being indistinguishable from "nothing set". Keyed by runner name
+ *  rather than derived from `runnerSchema` because the server's own `defaultModels` object
+ *  (src/config.ts) is spelled the same way — one key per runner, each independently optional. */
 export const runnerModelsSchema = z.object({
   claude: z.string().optional(),
   codex: z.string().optional(),
+  junie: z.string().optional(),
   opencode: z.string().optional(),
   cursor: z.string().optional(),
   pi: z.string().optional(),
+  copilot: z.string().optional(),
 });
 export type RunnerModels = z.infer<typeof runnerModelsSchema>;
 
@@ -408,6 +441,19 @@ export const setConfigInputSchema = z.object({
       opencode: z.string().trim().max(200).nullable().optional(),
       cursor: z.string().trim().max(200).nullable().optional(),
       pi: z.string().trim().max(200).nullable().optional(),
+      copilot: z.string().trim().max(200).nullable().optional(),
+    })
+    .optional(),
+  /** Per-runner "auto is the default" override (#906), additive: clearing a `defaultModels` preset
+   *  cannot express an explicit auto, because the answer then falls through to the coding agent's
+   *  own settings file. `true` sets auto; `false`/`null` clears the override back to no opinion.
+   *  Merges per runner exactly like `defaultModels`. */
+  defaultModelsAuto: z
+    .object({
+      claude: z.boolean().nullable().optional(),
+      codex: z.boolean().nullable().optional(),
+      opencode: z.boolean().nullable().optional(),
+      pi: z.boolean().nullable().optional(),
     })
     .optional(),
   maxParallel: z.number().int().min(1).max(16).optional(),
@@ -518,11 +564,11 @@ export type ProviderConnectResponse = z.infer<typeof providerConnectResponseSche
 /**
  * The runners whose model list is discovered from the host rather than hard-coded: Codex through
  * its app-server protocol, OpenCode through its own `models` listing (#794), Claude through the
- * CLI's `list_models` control request (#784), and Cursor through its CLI model listing. A runner absent here has no discovery path and
+ * CLI's `list_models` control request (#784), Cursor through its CLI model listing, and Junie through ACP session config options. A runner absent here has no discovery path and
  * 400s, so the client compiles against exactly what the route accepts. One definition, used by
  * the route's query validator and by the cockpit's picker.
  */
-export const modelDiscoveryRunnerSchema = z.enum(['claude', 'codex', 'opencode', 'cursor']);
+export const modelDiscoveryRunnerSchema = z.enum(['claude', 'codex', 'opencode', 'cursor', 'junie']);
 export type ModelDiscoveryRunner = z.infer<typeof modelDiscoveryRunnerSchema>;
 export const MODEL_DISCOVERY_RUNNERS: readonly ModelDiscoveryRunner[] =
   modelDiscoveryRunnerSchema.options;
@@ -539,7 +585,7 @@ export const runnerModelOptionSchema = z.object({
 });
 export type RunnerModelOption = z.infer<typeof runnerModelOptionSchema>;
 
-/** `GET /api/v1/models?runner=claude|codex|opencode|cursor` — the models discovered from that runner's
+/** `GET /api/v1/models?runner=claude|codex|opencode|cursor|junie` — the models discovered from that runner's
  *  own host installation, plus how fresh the answer is. Never an error: an unavailable CLI
  *  degrades to `source: 'unavailable'` with a `reason`. */
 export const runnerModelCatalogResponseSchema = z.object({
