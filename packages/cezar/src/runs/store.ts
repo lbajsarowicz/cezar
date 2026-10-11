@@ -93,6 +93,9 @@ const stepStateSchema = z.object({
    *  a PAIR. Without it, changing the project's account would silently make Continue resume
    *  against the wrong account's session store. Absent = the discovered default. */
   profileId: z.string().optional(),
+  /** Canonical provider/model identity resolved for this step. Optional so older runs.json files
+   *  remain readable and auto-model steps can retain an absent identity. */
+  modelIdentity: z.string().optional(),
   /** Dollar cost reported by the claude CLI for this step's turns. */
   costUsd: z.number().optional(),
 });
@@ -273,6 +276,27 @@ export const runRecordSchema = z.object({
    * so a Continue, a Finish or a cancel clears it without the caller's help.
    */
   awaitingAnswerSince: z.string().datetime().optional().catch(undefined),
+  /**
+   * A run a `checkout: 'pr-head'` automation launched on a pull request's head (spec
+   * 2026-10-06-agentic-e2e-checks Phase 3). `headSha` is what was fetched and tested — also the
+   * run's `baseBranch` — and `ref` the namespaced `refs/cezar/pr/<n>` holding it. Its presence
+   * is what refuses `POST /runs/:id/pr`: the branch would contain the whole foreign PR.
+   */
+  prHead: z
+    .object({
+      number: z.number().int().positive(),
+      repo: z.string(),
+      headRepo: z.string(),
+      headRef: z.string(),
+      headSha: z.string(),
+      baseRef: z.string(),
+      ref: z.string(),
+    })
+    .optional()
+    .catch(undefined),
+  /** The PR head came from a fork the automation admitted (`allowForkHeads`): untrusted code, so
+   *  its check steps never receive any secrets. */
+  untrustedHead: z.boolean().optional().catch(undefined),
   /**
    * Exact deadline at which a run stopped by a provider USAGE LIMIT resumes itself
    * (spec 2026-08-03-auto-resume-after-usage-limit) — the reset instant the provider named plus a
@@ -1128,6 +1152,20 @@ export class RunStore extends EventEmitter {
     if (!run || run.steps.some((s) => s.id === step.id)) return;
     run.steps.push({ ...step, status: 'pending', iterations: 0, tokensUsed: 0 });
     this.touch(run);
+  }
+
+  /**
+   * Replace the step list of a run that has not started any step yet (#1078): a queued run whose
+   * workflow changed on disk is re-resolved at dequeue, and the step rail must show the steps
+   * that will actually run. Refused (returns false) once any step has left `pending`, so a run
+   * with history can never have it rewritten.
+   */
+  replacePendingSteps(runId: string, steps: Array<Pick<StepState, 'id' | 'name' | 'kind'>>): boolean {
+    const run = this.runs.get(runId);
+    if (!run || run.steps.some((s) => s.status !== 'pending' || s.iterations > 0)) return false;
+    run.steps = steps.map((s) => ({ ...s, status: 'pending', iterations: 0, tokensUsed: 0 }));
+    this.touch(run);
+    return true;
   }
 
   updateStep(runId: string, stepId: string, patch: Partial<Omit<StepState, 'id'>>): void {
