@@ -56,6 +56,57 @@ describe('computeSnapshot', () => {
     expect(computeSnapshot({ ...base, eventName: 'schedule' })).toBeNull();
   });
 
+  describe('nightly', () => {
+    const nightly: SnapshotContext = {
+      ...base,
+      eventName: 'schedule',
+      refName: 'main',
+      prNumber: undefined,
+      requestedChannel: 'nightly',
+      nightlyDate: '20260813',
+    };
+
+    it('cuts main under the nightly dist-tag, dated and run-numbered', () => {
+      expect(computeSnapshot(nightly)).toEqual({
+        channel: 'nightly',
+        // Date first so the versions sort chronologically and a user can read the
+        // age of their build; run number second so a same-day re-cut never collides.
+        version: '0.1.5-nightly.20260813.123',
+        distTag: 'nightly',
+      });
+    });
+
+    it('cuts one on demand too — a manual dispatch of the nightly workflow', () => {
+      expect(computeSnapshot({ ...nightly, eventName: 'workflow_dispatch' })?.distTag).toBe('nightly');
+    });
+
+    it('is reachable only by asking for it by name, never from the event alone', () => {
+      // A workflow_dispatch or schedule that did NOT request the channel (ci.yml's
+      // manual trigger, say) must publish nothing.
+      expect(computeSnapshot({ ...nightly, requestedChannel: undefined })).toBeNull();
+      // ...and an unrecognised request is a no-op, not a fallback to another channel.
+      expect(computeSnapshot({ ...nightly, requestedChannel: 'nghtly' })).toBeNull();
+      expect(computeSnapshot({ ...base, requestedChannel: 'latest' })).toBeNull();
+    });
+
+    it('cuts only from main, and only from a schedule or a dispatch', () => {
+      expect(computeSnapshot({ ...nightly, refName: 'develop' })).toBeNull();
+      expect(computeSnapshot({ ...nightly, refName: 'release/0.1.x' })).toBeNull();
+      expect(computeSnapshot({ ...nightly, eventName: 'push' })).toBeNull();
+      expect(computeSnapshot({ ...nightly, eventName: 'pull_request' })).toBeNull();
+    });
+
+    it('refuses to publish without a well-formed date', () => {
+      expect(computeSnapshot({ ...nightly, nightlyDate: undefined })).toBeNull();
+      expect(computeSnapshot({ ...nightly, nightlyDate: '2026-08-13' })).toBeNull();
+      expect(computeSnapshot({ ...nightly, nightlyDate: '260813' })).toBeNull();
+    });
+
+    it('appends the run attempt on a re-run, like every other channel', () => {
+      expect(computeSnapshot({ ...nightly, runAttempt: 2 })?.version).toBe('0.1.5-nightly.20260813.123.2');
+    });
+  });
+
   it('appends the run attempt only on re-runs, so no publish ever collides', () => {
     expect(computeSnapshot({ ...base, runAttempt: 1 })?.version).toBe('0.1.5-pr482.123');
     expect(computeSnapshot({ ...base, runAttempt: undefined })?.version).toBe('0.1.5-pr482.123');
@@ -71,6 +122,14 @@ describe('computeSnapshot', () => {
     const events: SnapshotContext[] = [
       base,
       { ...base, eventName: 'push', refName: 'develop', prNumber: undefined },
+      {
+        ...base,
+        eventName: 'schedule',
+        refName: 'main',
+        prNumber: undefined,
+        requestedChannel: 'nightly',
+        nightlyDate: '20260813',
+      },
     ];
     for (const ctx of events) {
       const plan = computeSnapshot(ctx);
@@ -97,6 +156,11 @@ describe('stampManifests', () => {
       version: '0.1.5',
       dependencies: { '@open-mercato/cezar': '^0.1.5' },
     },
+    runAlias: {
+      name: 'cezar-run',
+      version: '0.1.5',
+      dependencies: { '@open-mercato/cezar': '^0.1.5' },
+    },
   });
 
   it('stamps every manifest to the snapshot version and pins each sibling exact', () => {
@@ -107,6 +171,8 @@ describe('stampManifests', () => {
     // Exact, no range: `npx cezar-cli@<v>` must run this PR's code, and the service must
     // resolve the api-client it was cut with.
     expect(stamped.alias.dependencies).toEqual({ '@open-mercato/cezar': '0.1.5-pr482.123' });
+    expect(stamped.runAlias.version).toBe('0.1.5-pr482.123');
+    expect(stamped.runAlias.dependencies).toEqual({ '@open-mercato/cezar': '0.1.5-pr482.123' });
     expect(stamped.cezar.devDependencies).toEqual({
       '@open-mercato/cezar-api-client': '0.1.5-pr482.123',
     });
@@ -119,10 +185,12 @@ describe('stampManifests', () => {
         apiClient: { name: '@old/client', version: '0.1.5' },
         cezar: { name: '@pat-lewczuk/cezar', version: '0.1.5', dependencies: { '@old/client': '^0.1.5' } },
         alias: { name: 'cezar-cli', version: '0.1.5', dependencies: { '@pat-lewczuk/cezar': '^0.1.5' } },
+        runAlias: { name: 'cezar-run', version: '0.1.5', dependencies: { '@pat-lewczuk/cezar': '^0.1.5' } },
       },
       '0.1.5-develop.7',
     );
     expect(stamped.alias.dependencies).toEqual({ '@pat-lewczuk/cezar': '0.1.5-develop.7' });
+    expect(stamped.runAlias.dependencies).toEqual({ '@pat-lewczuk/cezar': '0.1.5-develop.7' });
     expect(stamped.cezar.dependencies).toEqual({ '@old/client': '0.1.5-develop.7' });
   });
 
@@ -147,6 +215,7 @@ describe('stampManifests', () => {
     expect(stamped.alias.repository).toEqual(repository);
     expect(stamped.alias.homepage).toBe('https://example.test');
     expect(stamped.alias.bugs).toEqual({ url: 'https://example.test/issues' });
+    expect(stamped.runAlias.repository).toEqual(repository);
   });
 
   it('leaves the alias untouched when the service declares no repository', () => {

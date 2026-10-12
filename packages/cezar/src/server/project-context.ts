@@ -3,12 +3,14 @@ import { AutomationStore } from '../automations/store.ts';
 import { reconcileAutomationReceipts } from '../automations/task-template.ts';
 import { DEFAULT_WORKTREE_RETENTION, resolveWorktreeRetention } from '../config.ts';
 import { pruneOrphans } from '../git-worktree.ts';
+import { armRepoHandle } from '../runs/arm-repo-handle.ts';
 import { reclaimWorktrees } from '../runs/retention.ts';
 import { RunStore } from '../runs/store.ts';
 import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { RunManager } from '../workflows/run.ts';
 import { ensureLaunchKey } from './launch-key.ts';
 import { getRepoInfo } from './git.ts';
+import { resolveTrackerAgentEnv } from './tracker/agent-credentials.ts';
 
 /**
  * Per-project server context (spec 2026-07-20-multi-project-workspace,
@@ -213,7 +215,7 @@ export class ProjectContexts {
       ?? AutomationStore.open(dataDir);
     reconcileAutomationReceipts(automationStore, store);
     this.notifyStoreCreated(store);
-    const manager = new RunManager(store, project.root, { semaphore: this.semaphore });
+    const manager = new RunManager(store, project.root, { semaphore: this.semaphore, projectId: project.id, resolveTrackerEnv: resolveTrackerAgentEnv });
     try {
       const launchKey = ensureLaunchKey(dataDir);
       // Startup reconcile (spec 006) + count-based retention (#483) — the same
@@ -229,6 +231,15 @@ export class ProjectContexts {
         await reclaimWorktrees(project.root, store, keep).catch(() => [] as string[]);
       }
       await manager.recover();
+      // Which repository this project IS (#945), so the referenced tier stops adopting another
+      // repo's PR/issue as a task's subject. Fire-and-forget on purpose — it costs a `gh` spawn
+      // and building a context must not wait on the network. `project.root` is already realpath'd.
+      //
+      // Armed only once the build has SUCCEEDED. Arming beside `RunStore.open` would outlive a
+      // failed build: the promise still resolves after `teardown` flushed the index and detached
+      // every listener, and a healed record would then `touch()` a store whose lifecycle had
+      // ended — scheduling a `runs.json` write from a context nobody owns any more.
+      armRepoHandle(store, project.root);
       return { id: project.id, root: project.root, dataDir, store, manager, automationStore, launchKey };
     } catch (err) {
       // A failed build must not leak the half-built context's subscriptions.
@@ -241,6 +252,6 @@ export class ProjectContexts {
 /** Shared teardown for built and half-built contexts. */
 function teardown(ctx: { store: RunStore; manager: RunManager }): void {
   ctx.manager.dispose();
-  ctx.store.flush();
+  ctx.store.flush({ pretty: true });
   ctx.store.removeAllListeners();
 }

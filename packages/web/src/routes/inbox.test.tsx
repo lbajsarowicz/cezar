@@ -8,6 +8,13 @@ import type { ProviderStatusResponse, RunRecord, TodoItem } from '@open-mercato/
 import { Toaster, resetToasts } from '@/components/ui/toaster'
 
 import { InboxRoute, isTodoRunnable, visibleTodos } from './inbox'
+import { readFollowupSelection, writeFollowupSelection } from './github/hand-to-agent-draft'
+
+beforeEach(() => {
+  // The card seeds its engine pick from the remembered selection (#906), which is
+  // localStorage-backed and survives across tests in this file — start every test clean.
+  localStorage.clear()
+})
 
 afterEach(() => {
   act(() => resetToasts())
@@ -88,7 +95,7 @@ const jsonResponse = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
 const connectedProviders = (backends: readonly string[]): ProviderStatusResponse => ({
-  providers: (['claude', 'codex', 'opencode'] as const).map((provider) => ({
+  providers: (['claude', 'codex', 'opencode', 'cursor'] as const).map((provider) => ({
     provider,
     status: backends.includes(provider) ? 'connected' as const : 'not-installed' as const,
     enabled: true,
@@ -100,7 +107,8 @@ const PROVIDERS_NONE: ProviderStatusResponse = {
     { provider: 'claude', status: 'disconnected', enabled: true },
     { provider: 'codex', status: 'unknown', enabled: true },
     { provider: 'opencode', status: 'not-installed', enabled: true },
-  ],
+    { provider: 'cursor', status: 'disconnected', enabled: true },
+        ],
 }
 
 /** Fetch stub in the house style (github.test.tsx): records requests, serves the fixtures,
@@ -133,6 +141,8 @@ function stubFetch(
       if (method === 'GET' && path === '/api/v1/health') return jsonResponse(health(backends))
       if (method === 'GET' && path === '/api/v1/providers/status') return jsonResponse(providers)
       if (method === 'GET' && path === '/api/v1/models?runner=codex') return jsonResponse({ runner: 'codex', models: [{ id: 'gpt-future', label: 'gpt-future', description: 'Newest' }], source: 'live', stale: false })
+      if (method === 'GET' && path === '/api/v1/models?runner=claude') return jsonResponse({ runner: 'claude', models: [{ id: 'opus', label: 'opus', description: 'Opus 5' }, { id: 'sonnet', label: 'sonnet', description: 'Sonnet 5' }], source: 'live', stale: false })
+      if (path === '/api/v1/models?runner=cursor') return jsonResponse({ runner: 'cursor', models: [{ id: 'composer-2.5', label: 'Composer 2.5', description: '' }], source: 'live', stale: false })
       if (method === 'GET' && path === '/api/v1/config') {
         return jsonResponse({ defaultRunner: backends[0] ?? 'claude', defaultModels })
       }
@@ -158,6 +168,11 @@ function stubFetch(
 /** The Run POST the card actually sent — the assertion the #401 tests below turn on. */
 const startBody = (sent: readonly SentRequest[], id: string): unknown =>
   sent.find((r) => r.method === 'POST' && r.path === `/api/v1/todos/${id}/start`)?.body
+
+/** Whether the start actually fired — `startBody` alone cannot say, because a fully implicit
+ *  engine pick sends no body at all and reads as `undefined` either way. */
+const started = (sent: readonly SentRequest[], id: string) =>
+  sent.some((r) => r.method === 'POST' && r.path === `/api/v1/todos/${id}/start`)
 
 /** Open a pill's dropdown and choose an option by its visible label (the house pattern:
  *  Radix opens on pointerDown, and the menu renders in a portal outside the card). Scoped by
@@ -349,6 +364,58 @@ describe('Run — backend selection (#401)', () => {
     await waitFor(() => expect(startBody(sent, 't1')).toEqual({ model: 'opus' }))
   })
 
+  /**
+   * The #906 half that applies here: the card READS the remembered pick, so an explicit `auto`
+   * is honoured. `defaultModels` is seeded server-side from the coding agent's own settings file,
+   * so "untouched" is not a neutral state — it quietly hands the choice to
+   * `~/.claude/settings.json` and the run goes out pinned to whatever that names.
+   *
+   * The default runner is codex here purely so the assertions can tell "config has loaded" from
+   * "config has not loaded yet": a bare mount already resolves to auto, so asserting auto before
+   * the answer lands would pass no matter which way the fix went.
+   */
+  it('honors a remembered explicit auto instead of the configured default (#906)', async () => {
+    writeFollowupSelection({ model: '' })
+    const sent = stubFetch({ 'GET /api/v1/config': () => jsonResponse({ defaultRunner: 'codex', defaultModels: { codex: 'gpt-5-codex' } }) }, TODOS, ['claude', 'codex'])
+    renderInbox()
+
+    await waitFor(() => expect(cards()).toHaveLength(2))
+    const card = cards()[0]!
+    // The configured default runner arriving IS the proof that the config answer has landed.
+    await waitFor(() => expect(card.querySelector('[data-slot="runner-pill"]')?.textContent).toContain('codex'))
+    expect(card.querySelector('[data-slot="model-pill"]')?.textContent).toContain('auto')
+
+    fireEvent.click(card.querySelector('[data-action="todo-run"]')!)
+    // Auto stays implicit: no model on the wire, so the agent CLI decides — which is what the
+    // user asked for, and what the configured default was overriding. The runner is omitted too,
+    // because it IS what the server would pick anyway — which leaves no body at all.
+    await waitFor(() => expect(started(sent, 't1')).toBe(true))
+    expect(startBody(sent, 't1')).toBeUndefined()
+  })
+
+  /**
+   * The other side of that asymmetry, pinned so it stays a decision rather than an oversight.
+   * Writing the pick back would break #401's rule that a pick on one card must not re-aim the
+   * card below it — and persisting would make that leak survive reloads, which is strictly worse
+   * than the route state #401 already rejected.
+   */
+  it('never writes one card’s pick back to the remembered selection (#906/#401)', async () => {
+    const sent = stubFetch({}, TODOS, ['claude', 'codex'])
+    renderInbox()
+
+    await waitFor(() => expect(cards()).toHaveLength(2))
+    const card = cards()[0]!
+    await waitFor(() => expect(card.querySelector('[data-slot="runner-pill"]')).not.toBeNull())
+    await pick(card, 'runner-pill', 'codex')
+    await waitFor(() => expect(card.querySelector('[data-slot="runner-pill"]')?.textContent).toContain('codex'))
+
+    // The pick is real for THIS card…
+    fireEvent.click(card.querySelector('[data-action="todo-run"]')!)
+    await waitFor(() => expect(startBody(sent, 't1')).toEqual({ runner: 'codex' }))
+    // …and left no trace for the next card, or the next reload, to inherit.
+    expect(readFollowupSelection()).toMatchObject({ runner: null, model: null })
+  })
+
   it('a single-backend host hides the runner pill but still offers the model (composer rule)', async () => {
     stubFetch()
     renderInbox()
@@ -357,6 +424,54 @@ describe('Run — backend selection (#401)', () => {
     const card = cards()[0]!
     await waitFor(() => expect(card.querySelector('[data-slot="model-pill"]')).not.toBeNull())
     expect(card.querySelector('[data-slot="runner-pill"]')).toBeNull()
+  })
+
+  /**
+   * The Inbox mounts `EnginePills` WITHOUT `accounts` on purpose: `POST /todos/:id/start` has no
+   * `agentProfile` field, so offering a login picker here would render a choice the server drops
+   * on the floor. That opt-in is the whole safety argument for putting accounts in the shared
+   * component, and it needs a host that actually HAS a second login to mean anything — with an
+   * empty profiles payload this passes no matter which way the flag is set.
+   */
+  it('never offers agent accounts, even on a host with two logins for one runner', async () => {
+    const twoLogins = (provider: string, id: string, label: string) => ({
+      id,
+      provider,
+      label,
+      configDir: `~/.${provider}-${id}`,
+      path: `/home/u/.${provider}-${id}`,
+      exists: true,
+      looksValid: true,
+      isDefault: id === 'default',
+    })
+    const sent = stubFetch({
+      'GET /api/v1/workspace/agent-profiles': () =>
+        jsonResponse({
+          editable: true,
+          profiles: [
+            twoLogins('claude', 'default', 'Default'),
+            twoLogins('claude', 'klaudiusz', 'Klaudiusz'),
+          ],
+          profileCapableProviders: ['claude'],
+          selections: {},
+          defaults: {},
+        }),
+    })
+    renderInbox()
+
+    await waitFor(() => expect(cards()).toHaveLength(2))
+    const card = cards()[0]!
+    await waitFor(() => expect(card.querySelector('[data-slot="model-pill"]')).not.toBeNull())
+    // A second login would raise the pill on an accounts-enabled surface; here it must not.
+    expect(card.querySelector('[data-slot="runner-pill"]')).toBeNull()
+
+    fireEvent.click(card.querySelector('[data-action="todo-run"]')!)
+    // No body at all — stronger than an empty one, and the same bar the untouched-pick test above
+    // holds the card to. An `agentProfile` the endpoint ignores could not survive this.
+    await waitFor(() =>
+      expect(sent.some((r) => r.method === 'POST' && r.path === '/api/v1/todos/t1/start')).toBe(true),
+    )
+    expect(startBody(sent, 't1')).toBeUndefined()
   })
 
   it('a multi-backend host offers the runner pill, and the pick reaches the POST', async () => {
@@ -474,6 +589,7 @@ describe('Run — backend selection (#401)', () => {
           { provider: 'claude', status: 'disconnected', enabled: true },
           { provider: 'codex', status: 'connected', enabled: true },
           { provider: 'opencode', status: 'not-installed', enabled: true },
+          { provider: 'cursor', status: 'not-installed', enabled: true },
         ],
       },
     )
@@ -503,6 +619,7 @@ describe('Run — backend selection (#401)', () => {
           { provider: 'claude', status: 'connected', enabled: false },
           { provider: 'codex', status: 'connected', enabled: true },
           { provider: 'opencode', status: 'not-installed', enabled: true },
+          { provider: 'cursor', status: 'not-installed', enabled: true },
         ],
       },
     )
