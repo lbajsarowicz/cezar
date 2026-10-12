@@ -67,6 +67,7 @@ import {
   getSelfUpdate,
   getSelfUpdateDevelopment,
   getStarCount,
+  getTelemetryConsent,
   refreshSelfUpdate,
   setSelfUpdateChannel,
   applySelfUpdate,
@@ -440,6 +441,8 @@ export const workspaceQueryKeys = {
   /** cezar's own GitHub star count via `GET /api/v1/star-count`, behind the sidebar's ⭐ ask.
    *  Workspace-led: the number is about cezar, not about whichever project is on screen. */
   starCount: ['workspace', 'star-count'] as const,
+  /** The opt-in telemetry answer via `GET /api/v1/telemetry/consent` — one per machine. */
+  telemetryConsent: ['workspace', 'telemetry-consent'] as const,
   /** One directory listing from `GET /api/fs/browse` (step 4.2's folder picker). Keyed by the
    *  browsed path — `null` is the browse root, whose absolute location only the server knows.
    *  Not scope-led: there is one filesystem behind the workspace, not one per project. */
@@ -1496,6 +1499,17 @@ export function useStarCount(enabled = true) {
     refetchInterval: STAR_COUNT_REFRESH_MS,
     retry: false,
     refetchOnMount: false,
+  })
+}
+
+/** The opt-in telemetry answer. Read by the consent bar and Settings → Privacy; both write
+ *  through `putTelemetryConsent` and set this cache from the answer. */
+export function useTelemetryConsent() {
+  return useQuery({
+    queryKey: workspaceQueryKeys.telemetryConsent,
+    queryFn: ({ signal }) => getTelemetryConsent({ signal }),
+    staleTime: Infinity,
+    retry: false,
   })
 }
 
