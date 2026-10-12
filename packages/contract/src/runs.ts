@@ -8,6 +8,7 @@ import { workflowDefSchema, workflowStepDefSchema } from './workflows.ts';
 // one. `src/runs/store.ts` imports the SAME value for its persistence twin, so the two halves of
 // `contract-parity.runs.test.ts` cannot drift apart by construction.
 import { dispatchIntentSchema, dispatchSchema } from './dispatch.ts';
+import { trackerAssociationSchema, trackerAutomationEventSchema } from './tracker.ts';
 
 /**
  * The RUNS family of `/api/v1` — a task's record, its lifecycle mutations, and the artifacts
@@ -99,6 +100,9 @@ export const stepStateSchema = z.object({
    *  that created it, so resume and Continue read this rather than the project's current
    *  selection. Absent on records written before accounts existed. */
   profileId: z.string().optional(),
+  /** Canonical provider/model identity resolved for this step; absent for auto-model steps and
+   *  records written before per-step attribution existed. */
+  modelIdentity: z.string().optional(),
   costUsd: z.number().optional(),
 });
 export type StepState = z.infer<typeof stepStateSchema>;
@@ -210,6 +214,34 @@ export const runRecordSchema = z.object({
     })
     .optional(),
   /**
+   * Provenance for a task a tracker (Jira/Linear) automation launched — its own key for the same
+   * downgrade reason as `automationTrigger`. The store has always persisted and served it; it is
+   * described here so the cockpit can tell an automation's task from a person's (the Tasks
+   * tables' origin filter) without reaching past the type. No secret rides on it.
+   */
+  automationTracker: z
+    .object({
+      automationId: z.string(),
+      automationRevision: z.number(),
+      receiptId: z.string(),
+      provider: z.enum(['jira', 'linear']),
+      association: trackerAssociationSchema.optional(),
+      eventId: z.string().optional(),
+      event: trackerAutomationEventSchema.optional(),
+      timestamp: z.string().optional(),
+      change: z
+        .object({
+          fromId: z.string().optional(),
+          toId: z.string().optional(),
+          labelId: z.string().optional(),
+          labelName: z.string().optional(),
+        })
+        .optional(),
+      key: z.string(),
+      url: z.string(),
+    })
+    .optional(),
+  /**
    * This run's place in a dispatch tree (spec `.ai/specs/2026-09-10-dispatch.md`): its root,
    * its parent, its budget, its report. Absent on a plain task, which behaves exactly as it
    * always has.
@@ -233,6 +265,21 @@ export const runRecordSchema = z.object({
    *  question was still unanswered. Present only on a `failed` run; the cockpit keeps such a run
    *  under "needs you" until the answer reopens it. Absent on records written before it existed. */
   awaitingAnswerSince: z.string().optional(),
+  /** A run a `checkout: 'pr-head'` automation launched on a pull request's head (spec
+   *  2026-10-06-agentic-e2e-checks Phase 3): the fetched head it tested. Absent on every other run. */
+  prHead: z
+    .object({
+      number: z.number(),
+      repo: z.string(),
+      headRepo: z.string(),
+      headRef: z.string(),
+      headSha: z.string(),
+      baseRef: z.string(),
+      ref: z.string(),
+    })
+    .optional(),
+  /** The PR head came from a fork: its check steps run without the project's or workspace's secrets. */
+  untrustedHead: z.boolean().optional(),
   createdAt: z.string(),
   startedAt: z.string().optional(),
   finishedAt: z.string().optional(),
@@ -298,6 +345,8 @@ export const runRecordSchema = z.object({
    *  runs, on any run not yet opened, and on one deliberately put back to unread via
    *  `POST /runs/:id/unread` (#775) — all three count as unread. */
   seenAt: z.string().optional(),
+  /** Highest event `seq` handed out for this run (ephemeral frames included). Absent on older runs. */
+  lastSeq: z.number().int().nonnegative().optional(),
   currentStepId: z.string().optional(),
   error: z.string().optional(),
   steps: z.array(stepStateSchema),
@@ -395,6 +444,11 @@ export const runIndexEntrySchema = z.object({
    *  page needs to nest a child under its parent, and the child's `kind` so a row can say
    *  `review` or `implement` next to its title. Absent on a plain task. */
   dispatch: dispatchSchema.pick({ rootRunId: true, parentRunId: true, kind: true }).optional(),
+  /** The automation that launched this run — GitHub, scheduled or tracker, whichever provenance
+   *  key the record carries. Absent on a task a person (or a dispatching task) started; the
+   *  global page's origin filter reads it, and a dispatched child inherits its root's answer
+   *  there through `dispatch.rootRunId` rather than through a copy here. */
+  automationId: z.string().optional(),
   /** When the agent actually started, as opposed to when the task was created. The global page's
    *  age column prefers it and falls back to `createdAt`, exactly as the per-project table does. */
   startedAt: z.string().optional(),
@@ -593,6 +647,19 @@ export const gitPushResponseSchema = z.object({
   upstreamSet: z.boolean(),
 });
 export type GitPushResponse = z.infer<typeof gitPushResponseSchema>;
+
+/** `GET /runs/:id/git/status` — what the run's worktree holds that has not left it yet: files
+ *  `git add -A` would commit, and commits its upstream has not seen. `unpushed` is null while the
+ *  branch has no upstream (never pushed) — "not pushed at all" is a different answer from "0".
+ *  `behind` counts the other direction: what the base has that the branch lacks. */
+export const gitStatusResponseSchema = z.object({
+  uncommitted: z.number(),
+  unpushed: z.number().nullable(),
+  /** Commits on the task's base branch (as last fetched) the branch does not have; null when the
+   *  base cannot be resolved (none recorded, a raw sha, or a ref the repo lacks). */
+  behind: z.number().nullable(),
+});
+export type GitStatusResponse = z.infer<typeof gitStatusResponseSchema>;
 
 /** A commit a run made on its worktree branch. */
 export const runCommitSchema = z.object({

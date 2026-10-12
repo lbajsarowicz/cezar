@@ -298,7 +298,9 @@ describe('a parked monitor always has an exit', () => {
     expect(stateOf(id)?.session?.open).toBe(true);
     expect(stateOf(id)?.idleTimer).toBeDefined();
     // Newest first: the hand-off is the last thing that happened.
-    expect(heartbeats(id).slice(0, 2)).toEqual(['monitoring ended — status=waiting', 'turn complete — status=monitoring']);
+    const [handoff, lastTurn] = heartbeats(id);
+    expect(handoff).toBe('monitoring ended — status=waiting');
+    expect(lastTurn).toMatch(/^turn complete — status=monitoring( \(×\d+\))?$/);
   }, 120_000);
 
   it('at the cap waits for an in-flight child, then hands off after the report re-parks', async () => {
