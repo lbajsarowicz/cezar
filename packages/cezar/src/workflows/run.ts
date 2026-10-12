@@ -1013,7 +1013,8 @@ export function pastedAttachmentsText(attachments: PersistedAttachment[], librar
     `also saved on disk at:\n${list}\n${library}` +
     `When the task involves saving, uploading, attaching, or transforming the pasted content ` +
     `(e.g. attaching to a GitHub issue/PR, copying into the repo), operate on these files — do ` +
-    `not attempt to reconstruct them from the conversation.`
+    `not attempt to reconstruct them from the conversation. ` +
+    `Read a path above whenever you need to SEE an attachment and no image is visible in this message.`
   );
 }
 

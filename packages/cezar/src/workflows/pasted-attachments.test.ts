@@ -120,14 +120,16 @@ describe('pastedAttachmentsText / pastedAttachmentsNote', () => {
 
   /** The #950 wording is load-bearing for every backend that only ever sees text — a note that
    *  changed shape for a project with no library would be a regression nobody's test caught. */
-  it('is byte-identical to the pre-#929 note when there is no library to name', () => {
+  it('pins the pasted attachment note when there is no library to name', () => {
     const text = pastedAttachmentsText([{ name: 'pasted-1.png', url: '/x', path: '/abs/pasted-1.png' }]);
     expect(text).toBe(
       'The user attached 1 pasted file, also saved on disk at:\n- /abs/pasted-1.png\n' +
         'When the task involves saving, uploading, attaching, or transforming the pasted content ' +
         '(e.g. attaching to a GitHub issue/PR, copying into the repo), operate on these files — do ' +
-        'not attempt to reconstruct them from the conversation.',
+        'not attempt to reconstruct them from the conversation. ' +
+        'Read a path above whenever you need to SEE an attachment and no image is visible in this message.',
     );
+    expect(text).toContain('Read a path above whenever you need to SEE an attachment and no image is visible in this message.');
   });
 });
 
