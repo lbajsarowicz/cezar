@@ -101,6 +101,40 @@ describe('check steps are bounded in time, output and environment', () => {
     expect(settled.steps.map((s) => s.status)).toEqual(['done']);
   }, 30_000);
 
+  it('hands the gh token to a trusted check but not to one on an untrusted head', async () => {
+    setEnv('GITHUB_TOKEN', 'ghp_check_env_probe');
+    setEnv('GH_TOKEN', 'ghp_check_env_probe');
+    const { stdout } = await run('git', ['rev-parse', 'HEAD'], { cwd: repoRoot });
+    const sha = stdout.trim();
+    const workflow = (command: string): WorkflowDef => ({
+      name: 'gh-env',
+      source: 'file',
+      steps: [{ id: 'verify', command }],
+    });
+    const trusted = manager.startRun(workflow('test -n "$GITHUB_TOKEN" && test -n "$GH_TOKEN"'), {
+      task: 'x',
+      worktree: false,
+    });
+    expect((await settle(trusted.id, 20_000)).steps.map((s) => s.status)).toEqual(['done']);
+
+    const pr = {
+      number: 7,
+      repo: 'o/r',
+      headRepo: 'fork/r',
+      headRef: 'feature',
+      headSha: sha,
+      baseRef: 'main',
+      ref: 'refs/cezar/pr/7',
+    };
+    const forked = manager.startRun(workflow('test -z "${GITHUB_TOKEN:-}" && test -z "${GH_TOKEN:-}" && test -n "$PATH"'), {
+      task: 'x',
+      worktree: false,
+      forkRef: { sha, label: 'fork', pr, prUrl: 'https://github.com/o/r/pull/7', untrusted: true },
+    });
+    expect(store.getRun(forked.id)?.untrustedHead).toBe(true);
+    expect((await settle(forked.id, 20_000)).steps.map((s) => s.status)).toEqual(['done']);
+  }, 50_000);
+
   it.skipIf(process.platform === 'win32')('fails a hung check at its timeout and frees the run', async () => {
     const pidFile = join(repoRoot, 'bg.pid');
     const workflow: WorkflowDef = {

@@ -387,8 +387,11 @@ ref is deleted with the last run that needs it.
 
 **Fork heads are untrusted code.** An admitted fork's checks run **without
 any secrets** — the same rule GitHub Actions applies to fork
-PRs, and the one e2e's own security model asks for. A fork check therefore has
-no model key; agent-driven tests in it will fail on the missing credential
+PRs, and the one e2e's own security model asks for. No vault secret is read,
+and `GITHUB_TOKEN`, `GH_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GH_CONFIG_DIR` are
+removed from the check's environment even under `CEZ_AGENT_ENV_FULL=1` or
+`CEZ_ENV_PASSTHROUGH` (`GH_HOST` stays). A fork check therefore has
+no model key and no `gh` login; agent-driven tests in it will fail on the missing credential
 (exit 2) rather than run a stranger's code with your key.
 
 **A PR-head run cannot publish.** Its branch holds the whole PR under the

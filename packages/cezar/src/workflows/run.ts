@@ -6956,7 +6956,7 @@ export class RunManager {
     emit: (event: { type: string; stepId?: string; [k: string]: unknown }) => void,
   ): Promise<NodeJS.ProcessEnv> {
     // A fork's head is untrusted code (Phase 3): like GitHub Actions withholding secrets from fork
-    // PRs, its checks get the scrubbed check env only — the credentials are neither read nor handed over.
+    // PRs, its checks get the scrubbed check env only — no vault secrets are read and no `gh` token is handed over.
     const untrusted = this.store.getRun(runId)?.untrustedHead === true;
     const resolved = untrusted
       ? { values: {} as Record<string, string>, notes: [] as string[] }
@@ -6976,7 +6976,7 @@ export class RunManager {
     // The run context wins last (Phase 2). Its names are first removed from what the server
     // inherited — a cezar started inside another cezar task carries that task's `CEZ_*` — so a
     // variable this run does not set is absent, never a stale value from somewhere else.
-    const base: NodeJS.ProcessEnv = buildCheckEnv();
+    const base: NodeJS.ProcessEnv = buildCheckEnv(process.env, { untrusted });
     for (const name of CHECK_CONTEXT_VARS) {
       // `CEZ_PROJECT_ID` is the one context name that is ALSO a documented CLI input
       // (BACKWARD_COMPATIBILITY.md §1 — `cez task`/`cez automation` address a cockpit with it),

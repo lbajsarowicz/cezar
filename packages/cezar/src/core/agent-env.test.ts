@@ -400,4 +400,37 @@ describe('buildCheckEnv', () => {
     expect(buildCheckEnv({ ...host, CEZ_ENV_PASSTHROUGH: 'database_url' }).DATABASE_URL).toBe(host.DATABASE_URL);
     expect(buildCheckEnv({ ...host, CEZ_AGENT_ENV_FULL: '1' })).toEqual({ ...host, CEZ_AGENT_ENV_FULL: '1' });
   });
+
+  describe('untrusted head', () => {
+    const gh = {
+      ...host,
+      GH_TOKEN: 'ghp',
+      GH_ENTERPRISE_TOKEN: 'ghe',
+      GH_CONFIG_DIR: '/home/u/.config/gh',
+      GH_HOST: 'github.example.com',
+    };
+
+    it('drops every gh credential but keeps GH_HOST and the rest of the base', () => {
+      const env = buildCheckEnv(gh, { untrusted: true });
+      expect(env.GITHUB_TOKEN).toBeUndefined();
+      expect(env.GH_TOKEN).toBeUndefined();
+      expect(env.GH_ENTERPRISE_TOKEN).toBeUndefined();
+      expect(env.GH_CONFIG_DIR).toBeUndefined();
+      expect(env.GH_HOST).toBe('github.example.com');
+      expect(env.PATH).toBe('/usr/bin');
+    });
+
+    it('is not undone by CEZ_AGENT_ENV_FULL or CEZ_ENV_PASSTHROUGH', () => {
+      const full = buildCheckEnv({ ...gh, CEZ_AGENT_ENV_FULL: '1' }, { untrusted: true });
+      expect(full.GITHUB_TOKEN).toBeUndefined();
+      expect(full.GH_TOKEN).toBeUndefined();
+      const pass = buildCheckEnv({ ...gh, CEZ_ENV_PASSTHROUGH: 'gh_token' }, { untrusted: true });
+      expect(pass.GH_TOKEN).toBeUndefined();
+    });
+
+    it('a trusted check still receives them', () => {
+      expect(buildCheckEnv(gh).GITHUB_TOKEN).toBe('gh');
+      expect(buildCheckEnv(gh, { untrusted: false }).GH_TOKEN).toBe('ghp');
+    });
+  });
 });
