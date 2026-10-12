@@ -11,6 +11,9 @@ import {
   KeyboardIcon,
   NotebookPenIcon,
   PaletteIcon,
+  KeyRoundIcon,
+  BlocksIcon,
+  TicketIcon,
 } from 'lucide-react'
 import type { ComponentType, SVGProps } from 'react'
 
@@ -27,6 +30,9 @@ import { PromptTemplatesSection } from './prompt-templates-section'
 import { ResourcesSection } from './resources-section'
 import { SkillsSection } from './skills-section'
 import { WorktreesSection } from './worktrees-section'
+import { TrackerSection } from './tracker-section'
+import { ProjectSecretsSection, WorkspaceSecretsSection } from './secrets-section'
+import { IntegrationsSection } from './integrations-section'
 
 /**
  * The Settings section registry (R6 Step 1.3, spec §"Settings"): the ONE place a section is
@@ -57,6 +63,10 @@ export type SettingsSectionId =
   | 'prompt-templates'
   | 'keyboard'
   | 'skills'
+  | 'tracker'
+  | 'secrets'
+  | 'integrations'
+  | 'workspace-secrets'
 
 /** Which settings area a section belongs to — and therefore which store it writes. */
 export type SettingsScope = 'project' | 'global'
@@ -91,6 +101,30 @@ function comingSoon(title: string, Icon: ComponentType<SVGProps<SVGSVGElement>>)
 
 export const SETTINGS_SECTIONS: SettingsSection[] = [
   // ---- project scope (`/p/<projectId>/settings/…`) — settings that describe THIS repo -------
+  {
+    id: 'tracker',
+    title: 'Issue tracker',
+    description: 'Connect this project to Jira or Linear.',
+    icon: TicketIcon,
+    component: TrackerSection,
+    scope: 'project',
+  },
+  {
+    id: 'secrets',
+    title: 'Secrets',
+    description: 'Encrypted values for this project’s check steps and cezar — never for agents.',
+    icon: KeyRoundIcon,
+    component: ProjectSecretsSection,
+    scope: 'project',
+  },
+  {
+    id: 'integrations',
+    title: 'External integrations',
+    description: 'Third-party tools cezar installs and wires into this project — test frameworks first.',
+    icon: BlocksIcon,
+    component: IntegrationsSection,
+    scope: 'project',
+  },
   {
     id: 'agents',
     title: 'Agents',
@@ -165,6 +199,14 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     scope: 'global',
   },
   {
+    id: 'workspace-secrets',
+    title: 'Secrets',
+    description: 'Encrypted values shared by every project on this machine — never for agents.',
+    icon: KeyRoundIcon,
+    component: WorkspaceSecretsSection,
+    scope: 'global',
+  },
+  {
     id: 'accounts',
     title: 'Agent accounts',
     description: 'Second logins, and the agent and models a project uses when it has chosen none.',
@@ -198,7 +240,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
  */
 export function visibleSettingsSections(
   scope: SettingsScope,
-  capabilities?: Pick<Capabilities, 'singleProject'>,
+  capabilities?: Partial<Pick<Capabilities, 'singleProject'>>,
 ): SettingsSection[] {
   return SETTINGS_SECTIONS.filter(
     (section) =>

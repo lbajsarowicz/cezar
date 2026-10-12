@@ -6,7 +6,7 @@ import { runRecordSchema } from './runs.ts';
 
 /**
  * One discovered skill: repo (`.ai/skills`, `.ai/cezar/skills`), `npx skills` install dirs
- * (project + global), or a configured team skills repo (spec 005).
+ * (project + global), a configured team skills repo (spec 005), or the one built-in.
  */
 export const skillSchema = z.object({
   name: z.string(),
@@ -15,7 +15,9 @@ export const skillSchema = z.object({
   interactive: z.literal(true).optional(),
   body: z.string(),
   path: z.string(),
-  source: z.enum(['ai', 'cezar', 'agents', 'global', 'team']),
+  /** `builtin`: the one skill cezar ships itself (`create-cezar-automation`), served only while
+   *  GitHub automations are on and reachable (spec 2026-09-13-automations-from-prompt). */
+  source: z.enum(['ai', 'cezar', 'agents', 'global', 'team', 'builtin']),
   /** Team skills only: where the definition lives in its skills repo. */
   team: z
     .object({
@@ -37,19 +39,10 @@ export const skillSchema = z.object({
 export type Skill = z.infer<typeof skillSchema>;
 
 /**
- * One row in the "Manage skills" panel — a skill a default (vendor) repo offers, from
- * `GET /skills/importable`, independent of whether it is currently kept.
- *
- * `description` is optional because that is what the WIRE says: the handler builds
- * `{ name, description: skill.description }` and `JSON.stringify` omits an undefined value, so
- * a description-less skill is serialized as `{ "name": "…" }`. The route's own type disagrees
- * (it claims the key is always present) — a handler defect, see
- * `contract-parity.workflows.test.ts`.
+ * A skill offered by the default (vendor) repo, from `GET /skills/importable`, independent of
+ * whether it is enabled. The full definition lets the Skills catalog preview it before enabling.
  */
-export const importableSkillSchema = z.object({
-  name: z.string(),
-  description: z.string().optional(),
-});
+export const importableSkillSchema = skillSchema;
 export type ImportableSkill = z.infer<typeof importableSkillSchema>;
 
 // ---- follow-up inbox / todos (spec 007) ---------------------------------------------------

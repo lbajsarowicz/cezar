@@ -1,7 +1,8 @@
-import { useMutation, useQueries, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo } from 'react'
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { mergeProviderStatusResponse } from '@/lib/provider-status'
+import { mergeRun } from './events'
 
 import {
   ApiError,
@@ -19,6 +20,7 @@ import {
   getConfig,
   getGithub,
   getGithubChecks,
+  getGithubSearch,
   getGithubComments,
   getGithubPrChanges,
   getGithubRefStatus,
@@ -36,9 +38,13 @@ import {
   getRunCommits,
   getRepoChanges,
   getRepoCommit,
+  getRepoFile,
+  getRepoTree,
   getRun,
   getRunChanges,
+  getRunGitStatus,
   getRunDiff,
+  getRunDrafts,
   getRunFile,
   getRunHandoff,
   getRuns,
@@ -48,11 +54,22 @@ import {
   getSkills,
   getSkillsWhenReady,
   getTodos,
+  getTrackerAssociation, getTrackerConnection, getProjectSecrets, getWorkspaceSecrets, getE2eStatus,
+  getTrackerCandidates,
+  getTrackerItem,
+  getTrackerItems,
   getUiState,
   getWorkflows,
+  getWorkflowNodes,
   getWorkspaceConfig,
   getWorkspaceUiState,
   getSkillsUpdate,
+  getSelfUpdate,
+  getSelfUpdateDevelopment,
+  getStarCount,
+  refreshSelfUpdate,
+  setSelfUpdateChannel,
+  applySelfUpdate,
   checkSkillsUpdate,
   applySkillsUpdate,
   getWorktrees,
@@ -60,6 +77,8 @@ import {
   markRunSeen,
   markRunUnseen,
   patchRun,
+  pinProjectRun,
+  pinRun,
   removeQueuedMessage,
   registerProject,
   openAgentAccountFile,
@@ -72,6 +91,7 @@ import {
   sendProjectRunMessage,
   putAgentConfigFile,
   retryProviderAuth,
+  searchTrackerItems,
 } from './client'
 import { queryScope, REFERENCE_STATUS_MAX, runnerDiscoversModels } from '@open-mercato/cezar-api-client'
 import { useProjectScope } from './project-scope-context'
@@ -82,6 +102,7 @@ import type { ContinueOptions } from './client'
 import type {
   CheckoutProjectInput,
   CreateAgentProfileInput,
+  ApiRun,
   HealthResponse,
   MessageInput,
   Runner,
@@ -98,6 +119,10 @@ import type {
   SetAgentConfigInput,
   UpdateAgentProfileInput,
   UpdateProjectInput,
+  TrackerAssociation,
+  TrackerItemsResponse,
+  TrackerKind,
+  UpdateChannel,
 } from '@open-mercato/cezar-api-client'
 import { subscribeTopic } from './ws'
 
@@ -118,6 +143,33 @@ import { subscribeTopic } from './ws'
  * ever reach A's data. Call sites are unchanged — they keep writing `queryKeys.runs.list()`.
  */
 export const queryKeys = {
+  secrets: {
+    allFor: (projectId: string) => ['secrets', projectId] as const,
+    list: () => ['secrets', queryScope()] as const,
+  },
+  e2e: {
+    allFor: (projectId: string) => ['e2e', projectId] as const,
+    status: () => ['e2e', queryScope()] as const,
+  },
+  tracker: {
+    allFor: (projectId: string) => ['tracker', projectId] as const,
+    all: () => ['tracker', queryScope()] as const,
+    associationFor: (projectId: string) => ['tracker', projectId, 'association'] as const,
+    association: () => ['tracker', queryScope(), 'association'] as const,
+    candidates: (kind: TrackerKind, query = '') => ['tracker', queryScope(), 'candidates', kind, query] as const,
+    connection: () => ['tracker', queryScope(), 'connection'] as const,
+    items: (
+      association: TrackerAssociation,
+      params: { state: 'active' | 'all'; labels: readonly string[]; query?: string },
+    ) => [
+      'tracker', queryScope(), 'items', association.kind, association.source.id,
+      association.source.webUrl, association.externalId, association.connectionId ?? null, params.state, [...params.labels], params.query ?? '',
+    ] as const,
+    detail: (association: TrackerAssociation, id: string) => [
+      'tracker', queryScope(), 'detail', association.kind, association.source.id,
+      association.source.webUrl, association.externalId, association.connectionId ?? null, id,
+    ] as const,
+  },
   get health() {
     return [queryScope(), 'health'] as const
   },
@@ -129,8 +181,12 @@ export const queryKeys = {
     detail: (id: string) => [queryScope(), 'runs', 'detail', id] as const,
     diff: (id: string) => [queryScope(), 'runs', 'diff', id] as const,
     changes: (id: string) => [queryScope(), 'runs', 'changes', id] as const,
+    gitStatus: (id: string) => [queryScope(), 'runs', 'git-status', id] as const,
     file: (id: string, path: string) => [queryScope(), 'runs', 'files', id, path] as const,
     handoff: (id: string) => [queryScope(), 'runs', 'handoff', id] as const,
+    /** Unsent drafts for one task (#939). Read once per visit and never refetched in the
+     *  background — see `useRunDrafts`. */
+    drafts: (id: string) => [queryScope(), 'runs', 'drafts', id] as const,
     commits: (id: string) => [queryScope(), 'runs', 'commits', id] as const,
     commit: (id: string, sha: string) => [queryScope(), 'runs', 'commit', id, sha] as const,
   },
@@ -142,6 +198,9 @@ export const queryKeys = {
   },
   get workflows() {
     return [queryScope(), 'workflows'] as const
+  },
+  get workflowNodes() {
+    return [queryScope(), 'workflow-nodes'] as const
   },
   get skills() {
     return [queryScope(), 'skills'] as const
@@ -169,6 +228,12 @@ export const queryKeys = {
     return [queryScope(), 'repo', 'changes'] as const
   },
   repoCommit: (sha: string) => [queryScope(), 'repo', 'commit', sha] as const,
+  /** The Files sub-tab's path index (#1279) — also under `repo`, so a branch switch invalidates
+   *  the tree along with the diff. */
+  get repoTree() {
+    return [queryScope(), 'repo', 'tree'] as const
+  },
+  repoFile: (path: string) => [queryScope(), 'repo', 'file', path] as const,
   get uiState() {
     return [queryScope(), 'ui-state'] as const
   },
@@ -185,10 +250,15 @@ export const queryKeys = {
     return [queryScope(), 'worktrees'] as const
   },
   github: (params: { limit?: number } = {}) => [queryScope(), 'github', params.limit ?? null] as const,
+  githubPages: (limit = 50) => [queryScope(), 'github', 'pages', limit] as const,
   /** Lazy PR checks glyphs (`GET /api/github/checks`, #664), keyed by the sorted PR numbers so the
    *  same visible window de-dupes to one cache entry. */
   githubChecks: (prNumbers: readonly number[]) =>
     [queryScope(), 'github', 'checks', [...prNumbers].sort((a, b) => a - b).join(',')] as const,
+  /** Cross-state search (`GET /api/github/search`, #730), keyed by kind + the exact query so each
+   *  distinct search caches on its own and re-typing a previous query is instant. */
+  githubSearch: (kind: 'issue' | 'pr', query: string) =>
+    [queryScope(), 'github', 'search', kind, query] as const,
   /** Batched PR/issue chip status. Led by the EXPLICIT project rather than `queryScope()` —
    *  the global Tasks page asks about several projects at once, and two of them may each have a
    *  PR #42. Keyed by the sorted numbers, so the same window de-dupes to one cache entry. */
@@ -208,6 +278,122 @@ export const queryKeys = {
   },
 }
 
+export const TRACKER_STALE_TIME = 60_000
+
+export function useProjectSecrets() {
+  return useQuery({ queryKey: queryKeys.secrets.list(), queryFn: ({ signal }) => getProjectSecrets({ signal }) })
+}
+/** The user's own secrets (spec 2026-10-10-project-secrets-vault-options). Not scope-led: one machine, one set. */
+export function useWorkspaceSecrets() {
+  return useQuery({ queryKey: workspaceQueryKeys.secrets, queryFn: ({ signal }) => getWorkspaceSecrets({ signal }) })
+}
+
+/** `GET /e2e` (spec 2026-10-10-e2e-one-click-setup). The setup run's live status comes from
+ *  `useRun`, which the global event stream keeps current — no poll here. */
+export function useE2eStatus() {
+  return useQuery({ queryKey: queryKeys.e2e.status(), queryFn: ({ signal }) => getE2eStatus({ signal }) })
+}
+
+export function useTrackerConnection() {
+  return useQuery({ queryKey: queryKeys.tracker.connection(), queryFn: ({ signal }) => getTrackerConnection({ signal }) })
+}
+
+export function useTrackerAssociation() {
+  return useQuery({
+    queryKey: queryKeys.tracker.association(),
+    queryFn: ({ signal }) => getTrackerAssociation({ signal }),
+  })
+}
+
+export function useTrackerCandidates(kind: TrackerKind, query: string, enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.tracker.candidates(kind, query),
+    staleTime: TRACKER_STALE_TIME,
+    queryFn: ({ pageParam, signal }) =>
+      getTrackerCandidates(kind, {
+        q: query.trim() || undefined,
+        cursor: pageParam,
+        limit: 50,
+      }, { signal }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (page) => page.available && page.truncated ? page.nextCursor : undefined,
+    enabled,
+  })
+}
+
+/** Keep tracker failure metadata when a refresh rejects without replacing cached pages. */
+export class TrackerRefreshError extends Error {
+  constructor(readonly failure: Extract<TrackerItemsResponse, { available: false }>) {
+    super(failure.reason)
+    this.name = 'TrackerRefreshError'
+  }
+}
+
+export function useTrackerItems(
+  association: TrackerAssociation | null | undefined,
+  params: { state: 'active' | 'all'; labels: readonly string[]; query: string },
+  enabled = true,
+) {
+  const query = params.query.trim()
+  const queryClient = useQueryClient()
+  const queryKey = association
+    ? queryKeys.tracker.items(association, { ...params, query })
+    : ['tracker', queryScope(), 'items', 'unassociated']
+  const result = useInfiniteQuery({
+    queryKey,
+    // Watch owns automatic updates and preserves loaded pages until Show changes.
+    // Infinity still allows explicit invalidation when the connection or scope changes.
+    staleTime: Infinity,
+    queryFn: ({ pageParam, signal }) => query
+      ? searchTrackerItems(query, { association: association ?? undefined, cursor: pageParam, limit: 50, state: params.state, labels: params.labels, refresh: true }, { signal })
+      : getTrackerItems({ association: association ?? undefined, cursor: pageParam, limit: 50, state: params.state, labels: params.labels, refresh: false }, { signal }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (page) => page.available && page.truncated ? page.nextCursor : undefined,
+    enabled: association != null && enabled,
+  })
+  return {
+    ...result,
+    queryKey,
+    // Fetch page one without resetting the infinite-query cache: failed refreshes must
+    // retain loaded pages and cursors. The shared query owns cancellation and loading/error
+    // state, and publishes the replacement pages only after a successful response.
+    restart: async () => {
+      await queryClient.cancelQueries({ queryKey, exact: true })
+      try {
+        await queryClient.fetchInfiniteQuery({
+          queryKey,
+          initialPageParam: undefined as string | undefined,
+          pages: 1,
+          getNextPageParam: (page: TrackerItemsResponse) => page.available && page.truncated ? page.nextCursor : undefined,
+          staleTime: 0,
+          retry: false,
+          queryFn: async ({ signal }) => {
+            const browse = { association: association ?? undefined, limit: 50, state: params.state, labels: params.labels, refresh: true }
+            const page = query
+              ? await searchTrackerItems(query, browse, { signal })
+              : await getTrackerItems(browse, { signal })
+            if (!page.available) throw new TrackerRefreshError(page)
+            return page
+          },
+        })
+      } catch {
+        // Query state exposes failures to the existing retry UI; cancellation is silent.
+      }
+    },
+  }
+}
+
+export function useTrackerItem(association: TrackerAssociation | null | undefined, id: string | undefined) {
+  return useQuery({
+    staleTime: TRACKER_STALE_TIME,
+    queryKey: association && id
+      ? queryKeys.tracker.detail(association, id)
+      : ['tracker', queryScope(), 'detail', 'disabled'],
+    queryFn: ({ signal }) => getTrackerItem(id as string, { signal, association: association ?? undefined }),
+    enabled: association != null && id != null && id !== '',
+  })
+}
+
 /**
  * Workspace-level keys — deliberately NOT scope-led: there is one project registry no matter
  * which project is active, and the `/p/:projectId` route gate reads it while the scope is
@@ -215,19 +401,26 @@ export const queryKeys = {
  * scope changes → key changes → data gone → provider unmounts).
  */
 export const workspaceQueryKeys = {
+  dashboard: ['workspace', 'dashboard'] as const,
   models: (runner: string) => ['workspace', 'models', runner] as const,
   providerStatus: ['workspace', 'providers', 'status'] as const,
   projects: ['workspace', 'projects'] as const,
   /** The cross-project task index behind ⌘K. Workspace-led for the same reason the registry is:
    *  it answers for every project at once, so no scope owns it. */
   runsIndex: ['workspace', 'runs-index'] as const,
+  /** `~/.cezar/secrets/workspace.json` via `GET /api/v1/workspace/secrets` — metadata only. */
+  secrets: ['workspace', 'secrets'] as const,
   /** `~/.cezar/ui-state.json` via `GET/PUT /api/workspace/ui-state` (step 2.7) — cross-project
    *  GUI prefs, e.g. the sidebar's per-project collapse map (step 3.3), and — since step 3.5 —
    *  appearance + notifications, which describe the user rather than a repo. */
   uiState: ['workspace', 'ui-state'] as const,
-  /** `~/.cezar/config.json`'s settings slice via `GET/PUT /api/workspace/config` (step 2.7):
-   *  the global Resources knobs and the checkout root. */
+  /** `~/.cezar/config.json`'s workspace settings slice, including instance branding. */
   config: ['workspace', 'config'] as const,
+  /** Live host totals (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`). One cache for
+   *  both transports: local cockpits fold pushed `host` frames into it, remote ones refetch it
+   *  on mount and on the visibility/reconnect reconcile. Workspace-led because the machine is
+   *  the machine, whichever project is on screen. */
+  hostUsage: ['workspace', 'host-usage'] as const,
   /** Agent accounts via `GET /api/v1/workspace/agent-profiles` (spec 2026-07-29-agent-profiles).
    *  Workspace-led like the registry: an account describes the machine, not a repo. */
   agentProfiles: ['workspace', 'agent-profiles'] as const,
@@ -239,6 +432,12 @@ export const workspaceQueryKeys = {
   agentAccountStatus: (routeId: string) =>
     ['workspace', 'agent-profiles', 'status', routeId] as const,
   skillsUpdate: (projectId: string) => ['workspace', 'skills-update', projectId] as const,
+  /** cezar's own updater via `GET /api/v1/workspace/self-update` (self-update PoC). */
+  selfUpdate: ['workspace', 'self-update'] as const,
+  selfUpdateDevelopment: ['workspace', 'self-update', 'development'] as const,
+  /** cezar's own GitHub star count via `GET /api/v1/star-count`, behind the sidebar's ⭐ ask.
+   *  Workspace-led: the number is about cezar, not about whichever project is on screen. */
+  starCount: ['workspace', 'star-count'] as const,
   /** One directory listing from `GET /api/fs/browse` (step 4.2's folder picker). Keyed by the
    *  browsed path — `null` is the browse root, whose absolute location only the server knows.
    *  Not scope-led: there is one filesystem behind the workspace, not one per project. */
@@ -249,11 +448,13 @@ export const workspaceQueryKeys = {
 
 /**
  * One runner's host-discovered catalog, cached per runner (#794 — this used to be hard-wired to
- * Codex, which is why OpenCode had nothing but stale presets to show).
+ * Codex, which is why OpenCode had nothing but stale presets to show). Cursor (#807) discovers
+ * the same way — nothing runner-specific lives here, `runnerDiscoversModels` already knows it.
  *
- * A runner with no host catalog (claude) never fetches and never resolves data, so its picker
- * falls back to static presets exactly as before — callers can pass any runner and read
- * `data`/`isError` without checking first.
+ * A runner with no host catalog never fetches and never resolves data, so its picker falls back
+ * to static presets — callers can pass any runner and read `data`/`isError` without checking
+ * first. Claude joined the discovering runners in #784; `pi` is the one that still takes the
+ * fallback path today.
  *
  * `enabled` lets a caller that only MIGHT render the model pills (the thread's Continue — hooks
  * cannot be called conditionally) skip the fetch when it definitely won't.
@@ -285,8 +486,11 @@ export function useRunnerModelCatalogs(
   const claude = useRunnerModels('claude', enabled)
   const codex = useRunnerModels('codex', enabled)
   const opencode = useRunnerModels('opencode', enabled)
+  const cursor = useRunnerModels('cursor', enabled)
   const pi = useRunnerModels('pi', enabled)
-  return { claude, codex, opencode, pi }
+  const junie = useRunnerModels('junie', enabled)
+  const copilot = useRunnerModels('copilot', enabled)
+  return { claude, codex, junie, opencode, cursor, pi, copilot }
 }
 
 export function useProviderStatus() {
@@ -756,10 +960,11 @@ export function useOpenTargets() {
 }
 
 /** The authoritative run list. */
-export function useRuns() {
+export function useRuns<TData = ApiRun[]>(select?: (runs: ApiRun[]) => TData) {
   return useQuery({
     queryKey: queryKeys.runs.list(),
     queryFn: ({ signal }) => getRuns({ signal }),
+    select,
   })
 }
 
@@ -815,19 +1020,53 @@ export function useRunsIndex(enabled = true, refetchIntervalMs?: number) {
  * still goes to `/api/p/<bootId>/runs`, which the server answers byte-identically (the
  * route-parity contract).
  */
-export function useProjectRuns(projectId: string, enabled = true, boot = false) {
+export function useProjectRuns<TData = ApiRun[]>(
+  projectId: string,
+  enabled = true,
+  boot = false,
+  select?: (runs: ApiRun[]) => TData,
+) {
   return useQuery({
     queryKey: [boot ? 'default' : projectId, 'runs', 'list'] as const,
     queryFn: ({ signal }) => getProjectRuns(projectId, { signal }),
     enabled,
+    select,
   })
+}
+
+/**
+ * A run list for a project chosen OUTSIDE `ProjectScopeProvider` (the app shell and command
+ * palette live above the routed provider). Do not use `useRuns()` there: its key is read during
+ * the shell render, while its fetch runs after the route provider has written the module scope,
+ * which can cache project B's response under project A's key.
+ */
+export function useRunsForProject<TData = ApiRun[]>(
+  projectId: string | null,
+  bootProjectId: string | null | undefined,
+  select?: (runs: ApiRun[]) => TData,
+) {
+  const selected = projectId === 'default' ? null : projectId
+  const boot = selected === null || (bootProjectId != null && selected === bootProjectId)
+  return useProjectRuns(boot ? 'default' : selected ?? 'default', true, boot, select)
+}
+
+/**
+ * The authoritative single-run read, as options rather than a hook — so a caller that needs the
+ * record RIGHT NOW (`queryClient.fetchQuery`, with its own `staleTime: 0`) asks the same question
+ * at the same cache key as the thread's own `useRun`, and the answer lands in the cache every
+ * mounted view already reads. Spelling it twice would mean a refetch that heals nothing.
+ */
+export function runQueryOptions(id: string) {
+  return {
+    queryKey: queryKeys.runs.detail(id),
+    queryFn: ({ signal }: { signal: AbortSignal }) => getRun(id, { signal }),
+  }
 }
 
 /** One run, authoritative. `id` may be absent while a route param is still unresolved. */
 export function useRun(id: string | undefined) {
   return useQuery({
-    queryKey: queryKeys.runs.detail(id ?? ''),
-    queryFn: ({ signal }) => getRun(id as string, { signal }),
+    ...runQueryOptions(id ?? ''),
     enabled: Boolean(id),
   })
 }
@@ -873,6 +1112,21 @@ export function useRunChanges(id: string | undefined, live = false) {
     // focus refetch and a zero staleTime to THIS query (the global client keeps
     // refetchOnWindowFocus off + a 5-min staleTime, #query-client) so returning to a finished
     // task's Changes tab re-fetches instead of serving the last, possibly-empty snapshot.
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+  })
+}
+
+/** What the run's worktree has not published yet — the header's one git button reads it on
+ *  every tab, so it is the cheap `git status` answer rather than `/changes` and its patches.
+ *  Polled while the agent may still be writing; refetched on focus, like `useRunChanges`. */
+export function useRunGitStatus(id: string, enabled: boolean, live = false) {
+  return useQuery({
+    queryKey: queryKeys.runs.gitStatus(id),
+    queryFn: ({ signal }) => getRunGitStatus(id, { signal }),
+    enabled,
+    retry: false,
+    refetchInterval: live ? 10_000 : false,
     refetchOnWindowFocus: true,
     staleTime: 0,
   })
@@ -935,6 +1189,28 @@ export function useRunHandoff(id: string | undefined, enabled = true) {
   })
 }
 
+/**
+ * The unsent drafts of one task's editable inputs (#939).
+ *
+ * `staleTime: Infinity` and no focus refetch, and both are load-bearing rather than tuning: this
+ * query seeds inputs the user is typing into, so a background refetch landing mid-sentence would
+ * overwrite live text with what the server last heard. The cockpit's own writes update the cache
+ * in place (`useDraft`), which is the only thing that ever changes it while a task is open.
+ */
+export function useRunDrafts(id: string | undefined) {
+  return useQuery({
+    queryKey: queryKeys.runs.drafts(id ?? ''),
+    queryFn: ({ signal }) => getRunDrafts(id as string, { signal }),
+    enabled: Boolean(id),
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    // A draft is a convenience, not the page: a task whose drafts cannot be read still opens,
+    // with an empty composer, exactly as it did before this feature existed.
+    retry: false,
+  })
+}
+
 /** The follow-up inbox. Drives the nav badge. */
 /** The follow-up inbox. `enabled: false` (the caller passing `false` while
  *  `capabilities.followups` is off, #471) parks the query instead of polling an
@@ -948,9 +1224,19 @@ export function useTodos(enabled = true) {
   })
 }
 
-export function useWorkflows() {
+/** The graph editor's node catalog — static per server build, so it never refetches. */
+export function useWorkflowNodes() {
+  return useQuery({
+    queryKey: queryKeys.workflowNodes,
+    queryFn: ({ signal }) => getWorkflowNodes({ signal }),
+    staleTime: Infinity,
+  })
+}
+
+export function useWorkflows(opts: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: queryKeys.workflows,
+    enabled: opts.enabled ?? true,
     queryFn: ({ signal }) => getWorkflows({ signal }),
   })
 }
@@ -1038,6 +1324,44 @@ export function useRepoChanges() {
     queryKey: queryKeys.repoChanges,
     queryFn: ({ signal }) => getRepoChanges({ signal }),
     retry: false,
+  })
+}
+
+/**
+ * The repository's path index behind the Git tab's Files sub-tab (#1279). Same 409 stance as the
+ * rest of the family: "not a git repository" is an answer, not a hiccup. One read per visit feeds
+ * both the tree and the filter.
+ *
+ * `/repo/*` is deliberately NOT on the SSE stream, so there is no invalidation to ride and the
+ * query-client doctrine's "the stream says when something changed" does not cover it. This is the
+ * same hole `useRunChanges` opted out of, for the same reason and with the same two knobs: the data
+ * is a working tree an agent is actively editing, so coming back to the tab must re-read it rather
+ * than serve a snapshot from before the agent ran. `refetchOnWindowFocus` alone would not do it —
+ * the shared 5-minute `staleTime` would swallow the refetch — which is why `staleTime: 0` is here
+ * too. No polling: this fires on focus, not on a schedule.
+ */
+export function useRepoTree() {
+  return useQuery({
+    queryKey: queryKeys.repoTree,
+    queryFn: ({ signal }) => getRepoTree({ signal }),
+    retry: false,
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+  })
+}
+
+/** One repository file for the Files sub-tab's viewer. `path` is `undefined` while nothing is
+ *  selected. A 409 ("path is not in the repository index: …", "symlinks are not served: …") is the
+ *  server's answer, so retries are off; cached per path, making re-selection free. Same freshness
+ *  override as `useRepoTree` — the pane must not keep showing bytes an agent has since rewritten. */
+export function useRepoFile(path: string | undefined) {
+  return useQuery({
+    queryKey: queryKeys.repoFile(path ?? ''),
+    queryFn: ({ signal }) => getRepoFile(path as string, { signal }),
+    enabled: path !== undefined && path !== '',
+    retry: false,
+    refetchOnWindowFocus: true,
+    staleTime: 0,
   })
 }
 
@@ -1142,6 +1466,27 @@ export function useAgentProfiles() {
   })
 }
 
+/** The chip's refresh cadence — matches the server's `STAR_CACHE_TTL_MS`, which also paces
+ *  itself to GitHub's rate limit, so a poll never costs more than one cached read. */
+export const STAR_COUNT_REFRESH_MS = 10_000
+
+/**
+ * cezar's own star count, for the sidebar's ⭐ ask — refreshed every ten seconds while the tab is
+ * visible (TanStack pauses `refetchInterval` in the background). No retry: the server answers
+ * `{ available: false }` for every failure, and the next tick is the retry.
+ */
+export function useStarCount(enabled = true) {
+  return useQuery({
+    queryKey: workspaceQueryKeys.starCount,
+    queryFn: ({ signal }) => getStarCount({ signal }),
+    enabled,
+    staleTime: STAR_COUNT_REFRESH_MS,
+    refetchInterval: STAR_COUNT_REFRESH_MS,
+    retry: false,
+    refetchOnMount: false,
+  })
+}
+
 export function useSkillsUpdate(projectId: string, enabled = true) {
   return useQuery({
     queryKey: workspaceQueryKeys.skillsUpdate(projectId),
@@ -1176,14 +1521,83 @@ export function useApplySkillsUpdate(projectId: string) {
   return useMutation({ mutationFn: () => applySkillsUpdate(projectId), onSuccess: (state) => queryClient.setQueryData(key, state) })
 }
 
+/** cezar's own update state (self-update PoC). Polls fast while an install job runs so the
+ *  dialog's log follows npm, and sits idle otherwise — the health chip carries the "update
+ *  available" signal on its own. `enabled` gates the fetch to the open dialog. */
+export function useSelfUpdate(enabled = true) {
+  return useQuery({
+    queryKey: workspaceQueryKeys.selfUpdate,
+    queryFn: ({ signal }) => getSelfUpdate({ signal }),
+    enabled,
+    refetchInterval: (query) => (query.state.data?.job?.status === 'running' ? 1_000 : false),
+  })
+}
+
+/** The development channel's worktrees and PR builds — fetched only while that channel's
+ *  panel is on screen (a git call per worktree plus a GitHub round trip). */
+export function useSelfUpdateDevelopment(enabled = true) {
+  return useQuery({
+    queryKey: workspaceQueryKeys.selfUpdateDevelopment,
+    queryFn: ({ signal }) => getSelfUpdateDevelopment({ signal }),
+    enabled,
+    staleTime: 30_000,
+  })
+}
+
+export function useRefreshSelfUpdateDevelopment() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => getSelfUpdateDevelopment({ refresh: true }),
+    onSuccess: (state) => queryClient.setQueryData(workspaceQueryKeys.selfUpdateDevelopment, state),
+  })
+}
+
+export function useRefreshSelfUpdate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => refreshSelfUpdate(),
+    onSuccess: (state) => queryClient.setQueryData(workspaceQueryKeys.selfUpdate, state),
+  })
+}
+
+export function useSetSelfUpdateChannel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (channel: UpdateChannel) => setSelfUpdateChannel(channel),
+    onSuccess: (state) => queryClient.setQueryData(workspaceQueryKeys.selfUpdate, state),
+  })
+}
+
+export function useApplySelfUpdate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (version: string) => applySelfUpdate(version),
+    onSuccess: (state) => queryClient.setQueryData(workspaceQueryKeys.selfUpdate, state),
+  })
+}
+
 /** Rename a run (#389): `PATCH /api/runs/:id`. Invalidates `runs.*` so the list and the detail
  *  view refetch the authoritative record. The run header's inline title edit sits on this. */
 export function usePatchRun(id: string) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (patch: PatchRunInput) => patchRun(id, patch),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.runs.all }),
+    onSuccess: (updated) => {
+      writePatchedRunToCaches(queryClient, updated)
+      void queryClient.invalidateQueries({ queryKey: queryKeys.runs.all })
+    },
   })
+}
+
+/** Put a successful rename receipt into every project-scoped cache before refetching. */
+export function writePatchedRunToCaches(queryClient: QueryClient, updated: RunRecord): void {
+  queryClient.setQueryData<ApiRun[]>(queryKeys.runs.list(), (list) =>
+    list?.map((current) => (current.id === updated.id ? mergeRun(current, updated) : current)),
+  )
+  queryClient.setQueryData<ApiRun>(queryKeys.runs.detail(updated.id), (current) =>
+    current ? mergeRun(current, updated) : updated,
+  )
+  invalidateRunsIndex(queryClient)
 }
 
 /**
@@ -1324,6 +1738,37 @@ function withoutReceipt(run: RunRecord): RunRecord {
   return rest
 }
 
+/**
+ * Pin one task to the top of its project's list, or unpin it (#935) — `POST /api/runs/:id/pin`.
+ *
+ * Invalidate rather than patch, like the header's archive and unlike the read receipt: the answer
+ * moves the row between buckets, so the list has to be re-bucketed from the authoritative record
+ * anyway, and a pin is not fired at the busy moment a run finishes (the race that makes the
+ * receipt hooks patch a single field instead).
+ *
+ * Both parameters exist for the multi-project sidebar, which paints a quick-list per REGISTERED
+ * project and therefore acts on rows outside the scope the URL names:
+ *  - `projectId` sends the request to the run's OWN project (`queryScope()` would name whichever
+ *    project the page is standing in, which 404s — or, with a colliding run id, pins the wrong
+ *    task). Absent is the ordinary case: the caller is already inside the run's project.
+ *  - `cacheScope` is the key that project's run list is cached under. It is NOT always the
+ *    project id: `useProjectRuns` caches the boot project under `'default'`, because that is the
+ *    scope it mounts unscoped under, and invalidating `[<bootId>, 'runs']` would leave the
+ *    sidebar's boot group showing the pre-pin order.
+ */
+export function usePinRun(projectId?: string, cacheScope?: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) =>
+      projectId === undefined ? pinRun(id, pinned) : pinProjectRun(projectId, id, pinned),
+    // Hierarchical keys: this covers the list AND the open thread's own record.
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: cacheScope === undefined ? queryKeys.runs.all : ([cacheScope, 'runs'] as const),
+      }),
+  })
+}
+
 /** Deliver a reply into a live session (`POST /api/runs/:id/messages`). The transcript itself
  *  grows over SSE (`user-message`, then the agent's turn); the invalidation refreshes the
  *  record (status flips waiting → running). Errors are the CALLER's to surface — the composer
@@ -1398,6 +1843,25 @@ export function useGithub(params: { limit?: number } = {}, enabled = true) {
   })
 }
 
+/** Cursor-paged GitHub list. Both cursors advance together because the server asks GitHub for
+ * one issue page and one PR page per round trip. React Query retains earlier pages when a later
+ * page is appended, so loading more never refetches rows already on screen. */
+export function useGithubInfinite(limit = 50, enabled = true) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.githubPages(limit),
+    queryFn: ({ pageParam, signal }) =>
+      getGithub({ limit, issuesCursor: pageParam.issuesCursor, prsCursor: pageParam.prsCursor }, { signal }),
+    initialPageParam: { issuesCursor: undefined as string | undefined, prsCursor: undefined as string | undefined },
+    getNextPageParam: (last) => {
+      const issuesCursor = last.issuesNextCursor ?? undefined
+      const prsCursor = last.prsNextCursor ?? undefined
+      return issuesCursor || prsCursor ? { issuesCursor, prsCursor } : undefined
+    },
+    enabled,
+    staleTime: 60_000,
+  })
+}
+
 /** Lazy PR checks glyphs (`/api/github/checks`, #664). The list call no longer ships
  *  `statusCheckRollup`, so the PR row's checks glyph is hydrated here for the on-screen rows only.
  *  `enabled` gates it to the PR view with a non-empty window; `staleTime` matches the 60 s server
@@ -1408,6 +1872,21 @@ export function useGithubChecks(prNumbers: number[], enabled = true) {
     queryKey: queryKeys.githubChecks(prNumbers),
     queryFn: ({ signal }) => getGithubChecks(prNumbers, { signal }),
     enabled: enabled && prNumbers.length > 0,
+    staleTime: 60_000,
+  })
+}
+
+/** Cross-state search (`/api/github/search`, #730). The list only ever holds OPEN items, so this
+ *  is the only way the tab can surface a closed or merged issue/PR. `enabled` is what keeps it
+ *  cheap: the caller turns it on only for a non-empty query that the in-memory filter could not
+ *  satisfy, and only after debouncing — every call is a `gh` subprocess. `staleTime` matches the
+ *  tab's other GitHub queries so re-typing the same query does not re-shell. Degrade is silent:
+ *  an unavailable payload renders as "could not search", never an error boundary. */
+export function useGithubSearch(kind: 'issue' | 'pr', query: string, enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.githubSearch(kind, query),
+    queryFn: ({ signal }) => getGithubSearch(kind, query, {}, { signal }),
+    enabled: enabled && query.trim() !== '',
     staleTime: 60_000,
   })
 }

@@ -20,6 +20,8 @@ import type {
   ForgePrStatus,
   ForgePrDiffResult,
   ForgeRefKind,
+  ForgeRecentCreatedData,
+  ForgeSearchData,
   ForgeTimelineEvent,
   ForgeTimelineEventKind,
 } from './types.ts';
@@ -182,6 +184,10 @@ export interface GithubData {
   /** Repo-wide map of label name → 6-hex color (no `#`), so the UI can tint chips like GitHub
    *  does. Additive (BACKWARD_COMPATIBILITY): absent on old payloads, chips fall back to neutral. */
   labelColors?: Record<string, string>;
+  issuesTotal?: number;
+  prsTotal?: number;
+  issuesNextCursor?: string | null;
+  prsNextCursor?: string | null;
 }
 
 // `gh … --json` output — validated at the boundary, extras stripped.
@@ -214,6 +220,39 @@ const ghPrSchema = ghIssueSchema.extend({
   additions: z.number().default(0),
   deletions: z.number().default(0),
 });
+
+const ghListNodeSchema = z.object({
+  number: z.number(),
+  title: z.string(),
+  author: ghAuthor,
+  createdAt: z.string(),
+  // GraphQL `labels` is a connection (`{ nodes }`), not the flat array `gh … --json` returns.
+  labels: z.preprocess(
+    (v) => (v && typeof v === 'object' && 'nodes' in v ? (v as { nodes: unknown }).nodes : v),
+    z.array(ghLabel).default([]),
+  ),
+  url: z.string(),
+  comments: z.object({ totalCount: z.number().int().nonnegative() }).optional(),
+  isDraft: z.boolean().default(false),
+  additions: z.number().optional(),
+  deletions: z.number().optional(),
+});
+
+const ghListPageSchema = z.object({
+  totalCount: z.number().int().nonnegative(),
+  nodes: z.array(ghListNodeSchema),
+  pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullish() }),
+});
+
+const ghListResponseSchema = z.object({
+  issues: ghListPageSchema,
+  pullRequests: ghListPageSchema,
+});
+
+export function parseGithubListPage(out: string): z.infer<typeof ghListResponseSchema> {
+  const parsed = JSON.parse(out) as { data?: { repository?: unknown } };
+  return ghListResponseSchema.parse(parsed?.data && (parsed.data as { repository?: unknown }).repository);
+}
 const ghPrViewSchema = z.object({
   number: z.number(),
   url: z.string(),
@@ -241,6 +280,11 @@ const mergePrSchema = z.object({
   mergeable: z.string().nullish(),
   mergeStateStatus: z.string().nullish(),
   reviewDecision: z.string().nullish(),
+  statusCheckRollup: z.array(mergeCheckSchema).nullish(),
+});
+/** The check detail, fetched on its OWN `gh pr view` call (#969) so that a token which cannot read
+ *  `statusCheckRollup`'s contexts loses only the detail, never the merge state around it. */
+const mergeChecksSchema = z.object({
   statusCheckRollup: z.array(mergeCheckSchema).nullish(),
 });
 const repoMergePolicySchema = z.object({
@@ -377,51 +421,108 @@ const listCache = new Map<string, { at: number; limit: number; data: GithubData 
 const LIST_CACHE_MAX = 50;
 const CACHE_MS = 60_000;
 export const GH_MAX_LIMIT = 1000;
+/** GitHub GraphQL rejects `first` above 100 (EXCESSIVE_PAGINATION); larger limits page. */
+const GH_GRAPHQL_PAGE_MAX = 100;
 
-export async function fetchGithub(repoRoot: string, refresh = false, limit = 30): Promise<GithubData> {
-  if (process.env.CEZ_DRY_RUN === '1') return mockGithub();
+const githubListQuery = `
+query ($owner: String!, $name: String!, $issuesLimit: Int!, $prsLimit: Int!, $issuesCursor: String, $prsCursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(first: $issuesLimit, after: $issuesCursor, states: OPEN, orderBy: {field: CREATED_AT, direction: DESC}) {
+      totalCount
+      nodes { number title author { login } createdAt labels(first: 20) { nodes { name color } } url comments { totalCount } }
+      pageInfo { hasNextPage endCursor }
+    }
+    pullRequests(first: $prsLimit, after: $prsCursor, states: OPEN, orderBy: {field: CREATED_AT, direction: DESC}) {
+      totalCount
+      nodes { number title author { login } createdAt labels(first: 20) { nodes { name color } } url comments { totalCount } isDraft additions deletions }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}`;
+
+type GithubListPage = ReturnType<typeof parseGithubListPage>;
+
+/** Walks both open connections up to `limit` rows each, at most `GH_GRAPHQL_PAGE_MAX` per request,
+ *  keeping each side's cursor exact so the returned next cursors resume where the rows stop. */
+export async function fetchGithubListPages(
+  runGraphql: GraphqlRunner,
+  owner: string,
+  name: string,
+  limit: number,
+  cursors: { issuesCursor?: string; prsCursor?: string } = {},
+): Promise<GithubListPage> {
+  let issuesCursor = cursors.issuesCursor;
+  let prsCursor = cursors.prsCursor;
+  let issuesDone = false;
+  let prsDone = false;
+  let result: GithubListPage | null = null;
+  while (!result || !issuesDone || !prsDone) {
+    const issuesSize = issuesDone ? 0 : Math.min(GH_GRAPHQL_PAGE_MAX, limit - (result?.issues.nodes.length ?? 0));
+    const prsSize = prsDone ? 0 : Math.min(GH_GRAPHQL_PAGE_MAX, limit - (result?.pullRequests.nodes.length ?? 0));
+    const variables: Record<string, string> = {
+      owner,
+      name,
+      issuesLimit: String(issuesSize),
+      prsLimit: String(prsSize),
+    };
+    if (issuesCursor) variables.issuesCursor = issuesCursor;
+    if (prsCursor) variables.prsCursor = prsCursor;
+    const page = parseGithubListPage(await runGraphql(githubListQuery, variables));
+    const acc: GithubListPage = result ?? page;
+    if (issuesSize > 0) {
+      if (acc !== page) {
+        acc.issues.nodes.push(...page.issues.nodes);
+        acc.issues.pageInfo = page.issues.pageInfo;
+      }
+      issuesCursor = page.issues.pageInfo.endCursor ?? issuesCursor;
+      issuesDone = !page.issues.pageInfo.hasNextPage || page.issues.nodes.length === 0 || acc.issues.nodes.length >= limit;
+    }
+    if (prsSize > 0) {
+      if (acc !== page) {
+        acc.pullRequests.nodes.push(...page.pullRequests.nodes);
+        acc.pullRequests.pageInfo = page.pullRequests.pageInfo;
+      }
+      prsCursor = page.pullRequests.pageInfo.endCursor ?? prsCursor;
+      prsDone = !page.pullRequests.pageInfo.hasNextPage || page.pullRequests.nodes.length === 0 || acc.pullRequests.nodes.length >= limit;
+    }
+    result = acc;
+  }
+  return result;
+}
+
+export async function fetchGithub(
+  repoRoot: string,
+  refresh = false,
+  limit = 30,
+  cursors: { issuesCursor?: string; prsCursor?: string } = {},
+): Promise<GithubData> {
+  if (process.env.CEZ_DRY_RUN === '1') return mockGithubPage(limit, cursors);
   const capped = Math.min(Math.max(limit, 1), GH_MAX_LIMIT);
-  const hit = listCache.get(repoRoot);
+  const cacheKey = `${repoRoot}\0${cursors.issuesCursor ?? ''}\0${cursors.prsCursor ?? ''}`;
+  const hit = listCache.get(cacheKey);
   if (!refresh && hit && Date.now() - hit.at < CACHE_MS && hit.limit >= capped) {
     return hit.data;
   }
   try {
-    // No `comments` field — `gh … --json comments` ships full comment bodies.
-    // No `statusCheckRollup` either (#664): the CI rollup for every open PR was the
-    // dominant cost — it forced the 60 s budget below — and is now hydrated lazily per
-    // on-screen PR row via `fetchGithubChecks`. A big list still gets a little more wall
-    // clock than the default 30, but nothing like the old rollup walk.
     const timeout = capped > 100 ? 30_000 : 15_000;
-    const fields = 'number,title,author,createdAt,labels,body,url';
-    // The repo handle first (cheap) so the counts GraphQL query — which needs owner/name —
-    // can run parallel to the two expensive list calls below.
-    const repoOut = await gh(repoRoot, ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], timeout);
-    const ownerName = parseOwnerName(repoOut);
+    const ownerName = await resolveRepoHandle(repoRoot);
+    if (!ownerName) return { available: false, reason: 'repository handle unavailable', issues: [], prs: [] };
+    // `-f` sends every value as a String; the page sizes must go typed (`-F`) or GitHub rejects
+    // the whole query with "Could not coerce value to Int".
     const runGraphql: GraphqlRunner = (query, variables) => {
       const args = ['api', 'graphql', '-f', `query=${query}`];
-      for (const [key, value] of Object.entries(variables)) args.push('-f', `${key}=${value}`);
+      for (const [key, value] of Object.entries(variables)) {
+        args.push(key.endsWith('Limit') ? '-F' : '-f', `${key}=${value}`);
+      }
       return gh(repoRoot, args, timeout);
     };
-    // Bound the counts pagination to the rows actually being fetched: a page is 100, so
-    // `ceil(capped / 100)` pages (still capped at GH_COUNTS_MAX_PAGES) cover exactly the visible
-    // window and no more — the default 30-item load pays ONE counts round-trip, not ten. Rows
-    // beyond the window keep `comments: 0`, which the UI reads as "no badge" (same as before).
-    const countsMaxPages = Math.min(GH_COUNTS_MAX_PAGES, Math.max(1, Math.ceil(capped / 100)));
-    const [issuesOut, prsOut, counts] = await Promise.all([
-      gh(repoRoot, ['issue', 'list', '--limit', String(capped), '--json', fields], timeout),
-      gh(repoRoot, ['pr', 'list', '--limit', String(capped), '--json', `${fields},isDraft,additions,deletions`], timeout),
-      // Real comment counts (#499). Degrades to empty maps on its own — a failure here leaves
-      // every count at 0, never fails the tab. Skipped entirely if the handle isn't parseable.
-      ownerName
-        ? fetchCommentCounts(runGraphql, ownerName.owner, ownerName.name, countsMaxPages)
-        : Promise.resolve<{ issues: Record<number, number>; prs: Record<number, number> }>({ issues: {}, prs: {} }),
-    ]);
+    const page = await fetchGithubListPages(runGraphql, ownerName.owner, ownerName.name, capped, cursors);
     // One repo-wide label→color map, filled as we flatten each item's labels.
     const labelColors: Record<string, string> = {};
     const recordColor = (l: { name: string; color: string }) => {
       if (l.color && !labelColors[l.name]) labelColors[l.name] = l.color;
     };
-    const issues = z.array(ghIssueSchema).parse(JSON.parse(issuesOut)).map(
+    const issues = page.issues.nodes.map(
       (i): GithubItem => {
         i.labels.forEach(recordColor);
         return {
@@ -431,13 +532,12 @@ export async function fetchGithub(repoRoot: string, refresh = false, limit = 30)
           author: i.author?.login ?? '?',
           createdAt: i.createdAt,
           labels: i.labels.map((l) => l.name),
-          body: (i.body ?? '').slice(0, 8_000),
           url: i.url,
-          comments: counts.issues[i.number] ?? 0,
+          comments: i.comments?.totalCount ?? 0,
         };
       },
     );
-    const prs = z.array(ghPrSchema).parse(JSON.parse(prsOut)).map(
+    const prs = page.pullRequests.nodes.map(
       (p): GithubItem => {
         p.labels.forEach(recordColor);
         return {
@@ -447,9 +547,8 @@ export async function fetchGithub(repoRoot: string, refresh = false, limit = 30)
           author: p.author?.login ?? '?',
           createdAt: p.createdAt,
           labels: [...p.labels.map((l) => l.name), ...(p.isDraft ? ['draft'] : [])],
-          body: (p.body ?? '').slice(0, 8_000),
           url: p.url,
-          comments: counts.prs[p.number] ?? 0,
+          comments: p.comments?.totalCount ?? 0,
           isDraft: p.isDraft,
           additions: p.additions,
           deletions: p.deletions,
@@ -461,14 +560,18 @@ export async function fetchGithub(repoRoot: string, refresh = false, limit = 30)
     );
     const data: GithubData = {
       available: true,
-      repo: repoOut.trim() || undefined,
+      repo: `${ownerName.owner}/${ownerName.name}`,
       syncedAt: new Date().toISOString(),
       issues,
       prs,
       labelColors,
+      issuesTotal: page.issues.totalCount,
+      prsTotal: page.pullRequests.totalCount,
+      issuesNextCursor: page.issues.pageInfo.hasNextPage ? page.issues.pageInfo.endCursor ?? null : null,
+      prsNextCursor: page.pullRequests.pageInfo.hasNextPage ? page.pullRequests.pageInfo.endCursor ?? null : null,
     };
-    listCache.delete(repoRoot); // re-insert so this key becomes the newest
-    listCache.set(repoRoot, { at: Date.now(), limit: capped, data });
+    listCache.delete(cacheKey); // re-insert so this key becomes the newest
+    listCache.set(cacheKey, { at: Date.now(), limit: capped, data });
     while (listCache.size > LIST_CACHE_MAX) {
       const oldest = listCache.keys().next().value;
       if (oldest === undefined) break;
@@ -479,7 +582,7 @@ export async function fetchGithub(repoRoot: string, refresh = false, limit = 30)
     const message = err instanceof Error ? err.message : String(err);
     const reason = /ENOENT/.test(message)
       ? 'gh CLI not found — install it and run `gh auth login`'
-      : firstLine(message);
+      : whyLine(ghStderr(err) ?? message);
     return { available: false, reason, issues: [], prs: [] };
   }
 }
@@ -488,11 +591,232 @@ function firstLine(s: string): string {
   return s.split('\n').find((l) => l.trim().length > 0)?.trim() ?? 'gh failed';
 }
 
+/**
+ * The line of a `gh` failure that says WHY, not just that it failed (#969).
+ *
+ * Node prefixes a failed subprocess with `Command failed: <the whole argv>` and puts the forge's
+ * own message on the lines after it. `firstLine` therefore reports the command back at the reader —
+ * which is how "your token cannot read check runs" came out looking like a GitHub outage. This
+ * skips that preamble whenever there is something behind it, and falls back to it when there isn't.
+ */
+/** gh's own stderr, when present: a multi-line `query=` argv makes the Node message unreadable. */
+function ghStderr(err: unknown): string | undefined {
+  const stderr = (err as { stderr?: unknown } | null)?.stderr;
+  return typeof stderr === 'string' && stderr.trim() ? stderr : undefined;
+}
+
+export function whyLine(s: string): string {
+  const lines = s.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  return lines.find((l) => !/^Command failed:/i.test(l)) ?? lines[0] ?? 'gh failed';
+}
+
+// ---- search across states (#730) -------------------------------------------
+// `fetchGithub` above lists the OPEN set only (`gh issue/pr list` defaults to `--state open`),
+// and the tab's search is an in-memory filter over exactly that payload — so a closed or merged
+// item is not "past the window", it was never fetched at all and no amount of scrolling reaches
+// it. This tier asks GitHub instead of re-filtering what we already hold. It is deliberately a
+// SECOND, on-demand path rather than widening the list to `--state all`: the list is the tab's
+// hot path, and making every load pay for hundreds of closed rows to serve an occasional lookup
+// would trade a search bug for a performance one.
+
+/** Hits per search. `gh search`'s own default is 30; 50 matches the page size the incremental-
+ *  loading spec settled on and keeps one search to a single `gh` round-trip. */
+export const GH_SEARCH_MAX = 50;
+
+/** The `--json` field set each search path requests. Neither path asks for `additions`/`deletions`
+ *  or `statusCheckRollup` — the same reason the list tier stopped (#664), those are the expensive
+ *  per-PR lookups.
+ *
+ *  `isDraft` is added for PRs only, and that is a hard requirement rather than a nicety: `gh search
+ *  issues` does not define the field at all and rejects the whole call with `Unknown JSON field:
+ *  "isDraft"`, which would turn every text query on the Issues tab into the "could not be searched"
+ *  degrade. `gh {issue,pr} view` is the opposite — it tolerates the field for both kinds — so only
+ *  the search path needs to discriminate. */
+const SEARCH_FIELDS = 'number,title,author,createdAt,labels,body,url';
+
+/** `gh search {prs,issues} --json` field list for `kind`. See `SEARCH_FIELDS` on why `isDraft`
+ *  cannot be sent to the issues search. */
+function searchJsonFields(kind: 'issue' | 'pr'): string {
+  return kind === 'pr'
+    ? `${SEARCH_FIELDS},isDraft,commentsCount`
+    : `${SEARCH_FIELDS},commentsCount`;
+}
+
+/** `gh search issues|prs` returns `commentsCount` where the list tier gets its counts from a
+ *  separate GraphQL walk. Same value, different spelling — normalized into `ForgeItem.comments`. */
+const ghSearchHitSchema = ghIssueSchema.extend({
+  isDraft: z.boolean().default(false),
+  commentsCount: z.number().default(0),
+});
+
+/** `gh {issue,pr} view <n> --json …` — the exact-number path. Shares `ghIssueSchema`'s core;
+ *  `isDraft`/`additions`/`deletions` are PR-only and default harmlessly for issues. */
+const ghViewHitSchema = ghIssueSchema.extend({
+  isDraft: z.boolean().default(false),
+  additions: z.number().default(0),
+  deletions: z.number().default(0),
+});
+
+function urlKind(url: string): 'issue' | 'pr' | null {
+  if (/\/issues\/\d+(?:[/?#]|$)/.test(url)) return 'issue';
+  if (/\/pull\/\d+(?:[/?#]|$)/.test(url)) return 'pr';
+  return null;
+}
+
+/** Flatten one validated hit into the `ForgeItem` the tab's rows already render. `checks: null`
+ *  is what the list tier ships too since #664 — the glyph hydrates lazily via `/api/github/checks`
+ *  — so a searched row and a listed row are indistinguishable to the UI. */
+function toSearchItem(
+  kind: 'issue' | 'pr',
+  hit: z.infer<typeof ghSearchHitSchema> | z.infer<typeof ghViewHitSchema>,
+  labelColors: Record<string, string>,
+): ForgeItem {
+  for (const label of hit.labels) {
+    if (label.color && !labelColors[label.name]) labelColors[label.name] = label.color;
+  }
+  const item: ForgeItem = {
+    kind,
+    number: hit.number,
+    title: hit.title,
+    author: hit.author?.login ?? '?',
+    createdAt: hit.createdAt,
+    labels: hit.labels.map((l) => l.name),
+    body: (hit.body ?? '').slice(0, 8_000),
+    url: hit.url,
+    comments: 'commentsCount' in hit ? hit.commentsCount : 0,
+  };
+  if (kind === 'pr') {
+    item.isDraft = hit.isDraft;
+    // Draft is a label on list rows as well as a flag — keep the parity so filtering by the
+    // `draft` chip behaves the same on a searched row.
+    if (hit.isDraft) item.labels = [...item.labels, 'draft'];
+    if ('additions' in hit) item.additions = hit.additions;
+    if ('deletions' in hit) item.deletions = hit.deletions;
+    item.checks = null;
+  }
+  return item;
+}
+
+/**
+ * Find issues/PRs in ANY state (#730).
+ *
+ * Two query shapes, because they want different GitHub calls:
+ *  - **A bare number** (`4507`, `#4507`) is a lookup, not a search: `gh {pr,issue} view <n>` is
+ *    one cheap, state-agnostic call that finds a PR merged two years ago as readily as one opened
+ *    today. GitHub's search index cannot be relied on to surface an exact number at all.
+ *  - **Anything else** is a text search: `gh search {prs,issues} <query> --repo owner/name`, with
+ *    `--state` deliberately OMITTED — the flag only accepts `open|closed`, and leaving it off is
+ *    what searches every state.
+ *
+ * A numeric query that resolves to nothing (wrong repo, deleted, or simply a number the user meant
+ * as text) falls through to the text path rather than reporting "not found" — `4507` should still
+ * find a PR whose title contains it.
+ *
+ * Never throws: every failure lands on `{available: false, reason}`, the same quiet degrade the
+ * rest of the tab uses. Exported for unit tests.
+ */
+export async function searchGithubItems(
+  repoRoot: string,
+  kind: 'issue' | 'pr',
+  query: string,
+  limit = GH_SEARCH_MAX,
+): Promise<ForgeSearchData> {
+  const trimmed = query.trim();
+  if (trimmed === '') return { available: true, items: [] };
+  const capped = Math.min(Math.max(limit, 1), GH_SEARCH_MAX);
+  if (process.env.CEZ_DRY_RUN === '1') {
+    const mock = mockGithub();
+    const pool = kind === 'issue' ? mock.issues : mock.prs;
+    const needle = trimmed.replace(/^#/, '').toLowerCase();
+    // The fixture obeys `limit` and flags `truncated` on the live path's own rule (#838). The
+    // catalog is a handful of rows, so the cap never bites in the demo itself — but offline mode
+    // is the only place anyone developing without `gh` exercises cap-and-truncate at all, and a
+    // dry-run that returned the whole pool unflagged would hide a regression in it.
+    const items = pool
+      .filter((i) => String(i.number).includes(needle) || i.title.toLowerCase().includes(needle))
+      .slice(0, capped);
+    return { available: true, items, truncated: items.length >= capped };
+  }
+  const labelColors: Record<string, string> = {};
+  const numeric = trimmed.replace(/^#/, '');
+  try {
+    if (/^\d+$/.test(numeric)) {
+      // `Number()` before interpolation: the regex already guarantees digits, but the number is
+      // user input reaching an argv, so it is normalized rather than passed through verbatim.
+      const number = Number(numeric);
+      try {
+        const out = await gh(repoRoot, [
+          kind === 'pr' ? 'pr' : 'issue',
+          'view',
+          String(number),
+          '--json',
+          kind === 'pr' ? `${SEARCH_FIELDS},isDraft,additions,deletions` : SEARCH_FIELDS,
+        ]);
+        const hit = ghViewHitSchema.parse(JSON.parse(out));
+        // GitHub's `issue view` endpoint accepts a PR number because PRs are issues too. The
+        // requested tab kind is still part of the search contract, so verify the canonical URL
+        // before flattening; a wrong-kind hit falls through to the normal text search.
+        const actualKind = urlKind(hit.url);
+        if (actualKind !== kind) {
+          throw new Error(`GitHub returned a ${actualKind ?? 'unknown'} for an ${kind} lookup`);
+        }
+        return { available: true, items: [toSearchItem(kind, hit, labelColors)], labelColors };
+      } catch {
+        // Not a number in this repo (or not this kind) — fall through to the text search below.
+      }
+    }
+    // The memoized handle first (usually a hit). Its `null` is deliberately ambiguous — it swallows
+    // "gh is missing" and "no remote" alike — so on a miss, ask once more directly and let the real
+    // failure reach the catch below, where it becomes the same honest hint the list tier gives.
+    // Only a genuinely unparseable slug reaches the "no remote" reason.
+    const handle =
+      (await resolveRepoHandle(repoRoot)) ??
+      parseOwnerName(
+        await gh(repoRoot, ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']),
+      );
+    if (!handle) {
+      return { available: false, reason: 'no GitHub remote to search', items: [] };
+    }
+    const out = await gh(repoRoot, [
+      'search',
+      kind === 'pr' ? 'prs' : 'issues',
+      '--repo',
+      `${handle.owner}/${handle.name}`,
+      '--limit',
+      String(capped),
+      '--json',
+      searchJsonFields(kind),
+      // End-of-flags, then the query: `gh` parses a leading `-`/`--` as a flag otherwise, so a
+      // flag-shaped query would degrade the tab to "GitHub could not be searched: unknown flag",
+      // and the exact text `--web` would match `gh search`'s own `-w, --web` and open a browser
+      // on the cockpit's host. Behind `--` it is search text, which is all the box ever means.
+      '--',
+      trimmed,
+    ]);
+    const hits = z.array(ghSearchHitSchema).parse(JSON.parse(out));
+    return {
+      available: true,
+      items: hits.map((hit) => toSearchItem(kind, hit, labelColors)),
+      truncated: hits.length >= capped,
+      labelColors,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const reason = /ENOENT/.test(message)
+      ? 'gh CLI not found — install it and run `gh auth login`'
+      : firstLine(message);
+    return { available: false, reason, items: [] };
+  }
+}
+
 /** CEZ_DRY_RUN=1 — a small fixed catalog so the GitHub tab is demoable offline. */
 function mockGithub(): GithubData {
   const mk = (over: Partial<GithubItem> & Pick<GithubItem, 'kind' | 'number' | 'title' | 'body'>): GithubItem => ({
     author: 'mock',
-    createdAt: new Date(Date.now() - over.number * 3_600_000).toISOString(),
+    // A HIGHER number is MORE RECENT, because GitHub hands numbers out in creation order. The
+    // subtraction used to run the other way, which made the demo's hand-written descending list
+    // ascending by age — invisible until the tab grew a newest/oldest sort that reads this field.
+    createdAt: new Date(Date.now() - (200 - over.number) * 3_600_000).toISOString(),
     labels: [],
     url: `https://github.com/mock/repo/${over.kind === 'pr' ? 'pull' : 'issues'}/${over.number}`,
     comments: 0,
@@ -524,6 +848,23 @@ function mockGithub(): GithubData {
   };
 }
 
+function mockGithubPage(limit: number, cursors: { issuesCursor?: string; prsCursor?: string }): GithubData {
+  const full = mockGithub();
+  const issueStart = Number(cursors.issuesCursor ?? 0);
+  const prStart = Number(cursors.prsCursor ?? 0);
+  const issues = full.issues.slice(issueStart, issueStart + limit);
+  const prs = full.prs.slice(prStart, prStart + limit);
+  return {
+    ...full,
+    issues,
+    prs,
+    issuesTotal: full.issues.length,
+    prsTotal: full.prs.length,
+    issuesNextCursor: issueStart + issues.length < full.issues.length ? String(issueStart + issues.length) : null,
+    prsNextCursor: prStart + prs.length < full.prs.length ? String(prStart + prs.length) : null,
+  };
+}
+
 // ---- comment threads (#499 Phase 2) ----------------------------------------
 // A lazy per-thread fetch behind `GET /api/github/comments/:kind/:number`: the
 // conversation comments (issues endpoint — GitHub serves PR conversation
@@ -539,6 +880,11 @@ const ghIssueCommentSchema = z.object({
   created_at: z.string(),
   body: z.string().nullish(),
   html_url: z.string(),
+});
+const ghDetailSchema = z.object({
+  body: z.string().nullish(),
+  additions: z.number().int().nonnegative().nullish(),
+  deletions: z.number().int().nonnegative().nullish(),
 });
 const ghReviewSchema = z.object({
   id: z.number(),
@@ -2009,6 +2355,7 @@ export async function fetchGithubComments(
   const legacyComments = () =>
     gh(repoRoot, ['api', `repos/{owner}/{repo}/issues/${number}/comments`, '--paginate']);
   try {
+    let detail: { body: string; additions?: number; deletions?: number } | undefined;
     let commentRows: unknown[] = [];
     let events: ForgeTimelineEvent[] | undefined;
     let eventsTruncated = false;
@@ -2074,6 +2421,23 @@ export async function fetchGithubComments(
       events = undefined;
     }
 
+    // Body is a separate, best-effort detail tier. Fetch it only after the thread succeeds so a
+    // missing CLI does not create a second failing subprocess on the ordinary degrade path.
+    try {
+      const fields = kind === 'pr' ? 'body,additions,deletions' : 'body';
+      const detailOut = await gh(repoRoot, [kind === 'pr' ? 'pr' : 'issue', 'view', String(number), '--json', fields]);
+      const parsed = ghDetailSchema.parse(JSON.parse(detailOut));
+      if (parsed.body !== null && parsed.body !== undefined) {
+        detail = {
+          body: parsed.body,
+          ...(parsed.additions !== null && parsed.additions !== undefined ? { additions: parsed.additions } : {}),
+          ...(parsed.deletions !== null && parsed.deletions !== undefined ? { deletions: parsed.deletions } : {}),
+        };
+      }
+    } catch {
+      // The detail tier is best-effort: a missing body must not hide an otherwise readable thread.
+    }
+
     // Per-commit CI (#525 Phase 2). One extra subprocess per opened thread that contains commits,
     // behind the same 60 s LRU — a per-thread-open cost, not per-render. Every failure path here
     // leaves `checks` ABSENT rather than null, so commits simply render unglyphed: the fetch
@@ -2108,6 +2472,7 @@ export async function fetchGithubComments(
       // rather than replaced.
       truncated: truncated || eventsTruncated || stoppedShort || undefined,
     };
+    if (detail) data.detail = { ...detail, body: detail.body.slice(0, COMMENT_BODY_CAP) };
     if (events) data.events = events;
     cacheComments(key, data);
     return data;
@@ -2233,7 +2598,12 @@ function mockGithubComments(kind: 'issue' | 'pr'): ForgeCommentsData {
     });
   }
 
-  return { available: true, comments, events };
+  return {
+    available: true,
+    comments,
+    events,
+    detail: { body: kind === 'pr' ? 'Mock pull request body.' : 'Mock issue body.' },
+  };
 }
 
 // ---- draft-PR creation (review gate, spec 009) ------------------------------
@@ -2294,7 +2664,7 @@ export async function createDraftPr(input: DraftPrInput): Promise<DraftPrOutcome
   const prBase = run.baseBranch?.replace(/^origin\//, '');
   const baseArgs = prBase && !/^[0-9a-f]{7,40}$/i.test(prBase) ? ['--base', prBase] : [];
   const pr = await execTool(
-    ['pr', 'create', '--draft', '--head', branch, ...baseArgs, '--title', run.title, '--body', body],
+    ['pr', 'create', ...(input.draft === false ? [] : ['--draft']), '--head', branch, ...baseArgs, '--title', run.title, '--body', body],
     worktree,
     'gh',
     PUSH_TIMEOUT_MS,
@@ -2355,12 +2725,77 @@ interface ExecResult {
   notFound: boolean;
 }
 
+/**
+ * Post a comment on a PR through `gh` — the graph `github.pr-comment` node (spec
+ * 2026-09-30-workflow-node-editor). Never throws: every failure is a one-line error, and
+ * `CEZ_DRY_RUN=1` answers ok without touching the network.
+ */
+/** Mark a PR ready and/or add labels and reviewers (the graph `github.pr-update` node). Never
+ *  throws; `CEZ_DRY_RUN=1` answers ok offline. */
+export async function updatePr(
+  repoRoot: string,
+  number: number,
+  changes: { ready?: boolean; addLabels?: string[]; reviewers?: string[] },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (process.env.CEZ_DRY_RUN === '1') return { ok: true };
+  const fail = (res: ExecResult, what: string) =>
+    res.notFound ? 'gh is not installed' : (res.stderr || res.stdout).trim().split('\n')[0] || `${what} failed`;
+  if (changes.ready) {
+    const res = await execTool(['pr', 'ready', String(number)], repoRoot, 'gh', 60_000);
+    if (!res.ok) return { ok: false, error: fail(res, 'gh pr ready') };
+  }
+  const edit = [
+    ...(changes.addLabels ?? []).flatMap((l) => ['--add-label', l]),
+    ...(changes.reviewers ?? []).flatMap((r) => ['--add-reviewer', r]),
+  ];
+  if (edit.length) {
+    const res = await execTool(['pr', 'edit', String(number), ...edit], repoRoot, 'gh', 60_000);
+    if (!res.ok) return { ok: false, error: fail(res, 'gh pr edit') };
+  }
+  return { ok: true };
+}
+
+/** Comment on an issue (the graph `github.issue-comment` node). Same contract as `commentOnPr`. */
+export async function commentOnIssue(
+  repoRoot: string,
+  number: number,
+  body: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (process.env.CEZ_DRY_RUN === '1') return { ok: true };
+  const res = await execTool(['issue', 'comment', String(number), '--body', body], repoRoot, 'gh', 60_000);
+  if (res.notFound) return { ok: false, error: 'gh is not installed' };
+  if (res.ok) return { ok: true };
+  return { ok: false, error: (res.stderr || res.stdout).trim().split('\n')[0] || 'gh issue comment failed' };
+}
+
+export async function commentOnPr(
+  repoRoot: string,
+  number: number,
+  body: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (process.env.CEZ_DRY_RUN === '1') return { ok: true };
+  const res = await execTool(['pr', 'comment', String(number), '--body', body], repoRoot, 'gh', 60_000);
+  if (res.notFound) return { ok: false, error: 'gh is not installed' };
+  if (res.ok) return { ok: true };
+  return { ok: false, error: (res.stderr || res.stdout).trim().split('\n')[0] || 'gh pr comment failed' };
+}
+
 function execTool(args: string[], cwd: string, bin: string, timeoutMs = 30_000): Promise<ExecResult> {
   return new Promise((resolve) => {
     execFile(
       bin,
       args,
-      { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, encoding: 'utf8' },
+      {
+        cwd,
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+        encoding: 'utf8',
+        // Nobody can answer a prompt here: git opens /dev/tty directly, so
+        // piped stdio is not enough to stop it. Without this a `git push` that
+        // cannot authenticate hangs for the whole timeout and surfaces as a
+        // blank one-minute stall instead of git's own "could not read Username".
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      },
       (err, stdout, stderr) =>
         resolve({
           ok: !err,
@@ -2374,14 +2809,30 @@ function execTool(args: string[], cwd: string, bin: string, timeoutMs = 30_000):
 
 // ---- the driver -------------------------------------------------------------
 
-/** Cached availability probe so `GET /api/health` never pays a full listing. */
-let detectCache: { at: number; repoRoot: string; result: ForgeAvailability } | null = null;
+/** Cached availability probe so `GET /api/health` never pays a full listing. One entry per
+ *  project, `listCache`'s own pattern: a single shared slot would let one project's probe evict
+ *  another's, and a project whose GitHub is perfectly reachable would still read as unavailable
+ *  in `GET /automations` (and `/api/health`'s `forge` field) whenever a DIFFERENT project's probe
+ *  ran more recently — the toggle going dark for reasons that have nothing to do with that
+ *  project's own GitHub reachability. */
+const detectCache = new Map<string, { at: number; result: ForgeAvailability }>();
+/** Probes in flight, keyed by repo root: a cold read joins the revalidation the previous line of
+ *  the same request already started, rather than shelling out to `gh repo view` a second time. */
+const detectInflight = new Map<string, Promise<ForgeAvailability>>();
+const DETECT_CACHE_MAX = 50;
 
-async function detectGithub(repoRoot: string): Promise<ForgeAvailability> {
-  if (process.env.CEZ_DRY_RUN === '1') return { available: true };
-  if (detectCache && detectCache.repoRoot === repoRoot && Date.now() - detectCache.at < CACHE_MS) {
-    return detectCache.result;
-  }
+function detectGithub(repoRoot: string): Promise<ForgeAvailability> {
+  if (process.env.CEZ_DRY_RUN === '1') return Promise.resolve({ available: true });
+  const hit = detectCache.get(repoRoot);
+  if (hit && Date.now() - hit.at < CACHE_MS) return Promise.resolve(hit.result);
+  const inflight = detectInflight.get(repoRoot);
+  if (inflight) return inflight;
+  const probe = probeGithub(repoRoot).finally(() => detectInflight.delete(repoRoot));
+  detectInflight.set(repoRoot, probe);
+  return probe;
+}
+
+async function probeGithub(repoRoot: string): Promise<ForgeAvailability> {
   let result: ForgeAvailability;
   try {
     await gh(repoRoot, ['repo', 'view', '--json', 'nameWithOwner'], 5_000);
@@ -2395,7 +2846,13 @@ async function detectGithub(repoRoot: string): Promise<ForgeAvailability> {
         : firstLine(message),
     };
   }
-  detectCache = { at: Date.now(), repoRoot, result };
+  detectCache.delete(repoRoot); // re-insert so this key becomes the newest
+  detectCache.set(repoRoot, { at: Date.now(), result });
+  while (detectCache.size > DETECT_CACHE_MAX) {
+    const oldest = detectCache.keys().next().value;
+    if (oldest === undefined) break;
+    detectCache.delete(oldest);
+  }
   return result;
 }
 
@@ -2413,14 +2870,12 @@ async function detectGithub(repoRoot: string): Promise<ForgeAvailability> {
  */
 export function detectGithubCached(repoRoot: string): ForgeAvailability | null {
   if (process.env.CEZ_DRY_RUN === '1') return { available: true };
-  const cached =
-    detectCache && detectCache.repoRoot === repoRoot ? detectCache.result : null;
-  const fresh =
-    detectCache && detectCache.repoRoot === repoRoot && Date.now() - detectCache.at < CACHE_MS;
+  const hit = detectCache.get(repoRoot);
+  const fresh = hit && Date.now() - hit.at < CACHE_MS;
   if (!fresh) {
     void detectGithub(repoRoot).catch(() => {}); // revalidate off the request path
   }
-  return cached; // last-known value while revalidating; null only until the first probe warms
+  return hit?.result ?? null; // last-known value while revalidating; null only until the first probe warms
 }
 
 const mergeStateCache = new Map<string, { at: number; value: ForgePrMergeStateResult }>();
@@ -2435,6 +2890,9 @@ function mergeCheckState(check: z.infer<typeof mergeCheckSchema>): ForgePrCheck[
   return 'unknown';
 }
 
+/** The single row an `aggregate` check tier collapses to — see `ForgePrMergeState['checksTier']`. */
+export const AGGREGATE_CHECK_NAME = 'All checks';
+
 export function normalizeMergeState(
   raw: unknown,
   policyRaw: unknown,
@@ -2442,6 +2900,7 @@ export function normalizeMergeState(
     readable: false,
     requiredChecks: [],
   },
+  checkTier: { tier: ForgePrMergeState['checksTier']; reason?: string } = { tier: 'detailed' },
 ): ForgePrMergeState {
   const pr = mergePrSchema.parse(raw);
   const policy = repoMergePolicySchema.parse(policyRaw);
@@ -2464,7 +2923,12 @@ export function normalizeMergeState(
   const checks: ForgePrCheck[] = (pr.statusCheckRollup ?? []).map((check) => ({
     name: check.name,
     state: mergeCheckState(check),
-    required: requirements.readable ? requirements.requiredChecks.includes(check.name) : null,
+    // An `aggregate` row stands for every check at once, required ones included, so its
+    // requiredness is unknowable — never `false`, which would read as "not required".
+    required:
+      checkTier.tier === 'aggregate' || !requirements.readable
+        ? null
+        : requirements.requiredChecks.includes(check.name),
     ...(check.detailsUrl?.startsWith('https://') || check.detailsUrl?.startsWith('http://')
       ? { url: check.detailsUrl }
       : {}),
@@ -2496,6 +2960,13 @@ export function normalizeMergeState(
   } else if (reviewDecision === 'changes-requested' || reviewDecision === 'review-required') {
     eligibility = 'blocked';
     blockers.push({ code: 'reviews', message: reviewDecision === 'changes-requested' ? 'Changes were requested.' : 'A required review is missing.' });
+  } else if (checkTier.tier === 'none') {
+    // Empty `checks` here means "never found out", not "no CI" — never let that read as ready.
+    eligibility = 'unknown';
+    blockers.push({
+      code: 'checks-unknown',
+      message: 'This token cannot read the checks on this pull request.',
+    });
   } else if (reviewDecision === 'unknown' || !requirements.readable) {
     eligibility = 'unknown';
     blockers.push({
@@ -2532,6 +3003,8 @@ export function normalizeMergeState(
     mergeable,
     reviewDecision,
     checks,
+    checksTier: checkTier.tier,
+    ...(checkTier.reason ? { checksReason: checkTier.reason } : {}),
     methods,
     defaultMethod,
     eligibility,
@@ -2541,7 +3014,68 @@ export function normalizeMergeState(
   };
 }
 
-async function fetchPrMergeState(
+/** What one attempt at the check tier came back with — the rollup rows plus how they were read. */
+type MergeChecksTier = {
+  tier: ForgePrMergeState['checksTier'];
+  rollup: Array<z.infer<typeof mergeCheckSchema>>;
+  reason?: string;
+};
+
+/**
+ * The check tier for the merge panel, fetched independently of the merge state's core fields
+ * (#969).
+ *
+ * `gh pr view --json statusCheckRollup` expands `CheckRun` contexts, and reading a check run needs
+ * the `checks` scope — which fine-grained PATs cannot grant, because they have no Checks permission
+ * at all. On such a token `gh` exits 1 with empty stdout, which is why this call is kept out of the
+ * one that carries `mergeable`, `mergeStateStatus` and `reviewDecision`.
+ *
+ * The fallback is the aggregate `statusCheckRollup { state }` on the head commit — the one part of
+ * the tier the same token CAN read, and already what the list-row glyphs use (`fetchPrChecks`). It
+ * collapses to a single row so the eligibility ladder still sees a red CI as red. Only when that
+ * fails too does the tier go dark, and then it says so rather than looking like "no CI".
+ */
+async function fetchMergeChecks(
+  repoRoot: string,
+  repoRef: GithubRepoRef,
+  number: number,
+): Promise<MergeChecksTier> {
+  try {
+    const out = await gh(repoRoot, ['pr', 'view', String(number), '--json', 'statusCheckRollup']);
+    return { tier: 'detailed', rollup: mergeChecksSchema.parse(JSON.parse(out)).statusCheckRollup ?? [] };
+  } catch (error) {
+    const reason = whyLine(error instanceof Error ? error.message : String(error));
+    const runGraphql: GraphqlRunner = (query, variables) => {
+      const args = ['api', 'graphql', '-f', `query=${query}`];
+      for (const [key, value] of Object.entries(variables)) args.push('-f', `${key}=${value}`);
+      return gh(repoRoot, args);
+    };
+    const glyphs = await fetchPrChecks(runGraphql, repoRef.owner, repoRef.repo, [number]);
+    // Absent key = the aggregate query failed too; `null` = it answered "this head has no CI".
+    if (!(number in glyphs)) return { tier: 'none', rollup: [], reason };
+    const glyph = glyphs[number] ?? null;
+    if (glyph === null) return { tier: 'aggregate', rollup: [], reason };
+    return {
+      tier: 'aggregate',
+      reason,
+      rollup: [
+        {
+          name: AGGREGATE_CHECK_NAME,
+          // Back into the rollup's own vocabulary so `mergeCheckState` stays the single mapper.
+          state: glyph === 'passing' ? 'SUCCESS' : glyph === 'failing' ? 'FAILURE' : 'PENDING',
+        },
+      ],
+    };
+  }
+}
+
+/** Test hook — the merge-state cache would otherwise leak state across cases in one process. */
+export function __clearMergeStateCacheForTests(): void {
+  mergeStateCache.clear();
+}
+
+/** Exported for unit tests (#969): the split-call behaviour is only observable end to end. */
+export async function fetchPrMergeState(
   repoRoot: string,
   repoRef: GithubRepoRef | null,
   number: number,
@@ -2575,12 +3109,16 @@ async function fetchPrMergeState(
   const hit = mergeStateCache.get(key);
   if (!refresh && hit && Date.now() - hit.at < MERGE_CACHE_MS) return hit.value;
   try {
+    // The core fields ONLY (#969) — `statusCheckRollup` is deliberately absent. It used to ride
+    // along here, and on a token that cannot read its contexts `gh` exits 1 with empty stdout,
+    // taking `mergeable`, `mergeStateStatus` and `reviewDecision` down with it even though the same
+    // token reads all three. The check detail now has its own call, and its own way to degrade.
     const prOut = await gh(repoRoot, [
       'pr', 'view', String(number), '--json',
-      'number,title,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup',
+      'number,title,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,reviewDecision',
     ]);
     const parsedPr = mergePrSchema.parse(JSON.parse(prOut));
-    const [policyOut, requiredChecks] = await Promise.all([
+    const [policyOut, requiredChecks, checks] = await Promise.all([
       gh(repoRoot, ['api', `repos/${repoRef.owner}/${repoRef.repo}`]),
       gh(repoRoot, [
         'api',
@@ -2590,15 +3128,24 @@ async function fetchPrMergeState(
       ])
         .then((output) => ({ readable: true, requiredChecks: z.array(z.string()).parse(JSON.parse(output)) }))
         .catch(() => ({ readable: false, requiredChecks: [] as string[] })),
+      fetchMergeChecks(repoRoot, repoRef, number),
     ]);
     const value: ForgePrMergeStateResult = {
       available: true,
-      mergeState: normalizeMergeState(parsedPr, JSON.parse(policyOut), requiredChecks),
+      mergeState: normalizeMergeState(
+        { ...parsedPr, statusCheckRollup: checks.rollup },
+        JSON.parse(policyOut),
+        requiredChecks,
+        { tier: checks.tier, ...(checks.reason ? { reason: checks.reason } : {}) },
+      ),
     };
     mergeStateCache.set(key, { at: Date.now(), value });
     return value;
   } catch (error) {
-    return { available: false, reason: firstLine(error instanceof Error ? error.message : String(error)) };
+    // `whyLine`, not `firstLine`: a reason of "Command failed: gh pr view 353 --json …" is the
+    // command echoed back, and reads like an outage. The line after it says what actually went
+    // wrong (#969).
+    return { available: false, reason: whyLine(error instanceof Error ? error.message : String(error)) };
   }
 }
 
@@ -2662,6 +3209,7 @@ export function mergePreflightAllowed(current: ForgePrMergeState, overrideRules 
 
 /** owner/repo parsed out of the origin remote — feeds `viewUrl`. */
 export interface GithubRepoRef {
+  host?: string;
   owner: string;
   repo: string;
 }
@@ -2675,12 +3223,19 @@ export function createGithubDriver(repoRoot: string, repoRef: GithubRepoRef | nu
   return {
     kind: 'github',
 
+    recentCreated: (kind, sinceDate) => recentGithubCreated(repoRoot, repoRef, kind, sinceDate),
+
     detect: () => detectGithub(repoRoot),
     detectCached: () => detectGithubCached(repoRoot),
 
     listIssues: async (opts) => (await fetchGithub(repoRoot, opts?.refresh, opts?.limit)).issues,
 
     listPRs: async (opts) => (await fetchGithub(repoRoot, opts?.refresh, opts?.limit)).prs,
+
+    // The open-only list tier's escape hatch (#730) — this is the only path that can reach a
+    // closed or merged item.
+    searchItems: (kind, query, opts) => searchGithubItems(repoRoot, kind, query, opts?.limit),
+
     prDiff: (number, opts) => fetchGithubPrDiff(repoRoot, number, opts?.refresh),
 
     createPR: (input) => createDraftPr(input),
@@ -2727,4 +3282,46 @@ export function createGithubDriver(repoRoot: string, repoRef: GithubRepoRef | nu
       }
     },
   };
+}
+
+
+const ghCreatedSchema = z.object({
+  number: z.number().int().positive(), title: z.string(), created_at: z.iso.datetime(),
+  html_url: z.url().refine((url) => /^https?:\/\//.test(url)),
+});
+
+/** Search's explicit created ordering includes subsequently closed issues and merged PRs.
+ * No user query reaches this operation; every qualifier is validated before building argv. */
+async function recentGithubCreated(
+  root: string, ref: GithubRepoRef | null, kind: 'issue' | 'pr', sinceDate: string,
+): Promise<ForgeRecentCreatedData> {
+  if (!ref || !/^[a-zA-Z0-9.-]+$/.test(ref.host ?? 'github.com') ||
+      !/^[a-zA-Z0-9_.-]+$/.test(ref.owner) || !/^[a-zA-Z0-9_.-]+$/.test(ref.repo) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(sinceDate) || !Number.isFinite(Date.parse(sinceDate))) {
+    return { available: false, reason: 'GitHub repository or creation date is invalid', items: [] };
+  }
+  if (process.env.CEZ_DRY_RUN === '1') {
+    return { available: true, truncated: false, items: [{
+      number: kind === 'issue' ? 101 : 102,
+      title: kind === 'issue' ? 'Dashboard example issue' : 'Dashboard example pull request',
+      createdAt: new Date().toISOString(),
+      url: `https://${ref.host ?? 'github.com'}/${ref.owner}/${ref.repo}/${kind === 'issue' ? 'issues' : 'pull'}/${kind === 'issue' ? 101 : 102}`,
+    }] };
+  }
+  try {
+    const output = await gh(root, [
+      'api', '--hostname', ref.host ?? 'github.com', '--method', 'GET', 'search/issues',
+      '-f', `q=repo:${ref.owner}/${ref.repo} is:${kind} created:>=${sinceDate}`,
+      '-f', 'sort=created', '-f', 'order=desc', '-f', 'per_page=30',
+    ]);
+    const parsed = z.object({ items: z.array(ghCreatedSchema), incomplete_results: z.boolean().optional() }).parse(JSON.parse(output));
+    const items = parsed.items.slice(0, 30).map((item) => ({
+      number: item.number, title: item.title, createdAt: item.created_at, url: item.html_url,
+    }));
+    return { available: true, items, truncated: parsed.items.length >= 30 || parsed.incomplete_results === true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { available: false, items: [], reason: /ENOENT/.test(message)
+      ? 'gh CLI not found — install it and run `gh auth login`' : firstLine(message) };
+  }
 }

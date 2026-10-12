@@ -12,6 +12,24 @@ import { apiRequest } from './loopback-request.testkit.ts';
 import { ProviderAuthService } from '../core/provider-auth.ts';
 import { createApp, type ServerDeps } from './server.ts';
 
+// `resolveClaudeBin` probes the real machine for an install that is off PATH, so the claude
+// executable these cases assert on would otherwise be whatever the DEVELOPER has. Pinned to the
+// env-only resolution so the suite reads the same on every host; `claude-bin.test.ts` tests
+// discovery for real.
+vi.mock('../core/claude-bin.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../core/claude-bin.ts')>()),
+  resolveClaudeBin: () => process.env.CEZ_CLAUDE_BIN ?? 'claude',
+}));
+
+// Junie has no read-only auth-status command, so `ProviderAuthService` probes it through a real
+// ACP session instead of `runCommand`. Left unmocked, every status probe in this suite spawned a
+// real `junie` process — on a machine with Junie installed and logged in, that handshake is slow
+// enough to blow past `vi.waitFor`'s default timeout before the boot warm-up settles (#M3 review,
+// same bug as providers-api.test.ts / provider-auth-runtime.test.ts / provider-action-gating.test.ts).
+vi.mock('../core/junie-auth-probe.ts', () => ({
+  probeJunieAuthentication: vi.fn(async () => ({ connected: true })),
+}));
+
 /**
  * `/api/v1/workspace/agent-profiles` (spec 2026-07-29-agent-profiles): extra config dirs for a
  * second login of the same agent CLI.
@@ -85,7 +103,7 @@ describe('agent profiles API', () => {
       const body = await list();
       expect(body.editable).toBe(true);
       expect(body.profiles.every((p) => p.isDefault)).toBe(true);
-      expect(body.profiles.map((p) => p.provider)).toEqual(['claude', 'codex', 'opencode', 'pi']);
+      expect(body.profiles.map((p) => p.provider)).toEqual(['claude', 'codex', 'opencode', 'cursor', 'pi', 'junie', 'copilot']);
       expect(body.profiles.every((p) => p.id === 'default')).toBe(true);
     });
 
@@ -504,7 +522,7 @@ describe('agent profiles API', () => {
       });
       const spawns: string[] = [];
       const app = makeApp({
-        socketHub: { registerTopic: () => undefined, attach: () => undefined, close: () => undefined },
+        socketHub: { registerTopic: () => () => undefined, attach: () => undefined, close: () => undefined },
         providerAuth: new ProviderAuthService({
           runCommand: async (executable) => {
             spawns.push(executable);

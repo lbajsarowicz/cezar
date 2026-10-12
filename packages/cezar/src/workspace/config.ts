@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { chmodSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { z } from 'zod';
@@ -8,7 +8,7 @@ import { z } from 'zod';
 // are imported rather than repeated.
 import { PROJECT_TAGS_MAX, PROJECT_TAG_MAX_LENGTH } from '@open-mercato/cezar-contract';
 import { PROVIDER_IDS, type ProviderId } from '../core/provider-auth.ts';
-import { assertCezarHomeWriteIsSandboxed, workspaceConfigPath } from '../paths.ts';
+import { assertCezarHomeWriteIsSandboxed, isAbsolutePath, workspaceConfigPath } from '../paths.ts';
 
 /**
  * `~/.cezar/config.json` — the per-user workspace config + project registry
@@ -21,10 +21,14 @@ import { assertCezarHomeWriteIsSandboxed, workspaceConfigPath } from '../paths.t
  *   survive a round-trip through an older one;
  * - `.max()` bounds on strings (this file is parsed on every boot);
  * - atomic tmp+rename writes with mode `0600` (dir `0700`);
- * - a corrupt file degrades to in-memory defaults plus ONE warning line — the
- *   registry rebuilds as projects are opened, so losing it is an
- *   inconvenience, not data loss. The corrupt file is left in place until the
- *   next successful merge-write replaces it.
+ * - a corrupt file degrades to in-memory defaults plus ONE warning line, and
+ *   is left in place until the next successful merge-write replaces it. What
+ *   makes that survivable is the `config.json.bak` snapshot below, which the
+ *   load path restores from before degrading — NOT re-registration: since boot
+ *   registration became seed-once (`shouldAutoRegisterProject`), opening a
+ *   project no longer writes it back, so a registry lost with its snapshot is
+ *   re-added with `cezar projects add <dir>` (or the cockpit's Add project),
+ *   one gesture per project. Nothing inside any repo is ever at stake.
  */
 
 /** `id` slug rule — mirrors the spec: `^[a-z0-9][a-z0-9-]{0,63}$`. */
@@ -40,8 +44,9 @@ const workspaceProjectSchema = z
     /** Unique slug — URL segment, sidebar key, worktree namespace. */
     id: z.string().regex(PROJECT_ID_RE),
     /** Absolute, realpath-normalized repo root (normalization is the writer's
-     *  job — `registerProject` in step 1.3; the schema only demands absolute). */
-    root: z.string().min(1).max(4096).refine((p) => p.startsWith('/'), 'root must be absolute'),
+     *  job — `registerProject` in step 1.3; the schema only demands absolute,
+     *  on THIS platform: `C:\repo` on Windows — see `isAbsolutePath`). */
+    root: z.string().min(1).max(4096).refine((p) => isAbsolutePath(p), 'root must be absolute'),
     /** Display name (basename by default). `''` = caller derives a fallback. */
     name: z.string().max(200).catch(''),
     addedAt: z.string().max(64).catch(''),
@@ -76,12 +81,17 @@ export type WorkspaceProject = z.infer<typeof workspaceProjectSchema>;
  */
 export const DEFAULT_MONITORING_WAKE_MINUTES = 5;
 
+/** Plain user-wait sessions retain a bounded liveness safeguard by default (#992). */
+export const DEFAULT_IDLE_TIMEOUT_MINUTES = 15;
+
 const resourcesSchema = z
   .object({
     /** Workspace-wide parallel-task cap (moved from per-repo config.json). */
     maxParallel: z.number().int().min(1).max(16).default(2).catch(2),
     /** Extra durable `CEZ:MONITORING` sessions exempt from the active-task cap. */
     maxMonitoringSessions: z.number().int().min(0).max(16).default(2).catch(2),
+    /** Plain `waiting`/`CEZ:ASK` session idle timeout; null or 0 disables this safeguard. */
+    idleTimeoutMinutes: z.number().int().min(0).max(1440).nullable().default(DEFAULT_IDLE_TIMEOUT_MINUTES).catch(DEFAULT_IDLE_TIMEOUT_MINUTES),
     /**
      * Cadence for re-checking monitored work; `null` parks at zero model cost until a
      * user (or an external integration) resumes the session.
@@ -146,7 +156,10 @@ const agentDefaultsSchema = z
         claude: z.string().trim().min(1).max(200).optional().catch(undefined),
         codex: z.string().trim().min(1).max(200).optional().catch(undefined),
         opencode: z.string().trim().min(1).max(200).optional().catch(undefined),
+        cursor: z.string().trim().min(1).max(200).optional().catch(undefined),
         pi: z.string().trim().min(1).max(200).optional().catch(undefined),
+        junie: z.string().trim().min(1).max(200).optional().catch(undefined),
+        copilot: z.string().trim().min(1).max(200).optional().catch(undefined),
       })
       .passthrough()
       .optional()
@@ -176,6 +189,10 @@ const disabledProvidersSchema = z
 
 const workspaceConfigSchema = z
   .object({
+    /** Optional instance name shown in the cockpit; absent keeps the product default. */
+    branding: z.object({
+      name: z.string().trim().min(1).max(80).optional().catch(undefined),
+    }).passthrough().default(() => ({})).catch(() => ({})),
     /** Migration cursor (src/workspace/migrations.ts). Absent/bad → 0, which
      *  means "run every migration" — each one is idempotent, so that is safe. */
     schemaVersion: z.number().int().min(0).default(0).catch(0),
@@ -189,6 +206,10 @@ const workspaceConfigSchema = z
     /** Optional auto-update override. Absence inherits the environment/default
      *  and must stay absent on unrelated merge-writes. */
     skillsAutoUpdate: z.boolean().optional().catch(undefined),
+    /** Release channel the self-updater follows (`stable` → npm `latest`, `nightly` → `nightly`,
+     *  `development` → none: a worktree or PR preview picked by hand). Absent inherits
+     *  `CEZ_UPDATE_CHANNEL`, then stable. */
+    updateChannel: z.enum(['stable', 'nightly', 'development']).optional().catch(undefined),
     /** Global opt-in model policy. The native coding-agent model becomes
      * authoritative while runner choice remains available. */
     modelsLocked: z.boolean().optional().catch(undefined),
@@ -325,7 +346,9 @@ export async function loadWorkspaceConfig(path: string = workspaceConfigPath()):
     return restored;
   }
   if (raw === null) return defaultWorkspaceConfig();
-  console.warn(`[cez] workspace config ${path} is corrupt — using defaults (registry rebuilds)`);
+  console.warn(
+    `[cez] workspace config ${path} is corrupt — using defaults (re-add projects with \`cezar projects add\`)`,
+  );
   return defaultWorkspaceConfig();
 }
 
@@ -351,8 +374,29 @@ export function atomicWriteJsonSync(path: string, value: unknown): void {
   assertCezarHomeWriteIsSandboxed(path);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = atomicTmpPath(path);
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  renameSync(tmp, path);
+  let fd = -1;
+  try {
+    fd = openSync(tmp, 'w', 0o600);
+    writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8' });
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = -1;
+    renameSync(tmp, path);
+  } catch (error) {
+    if (fd !== -1) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Preserve the original write/fsync/rename error.
+      }
+    }
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // Preserve the original write/fsync/rename error.
+    }
+    throw error;
+  }
   try {
     chmodSync(path, 0o600); // best-effort — ignored on some filesystems
   } catch {

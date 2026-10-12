@@ -11,6 +11,23 @@ import type { WorkflowDef } from '../workflows/types.ts';
 import { apiRequest } from './loopback-request.testkit.ts';
 import { createApp } from './server.ts';
 
+// `resolveClaudeBin` probes the real machine for an install that is off PATH, so the claude
+// executable these cases assert on would otherwise be whatever the DEVELOPER has. Pinned to the
+// env-only resolution so the suite reads the same on every host; `claude-bin.test.ts` tests
+// discovery for real.
+vi.mock('../core/claude-bin.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../core/claude-bin.ts')>()),
+  resolveClaudeBin: () => process.env.CEZ_CLAUDE_BIN ?? 'claude',
+}));
+
+// Junie has no read-only auth-status command, so `ProviderAuthService` probes it through a real
+// ACP session instead of `runCommand`. Left unmocked, the junie test below spawned a real
+// `junie` process (#M3 review). `connected: false` with no hint is what a genuinely unverifiable
+// ACP handshake maps to — the 'unknown' status the one junie test in this file is about.
+vi.mock('../core/junie-auth-probe.ts', () => ({
+  probeJunieAuthentication: vi.fn(async () => ({ connected: false })),
+}));
+
 const DISABLED_MESSAGE = 'Codex is disabled. Enable it in Settings → Agents → Providers.';
 
 const memoryWorkspaceConfig = (disabledProviders: ProviderId[] = ['codex']) => {
@@ -332,6 +349,15 @@ describe('the gate verifies before it refuses', () => {
     state.claudeLoggedIn = true; // meanwhile, the user logs in from a terminal
 
     const response = await start(app, 'claude');
+    expect(response.status).toBe(201);
+    expect(startRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows Junie runs when credentials are unknown because Junie has no read-only auth probe', async () => {
+    const { app } = setup();
+
+    const response = await start(app, 'junie');
+
     expect(response.status).toBe(201);
     expect(startRun).toHaveBeenCalledTimes(1);
   });

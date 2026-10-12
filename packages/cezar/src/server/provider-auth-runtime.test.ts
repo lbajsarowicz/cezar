@@ -14,6 +14,22 @@ import {
   watchProviderRuntimeAuthFailures,
 } from './provider-auth-runtime.ts';
 
+// `resolveClaudeBin` probes the real machine for an install that is off PATH, so the claude
+// executable these cases assert on would otherwise be whatever the DEVELOPER has. Pinned to the
+// env-only resolution so the suite reads the same on every host; `claude-bin.test.ts` tests
+// discovery for real.
+vi.mock('../core/claude-bin.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../core/claude-bin.ts')>()),
+  resolveClaudeBin: () => process.env.CEZ_CLAUDE_BIN ?? 'claude',
+}));
+
+// Junie has no read-only auth-status command, so `ProviderAuthService` probes it through a real
+// ACP session instead of `runCommand`. Left unmocked, every status probe in this suite spawned a
+// real `junie` process (#M3 review). Every test here expects junie 'connected'.
+vi.mock('../core/junie-auth-probe.ts', () => ({
+  probeJunieAuthentication: vi.fn(async () => ({ connected: true })),
+}));
+
 const CONNECTED_OUTPUT: Record<ProviderId, string> = {
   claude: '{"loggedIn":true}',
   codex: 'Logged in using ChatGPT',
@@ -22,13 +38,40 @@ const CONNECTED_OUTPUT: Record<ProviderId, string> = {
     '●  Anthropic oauth',
     '└  1 credential',
   ].join('\n'),
+  cursor: JSON.stringify({
+    status: 'authenticated',
+    isAuthenticated: true,
+    userInfo: { email: 'dev@example.com' },
+  }),
   pi: 'provider  model  context  max-out  thinking  images\nanthropic  claude  200K  64K  yes  yes',
+  // junie never reaches `runCommand`/`parse` at all — `probe()` special-cases it onto
+  // `probeJunieAuthentication` (mocked above), so this value is only here to satisfy
+  // `Record<ProviderId, string>` and is never read.
+  junie: 'Junie version: 26.9.22 (3419.7)',
+  // Copilot's probe drives its ACP server, so its "connected" evidence is the `session/new`
+  // answer (`.ai/runs/2026-09-27-copilot-cli-runner/copilot-acp-notes.md`).
+  copilot: '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"3f1b6f2e-0000-4000-8000-1f2e3d4c5b6a"}}',
 };
 
 const providerForExecutable = (executable: string): ProviderId => {
-  if (executable === 'claude' || executable === 'codex' || executable === 'opencode' || executable === 'pi') return executable;
+  if (executable === 'claude' || executable === 'codex' || executable === 'opencode' || executable === 'pi' || executable === 'junie' || executable === 'copilot') return executable;
+  if (executable === 'agent') return 'cursor';
   throw new Error(`unexpected executable: ${executable}`);
 };
+
+/** A service whose Claude CLI agrees the credentials are gone, so the latch's self-check confirms
+ *  the rejection instead of clearing it. */
+function loggedOutClaudeProviderAuth(): ProviderAuthService {
+  return new ProviderAuthService({
+    platform: 'linux',
+    runCommand: vi.fn<RunProviderCommand>(async (executable) => (
+      executable === 'claude'
+        ? { stdout: '{"loggedIn":false}', stderr: '', exitCode: 1 }
+        : { stdout: CONNECTED_OUTPUT[providerForExecutable(executable)], stderr: '', exitCode: 0 }
+    )),
+    createAuthFailureId: () => 'auth-incident-1',
+  });
+}
 
 describe('watchProviderRuntimeAuthFailures', () => {
   let root: string;
@@ -256,6 +299,87 @@ describe('watchProviderRuntimeAuthFailures', () => {
     }
   });
 
+  describe('the latch checks itself against the CLI before it stands', () => {
+    const failing = (store_: RunStore, runner: ProviderId = 'claude') => {
+      const run = store_.createRun({
+        title: 'self-check',
+        workflow: 'quick-task',
+        task: 'work',
+        runner,
+        steps: [],
+      });
+      store_.appendEvent(run.id, {
+        type: 'error',
+        message: 'Failed to authenticate. API Error: 401 OAuth access token has been revoked.',
+      });
+      return run;
+    };
+
+    it('announces the recovery when the credentials were never gone', async () => {
+      const onProviderStatus = watch();
+      const verifying = vi.spyOn(providerAuth, 'verifyRuntimeAuthFailure');
+
+      failing(store);
+      await verifying.mock.results[0]!.value;
+
+      expect(onProviderStatus.mock.calls.map(([status]) => status)).toEqual([
+        expect.objectContaining({ provider: 'claude', status: 'disconnected' }),
+        { provider: 'claude', status: 'connected' },
+      ]);
+      await expect(providerAuth.status()).resolves.toMatchObject({
+        providers: expect.arrayContaining([
+          expect.objectContaining({ provider: 'claude', status: 'connected' }),
+        ]),
+      });
+    });
+
+    it('leaves the latch standing when the CLI confirms the logout', async () => {
+      providerAuth = loggedOutClaudeProviderAuth();
+      const onProviderStatus = watch();
+      const verifying = vi.spyOn(providerAuth, 'verifyRuntimeAuthFailure');
+
+      failing(store);
+      await verifying.mock.results[0]!.value;
+
+      expect(onProviderStatus).toHaveBeenCalledTimes(1);
+      expect(onProviderStatus).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'claude',
+        status: 'disconnected',
+        authFailureId: 'auth-incident-1',
+      }));
+      await expect(providerAuth.status()).resolves.toMatchObject({
+        providers: expect.arrayContaining([
+          expect.objectContaining({ provider: 'claude', status: 'disconnected' }),
+        ]),
+      });
+    });
+
+    it('self-checks once for a burst of auth-shaped lines under one latch', async () => {
+      watch();
+      const verifying = vi.spyOn(providerAuth, 'verifyRuntimeAuthFailure');
+      const run = failing(store);
+
+      // Same run, same incident: the second and third line describe the latch already standing.
+      for (const type of ['session.error', 'note']) {
+        store.appendEvent(run.id, { type, message: 'unauthorized: 401 token expired' });
+      }
+      await verifying.mock.results[0]!.value;
+
+      expect(verifying).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the task transcript record of what the runner reported', async () => {
+      watch();
+      const verifying = vi.spyOn(providerAuth, 'verifyRuntimeAuthFailure');
+      const run = failing(store);
+      await verifying.mock.results[0]!.value;
+
+      // Recovery repairs workspace status, not history: the task still shows why it stopped.
+      expect(store.readEvents(run.id).filter(({ type }) => type === 'provider-auth-required'))
+        .toEqual([expect.objectContaining({ provider: 'claude', authFailureId: 'auth-incident-1' })]);
+    });
+  });
+
   it('unsubscribes cleanly', () => {
     const onInvalidated = vi.fn();
     const unwatch = watchProviderRuntimeAuthFailures(store, providerAuth, onInvalidated);
@@ -305,6 +429,9 @@ describe('watchProviderRuntimeAuthFailures', () => {
       runner: 'claude',
       steps: [],
     });
+    // A CLI that agrees the credentials are gone, so the self-check leaves the latch standing and
+    // this case stays about its own subject: observation is attached BEFORE recovery runs.
+    providerAuth = loggedOutClaudeProviderAuth();
     const observer = new ProviderRuntimeAuthObserver(providerAuth, vi.fn());
 
     await recoverWithProviderRuntimeAuthObservation(
