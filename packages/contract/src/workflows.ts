@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { runnerSchema } from './health.ts';
+import { stepSecretsSchema } from './secrets.ts';
 
 /**
  * The WORKFLOWS family: the chain catalog, the save/parse routes, and the planner.
@@ -44,12 +45,18 @@ export const workflowStepDefSchema = z
         retryOn: z.array(z.number().int().positive()).optional(),
       })
       .optional(),
+    /** Check steps only: which project/workspace secrets reach this command (by name, optionally
+     *  renamed). Omitted means every secret whose audiences include `checks`. */
+    secrets: stepSecretsSchema.optional(),
   })
   .refine((s) => Boolean(s.command) !== Boolean(s.prompt ?? s.skill), {
     message: 'a step is either an agent step (prompt/skill) or a check step (command), not both',
   })
   .refine((s) => s.timeoutMs === undefined || Boolean(s.command), {
     message: 'timeoutMs applies only to a check step (command)',
+  })
+  .refine((s) => !s.secrets || Boolean(s.command), {
+    message: 'secrets: is for check steps only — an agent step never receives a secret',
   });
 export type WorkflowStepDef = z.infer<typeof workflowStepDefSchema>;
 
@@ -113,6 +120,7 @@ export const workflowGraphNodeSchema = z.discriminatedUnion('type', [
     command: z.string().min(1),
     timeoutMs: z.number().int().positive().max(2_147_483_647).optional(),
     retryOn: z.array(z.number().int().positive()).optional(),
+    secrets: stepSecretsSchema.optional(),
   }),
   z.object({ ...graphNodeBase, type: z.literal('gate.human'), message: z.string().min(1), timeoutMs: waitMs.optional() }),
   z.object({
