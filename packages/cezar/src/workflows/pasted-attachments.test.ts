@@ -50,6 +50,11 @@ describe('HANDOFF_INSTRUCTIONS pasted-attachments note', () => {
     expect(HANDOFF_INSTRUCTIONS).toMatch(/that copy is for viewing only/);
   });
 
+  it('tells the agent to open the path instead of reporting it cannot see the attachment', () => {
+    expect(HANDOFF_INSTRUCTIONS).toMatch(/Read the file whenever the user refers to a screenshot you cannot see inline/);
+    expect(HANDOFF_INSTRUCTIONS).toMatch(/never tell the user their attachment did not reach you without opening its path first/);
+  });
+
   /** #950 — a file has no inline copy at all, and an agent that assumes one would answer about a
    *  document it never saw. The contract has to say so, not merely imply it. */
   it('says a non-image attachment exists only as the file on disk', () => {
@@ -618,6 +623,40 @@ describe('pasted screenshots materialize to disk and reach the agent as file pat
     const ndjson = readFileSync(join(dataDir, 'runs', `${record.id}.ndjson`), 'utf8');
     expect(ndjson).not.toContain(TINY_PNG_B64);
   }, 30_000);
+
+  /** The base64 blocks are first-step-only, so on a multi-step workflow the path note is all a
+   *  later step has — clearing the attachments after step one left it with no reference at all. */
+  it('a second agent step still receives the on-disk path, without the inline image', async () => {
+    writeFileSync(stdinFile, '', 'utf8');
+    const workflow: WorkflowDef = {
+      name: 'pasted-two-step-test',
+      source: 'built-in',
+      steps: [
+        { id: 'work', prompt: '{{task}}' },
+        { id: 'review', prompt: 'second step reviewing: {{task}}' },
+        { id: 'verify', command: 'true' },
+      ],
+    };
+    const image: ContentBlock = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: TINY_PNG_B64 },
+    };
+    const record = manager.startRun(workflow, {
+      task: 'act on the screenshot in step two',
+      images: [image],
+      worktree: false,
+    });
+    await waitForStatus(record.id, ['done', 'review', 'failed', 'cancelled']);
+    expect(store.getRun(record.id)?.status, store.getRun(record.id)?.error).toMatch(/^(done|review)$/);
+
+    const second = readStdinLines().find((line) => line.userText.includes('second step reviewing:'));
+    expect(second).toBeDefined();
+    expect(second?.imageCount).toBe(0);
+    expect(second?.userText).toContain('The user attached 1 pasted file, also saved on disk at:');
+    const pathMatch = second?.userText.match(/- (.*pasted-\d+\.png)/);
+    expect(pathMatch).toBeTruthy();
+    expect(existsSync(pathMatch?.[1] as string)).toBe(true);
+  }, 40_000);
 
   /**
    * The PDF/TXT/MD half of the same contract (#950). A file has nothing for the model to look at,
