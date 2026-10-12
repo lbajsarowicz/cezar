@@ -8,17 +8,24 @@ type Reply = (error: null, result: { stdout: string; stderr: string }) => void;
 let lists: Reply[];
 
 function reply(callback: Reply, title: string): void {
-  callback(null, { stdout: JSON.stringify([{
-    number: 1, title, createdAt: '2026-10-01T00:00:00Z', labels: [],
-    body: '', url: 'https://github.com/acme/demo/issues/1',
-  }]), stderr: '' });
+  callback(null, { stdout: JSON.stringify({ data: { repository: {
+    issues: {
+      totalCount: 1,
+      nodes: [{
+        number: 1, title, author: { login: 'a' }, createdAt: '2026-10-01T00:00:00Z', labels: [],
+        url: 'https://github.com/acme/demo/issues/1',
+      }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+    pullRequests: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+  } } }), stderr: '' });
 }
 
 beforeEach(() => {
   vi.stubEnv('CEZ_DRY_RUN', '0');
   lists = [];
   execFile.mockImplementation((_file, args: string[], _opts, callback: Reply) => {
-    if (args[0] === 'issue') { lists.push(callback); return; }
+    if (args[0] === 'api' && args[1] === 'graphql') { lists.push(callback); return; }
     callback(null, { stdout: args[0] === 'repo' ? 'acme/demo' : '[]', stderr: '' });
   });
 });
