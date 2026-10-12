@@ -17,6 +17,19 @@
  */
 @import "tw-animate-css";
 
+/* `no-hover:` — the device cannot hover, so a hover-revealed control would be UNREACHABLE.
+ *
+ * The pointer, not the viewport, is the honest axis. `md:` was the obvious spelling and it is
+ * wrong twice over: the drawer keeps the sidebar's fixed 264px, so a width rule written for the
+ * desktop column applies below `md` too, and a tablet in landscape is ≥md while still having no
+ * hover at all. `(hover: none)` asks the actual question, and a desktop machine that merely HAS
+ * a touchscreen still reports `hover: hover` for its primary pointer, so it keeps the quiet
+ * hover-revealed affordance.
+ *
+ * Reach for this on any control that is hidden until hover. Pair it with `focus-visible:`, which
+ * is the keyboard's answer to the same problem. */
+@custom-variant no-hover (@media (hover: none));
+
 /* Streamdown (the thread's markdown renderer) styles itself with Tailwind utility classes that
  * live in node_modules — without this @source Tailwind would purge them and every code block /
  * table / blockquote would render unstyled (diff-highlight-tech.md §4, the documented gotcha). */
@@ -70,6 +83,20 @@
     U+2C60-2C7F, U+A720-A7FF;
 }
 
+/* The wordmark's face (brand guideline, "Znak z nazwą"): Chakra Petch SemiBold, whose chamfered
+ * corners repeat the angles of the mark. ONE weight, latin only — it sets five letters, the
+ * name `cezar`, and nothing else in the cockpit. Vendored from @fontsource/chakra-petch v5.3.0
+ * (SIL OFL 1.1, licence beside the binary). */
+@font-face {
+  font-family: 'Chakra Petch';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('../assets/fonts/chakra-petch-latin-600-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
 /* ---------- tokens: dark (default) ---------- */
 
 :root {
@@ -114,6 +141,16 @@
    * is blue. Ink-only, per theme, AA on both backgrounds (10.9:1 here, 6.7:1 on light). */
   --info: #93c5fd;
 
+  /* A pull request that will not merge — the OTHER axis of a reference's state, and the reason it
+   * needs a hue of its own. Red is already spoken for by "the checks failed" and "a reviewer asked
+   * for changes", and a conflict shown in that same red is a third meaning on one colour; green
+   * "ready" is the very claim it contradicts. Orange sits between the two on the same warm ramp —
+   * blocked, not broken — and is the one warm hue the cockpit had not spent. Ink-only, per theme,
+   * AA on both backgrounds (8.6:1 on this one, 7.9:1 on --card; 5.2:1 on light). Distinct from
+   * `--pending`'s amber by hue AND by glyph: the pending chip carries the pulsing dot, this one a
+   * warning triangle. */
+  --conflict: #fb923c;
+
   /* The INK version of pending. `--pending` is a fill colour: amber-400 as text passes against
    * this theme's near-black and fails badly against the light theme's white, which is why the
    * design guardian bans `text-pending` outright. This token is the sanctioned way to write amber
@@ -132,6 +169,8 @@
   /* type stacks — the woff2 above, then platform fallbacks */
   --sans: 'Inter Variable', 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SF Mono', 'Menlo', monospace;
+  /* The wordmark only. Falls back to the UI face, never to a system display font. */
+  --brand: 'Chakra Petch', var(--sans);
 
   /* reading measure — the max width of the task view's column (header, thread, changes,
    * commits). The default is the shipped 820px reading column; Settings → Appearance → Reading
@@ -186,6 +225,10 @@
   /* amber-700, not amber-400: the dot keeps `--pending` in both themes, but amber ink on white
    * has to come down this far to stay readable (~4.8:1 against #ffffff). */
   --pending-strong: #b45309;
+
+  /* orange-700, for the same reason the amber above darkens: orange-400 as ink on white is ~2:1.
+   * Far enough from `--pending-strong` (amber-700) to stay a different colour, not a shade. */
+  --conflict: #c2410c;
 
   --shadow-modal: 0 16px 48px 0 rgba(0, 0, 0, 0.12);
 
@@ -297,6 +340,7 @@
   --color-pending: var(--pending);
   --color-pending-strong: var(--pending-strong);
   --color-info: var(--info);
+  --color-conflict: var(--conflict);
 
   --color-diff-add: var(--diff-add-bg);
   --color-diff-add-strong: var(--diff-add-strong);
@@ -318,6 +362,20 @@
 
   /* `rounded-md` is the default control radius — the token sheet spells that step `--radius`. */
   --radius-md: var(--radius);
+}
+
+/* The landing's `//` eyebrow before a dashboard module heading. CSS generated content IS part
+ * of an element's accessible name, so the slashes carry empty alt text (`/ ""`): a screen
+ * reader announces "Usage & cost", not "slash slash Usage & cost". The plain declaration first
+ * is the fallback for engines without content alt text, which drop the second one. */
+@utility section-mark {
+  &::before {
+    content: '//';
+    content: '//' / '';
+    margin-right: 0.375rem;
+    letter-spacing: normal;
+    color: var(--violet);
+  }
 }
 
 /* ---------- base ---------- */
@@ -507,4 +565,59 @@
 .thread-markdown [data-streamdown='code-block'] pre {
   font-size: 12px;
   line-height: 1.55;
+}
+
+/* ---------- document markdown (diff preview) ----------
+ * Reading scale for a whole Markdown FILE (the Changes tab's preview toggle), layered on the
+ * chat rules above: a centred ~72ch measure, body text a step up, headings with real
+ * hierarchy and forge-style rules under h1/h2, roomier block spacing. Same unlayered
+ * reasoning; the doubled class outranks the `.thread-markdown` rules it overrides. */
+
+.thread-markdown.markdown-document {
+  max-width: 72ch;
+  margin-inline: auto;
+  font-size: 15px;
+  line-height: 1.7;
+}
+.thread-markdown.markdown-document :is(h1, h2, h3, h4, h5, h6) {
+  margin: 1.6em 0 0.6em;
+  line-height: 1.3;
+}
+/* Streamdown's own first-child reset lives in the utilities layer, which the unlayered heading
+ * margin above outranks — restate it, or a file opening with `# Title` starts ~40px down. */
+.thread-markdown.markdown-document > :first-child {
+  margin-top: 0;
+}
+.thread-markdown.markdown-document h1 {
+  font-size: 1.75em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+}
+.thread-markdown.markdown-document h2 {
+  font-size: 1.4em;
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--border);
+}
+.thread-markdown.markdown-document h3 {
+  font-size: 1.2em;
+}
+.thread-markdown.markdown-document :is(h4, h5, h6) {
+  font-size: 1em;
+}
+.thread-markdown.markdown-document :is(p, ul, ol, table, blockquote) {
+  margin: 0.9em 0;
+}
+.thread-markdown.markdown-document li + li {
+  margin-top: 0.3em;
+}
+.thread-markdown.markdown-document hr {
+  margin: 2em 0;
+  border-color: var(--border);
+}
+.thread-markdown.markdown-document img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+.thread-markdown.markdown-document [data-streamdown='code-block'] pre {
+  font-size: 13px;
 }

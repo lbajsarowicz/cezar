@@ -9,7 +9,40 @@ import { createInterface } from 'node:readline';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const emit = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
+const write = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
+
+// `--include-partial-messages` → every text/thinking block of an assistant
+// frame is streamed first as `stream_event` deltas, the way the real CLI does:
+// block start, deltas, the whole-block assistant frame, block stop.
+const partialMessages = process.argv.includes('--include-partial-messages');
+
+function streamedBlocks(obj) {
+  if (!partialMessages || obj?.type !== 'assistant' || !Array.isArray(obj.message?.content)) return [];
+  return obj.message.content.flatMap((block, index) => {
+    if (block?.type === 'text' && typeof block.text === 'string' && block.text !== '') {
+      return [{ index, start: { type: 'text', text: '' }, deltaType: 'text_delta', key: 'text', text: block.text }];
+    }
+    if (block?.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.trim() !== '') {
+      return [{ index, start: { type: 'thinking', thinking: '', signature: '' }, deltaType: 'thinking_delta', key: 'thinking', text: block.thinking }];
+    }
+    return [];
+  });
+}
+
+function emit(obj) {
+  const blocks = streamedBlocks(obj);
+  const envelope = { session_id: obj?.session_id, parent_tool_use_id: obj?.parent_tool_use_id ?? null };
+  for (const block of blocks) {
+    write({ type: 'stream_event', event: { type: 'content_block_start', index: block.index, content_block: block.start }, ...envelope });
+    for (const piece of block.text.match(/\S+\s*|\s+/g) ?? [block.text]) {
+      write({ type: 'stream_event', event: { type: 'content_block_delta', index: block.index, delta: { type: block.deltaType, [block.key]: piece } }, ...envelope });
+    }
+  }
+  write(obj);
+  for (const block of blocks) {
+    write({ type: 'stream_event', event: { type: 'content_block_stop', index: block.index }, ...envelope });
+  }
+}
 
 // Testability hook: CEZ_MOCK_ARGS_FILE=<path> appends the argv this mock was
 // spawned with (one JSON array per line), so tests and dry-run proofs can
@@ -25,6 +58,19 @@ if (process.env.CEZ_MOCK_ARGS_FILE) {
 emit({ type: 'system', subtype: 'init' });
 
 let turn = 0;
+
+// `mock:autonomous` → the autonomous auto-nudge fixture (#autonomous). Cezar's nudge text is
+// fixed and carries no `mock:` marker, so a marker-per-message mock could never end such a
+// session: the first turn would end plainly, every nudge would end plainly, and the run would
+// only stop at MAX_AUTO_CONTINUES. This one flag ARMS the session instead — the turn that
+// answers the nudge ends with CEZ:DONE — so a dry-run test can watch a nudged run complete
+// rather than time out.
+let autonomousArmed = false;
+let askRepeat = false;
+// Must stay a prefix of `AUTONOMOUS_NUDGE` in `src/workflows/run.ts`. This is a plain script
+// and cannot import it, so `autonomous-nudge.test.ts` reads this line back and asserts the
+// coupling — reword the nudge and that test fails HERE rather than as an opaque timeout.
+const AUTONOMOUS_NUDGE_PREFIX = 'Continue working autonomously';
 
 // A tiny generated PNG (320x200) standing in for a browser screenshot.
 const MOCK_SCREENSHOT_B64 =
@@ -78,11 +124,34 @@ async function respond(userText, imageCount) {
   turn += 1;
   await sleep(250);
   // `mock:done` anywhere in the message → the reply ends with the CEZ:DONE
-  // completion marker (#347), so the auto-close path is testable dry.
-  const doneMarker = userText.includes('mock:done') ? '\n\nCEZ:DONE' : '';
+  // completion marker (#347), so the auto-close path is testable dry. `mock:report` implies it:
+  // a unit that has reported is finished, and a report with no done marker would leave the child
+  // parked instead of settling into the report its parent is waiting for.
+  // `mock:autonomous` arms the dry autonomous loop: once armed, the first nudge the engine sends
+  // is answered with CEZ:DONE, so a nudged run settles instead of looping to the cap.
+  if (userText.includes('mock:autonomous')) autonomousArmed = true;
+  // `mock:ask-repeat` → the SAME CEZ:ASK on this turn and on every later one (a nudge included):
+  // the agent that is blocked on something no nudge can fix and keeps asking about it.
+  if (userText.includes('mock:ask-repeat')) askRepeat = true;
+  // An inbox digest delivered into the session is answered with CEZ:DONE: the dry run proves the
+  // message reached the model, then settles.
+  const doneMarker =
+    userText.includes('mock:done') ||
+    userText.includes('## Tree inbox') ||
+    (autonomousArmed && userText.includes(AUTONOMOUS_NUDGE_PREFIX))
+      ? '\n\nCEZ:DONE'
+      : '';
   // `mock:monitoring` → the reply ends with CEZ:MONITORING, the "still working
   // on downstream work" marker (#490), so the monitoring-status path is testable dry.
-  const monitoringMarker = userText.includes('mock:monitoring') ? '\n\nCEZ:MONITORING' : '';
+  // `mock:monitoring-refs` → the same marker, but with task-reference marker lines AFTER it
+  // (#933): the handoff contract asks for those "as soon as you know", so an agent that opens
+  // its PR in the same turn it parks on its sub-agents emits exactly this shape. It used to
+  // bury the marker and park the run as `waiting` ("needs you").
+  const monitoringMarker = userText.includes('mock:monitoring')
+    ? userText.includes('mock:monitoring-refs')
+      ? '\n\nCEZ:MONITORING\nCEZ:PR=4242\nCEZ:TITLE=waiting on dispatched sub-agents'
+      : '\n\nCEZ:MONITORING'
+    : '';
   // `mock:ask` → the reply ends with a valid CEZ:ASK marker (#473), so the
   // AskUser card path (park `waiting` + emit `ask.requested`) is testable dry.
   // `mock:ask-bad` → a MALFORMED marker (invalid JSON), to prove graceful
@@ -92,10 +161,30 @@ async function respond(userText, imageCount) {
   // ever render it, so the marker must survive in the v1 text.
   // `mock:ask-near` → bounded presentation drift: harmless extra keys plus
   // an overlong header/description. It should normalize into exactly one card.
-  const askMarker = userText.includes('mock:ask-bad')
+  // `mock:ask-truncated` → a complete payload one closing brace short (#936):
+  // the closer repair should still produce one card, note the recovery, and
+  // strip the raw marker (which ends on `]`, not `}`).
+  // `mock:ask-many` → six distinct questions, one of them with six options:
+  // over the old 4/4 caps, which refused the whole payload and showed the user
+  // raw JSON. It must now render as exactly one card, and a dispatched child
+  // parking on it must still write a run record its index parser can read.
+  const askMarker = userText.includes('mock:ask-many')
+    ? '\n\nCEZ:ASK ' +
+      JSON.stringify({
+        questions: Array.from({ length: 6 }, (_, index) => ({
+          header: `Area ${index}`,
+          question: `Decision ${index} — which way?`,
+          options: Array.from({ length: index === 0 ? 6 : 2 }, (_, option) => ({
+            label: `Option ${index}.${option}`,
+          })),
+        })),
+      })
+    : userText.includes('mock:ask-bad')
     ? '\n\nCEZ:ASK {not valid json'
     : userText.includes('mock:ask-invalid')
       ? '\n\nCEZ:ASK {"questions":[]}'
+      : userText.includes('mock:ask-truncated')
+        ? '\n\nCEZ:ASK {"questions":[{"header":"Lint scope","question":"How much of the lint backlog should I land now?","multiSelect":false,"options":[{"label":"First slice only"},{"label":"Rule by rule"},{"label":"Whole backlog"}]}]'
       : userText.includes('mock:ask-near')
         ? '\n\nCEZ:ASK ' +
           JSON.stringify({
@@ -112,7 +201,7 @@ async function respond(userText, imageCount) {
               },
             ],
           })
-      : userText.includes('mock:ask')
+      : userText.includes('mock:ask') || askRepeat
       ? '\n\nCEZ:ASK ' +
         JSON.stringify({
           questions: [
@@ -127,14 +216,29 @@ async function respond(userText, imageCount) {
           ],
         })
       : '';
+  // `mock:verdict=<name>` → the reply ends with `CEZ:VERDICT <name>`, a graph agent node's
+  // branch choice (spec 2026-09-30-workflow-node-editor). cezar's one-shot verdict nudge carries
+  // no `mock:` marker, so it is answered with the FIRST verdict it lists — which makes the nudge
+  // path testable dry: omit the marker on the first turn, get the verdict on the nudge.
+  const verdictMatch = /mock:verdict=([A-Za-z0-9_-]+)/.exec(userText);
+  const nudgeMatch = userText.includes('You did not end with a verdict.')
+    ? /CEZ:VERDICT ([A-Za-z0-9_-]+)/.exec(userText)
+    : null;
+  const verdictMarker = verdictMatch
+    ? `\n\nCEZ:VERDICT ${verdictMatch[1]}`
+    : nudgeMatch
+      ? `\n\nCEZ:VERDICT ${nudgeMatch[1]}`
+      : '';
   // `mock:refs` → the reply carries the in-band task-reference markers
   // (spec 2026-07-18-task-ref-markers), so the declaration path is testable dry.
   const refsMarkers = userText.includes('mock:refs')
     ? '\nCEZ:PR=4242\nCEZ:ISSUE=17\nCEZ:TITLE=implementing marker refs'
     : '';
 
-  // `mock:slow` → hold the turn for ~25 s so queue states are observable.
+  // `mock:slow` → hold the turn for ~25 s so queue states are observable. `mock:pause` → ~2 s,
+  // long enough for a test to drop a file into the run's inbox before its turn ends.
   if (userText.includes('mock:slow')) await sleep(25_000);
+  else if (userText.includes('mock:pause')) await sleep(2_000);
 
   // Mirrors the real Claude Code 2.1.148 revoked-token envelope: the CLI puts
   // the credential failure in an `is_error` result even though its subtype is
@@ -451,7 +555,7 @@ async function respond(userText, imageCount) {
       type: 'assistant',
       message: {
         role: 'assistant',
-        content: [{ type: 'text', text: `Done with the first pass — opened a draft PR: https://github.com/open-mercato/demo/pull/123. Anything to adjust? (dry-run mock)${refsMarkers}${doneMarker}${monitoringMarker}${askMarker}` }],
+        content: [{ type: 'text', text: `Done with the first pass — opened a draft PR: https://github.com/open-mercato/demo/pull/123. Anything to adjust? (dry-run mock)${refsMarkers}${doneMarker}${monitoringMarker}${askMarker}${verdictMarker}` }],
         usage: { input_tokens: 300, output_tokens: 90 },
       },
     });
@@ -471,7 +575,7 @@ async function respond(userText, imageCount) {
     type: 'assistant',
     message: {
       role: 'assistant',
-      content: [{ type: 'text', text: `Follow-up #${turn - 1} received: "${userText.slice(0, 100)}".${imgNote} Applied (dry run).${refsMarkers}${doneMarker}${monitoringMarker}${askMarker}` }],
+      content: [{ type: 'text', text: `Follow-up #${turn - 1} received: "${userText.slice(0, 100)}".${imgNote} Applied (dry run).${refsMarkers}${doneMarker}${monitoringMarker}${askMarker}${verdictMarker}` }],
       usage: { input_tokens: 200, output_tokens: 60 },
     },
   });

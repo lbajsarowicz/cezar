@@ -14,24 +14,31 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 import {
+  AGGREGATE_CHECK_NAME,
   __clearCommentsCacheForTests,
+  __clearMergeStateCacheForTests,
   __clearRepoHandleCacheForTests,
   resolveRepoHandle,
+  createGithubDriver,
   detectGithubCached,
   fetchGithubComments,
   fetchTimelinePages,
   fetchCommentCounts,
   fetchCommitChecks,
   fetchPrChecks,
+  fetchPrMergeState,
   fetchRefStatuses,
   fetchGithubRefStatus,
+  whyLine,
   derivePrReferenceStatus,
   deriveIssueReferenceStatus,
   __clearRefStatusCacheForTests,
   forgetRefStatus,
   refNumberFromUrl,
   fetchGithub,
+  searchGithubItems,
   GH_CHECKS_MAX,
+  GH_SEARCH_MAX,
   ghCheckRunSchema,
   ghTimelineEventSchema,
   mergeThread,
@@ -41,6 +48,7 @@ import {
   normalizeReviews,
   normalizeMergeState,
   parseCountsPage,
+  parseGithubListPage,
   parseOwnerName,
   rollupToChecks,
   THREAD_ENTRY_CAP,
@@ -431,6 +439,10 @@ const ghByCwd = () =>
     const who = opts?.cwd?.includes('proj-b') ? 'b' : 'a';
     let stdout = '';
     if (argv[0] === 'repo') stdout = `owner/${who}\n`;
+    else if (argv[0] === 'api' && argv[1] === 'graphql') stdout = JSON.stringify({ data: { repository: {
+      issues: { totalCount: 1, nodes: [{ number: 1, title: `${who}-issue`, author: { login: who }, createdAt: '2026-07-01T00:00:00Z', labels: [], url: `https://github.com/owner/${who}/issues/1` }], pageInfo: { hasNextPage: false, endCursor: null } },
+      pullRequests: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    } } });
     else if (argv[0] === 'issue')
       stdout = JSON.stringify([
         {
@@ -455,7 +467,7 @@ const ghByCwd = () =>
         },
       ]);
     else if (argv[1]?.includes('/reviews')) stdout = '[]';
-    else stdout = '{}'; // graphql counts — malformed page degrades to empty maps
+    else stdout = '{}';
     cb(null, { stdout, stderr: '' });
   });
 
@@ -565,6 +577,37 @@ describe('detectGithubCached', () => {
     // …and a background revalidate was kicked off exactly once for the stale read.
     await vi.advanceTimersByTimeAsync(0);
     expect(execFileMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('probes once when a cold read is followed by an awaited detect', async () => {
+    ghOk();
+    const coldRoot = '/repo/detect-inflight';
+    // What `GET /automations` does on a cold cache: the SWR read fires a revalidation and answers
+    // null, then the route awaits the real probe — which must join it rather than shell out again.
+    expect(detectGithubCached(coldRoot)).toBeNull();
+    const awaited = createGithubDriver(coldRoot, null).detect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await awaited).toEqual({ available: true });
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps one project\'s cached availability when a different project is probed afterward', async () => {
+    ghOk();
+    const firstRoot = '/repo/detect-multi-a'; // distinct roots, isolated from the other cases here
+    const otherRoot = '/repo/detect-multi-b';
+
+    expect(detectGithubCached(firstRoot)).toBeNull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(detectGithubCached(firstRoot)).toEqual({ available: true });
+
+    // A second project is probed later — this used to overwrite the single shared slot and make
+    // the first project's next read come back null again, disabling its "When GitHub changes"
+    // toggle even though its GitHub was never unreachable.
+    expect(detectGithubCached(otherRoot)).toBeNull();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(detectGithubCached(otherRoot)).toEqual({ available: true });
+
+    expect(detectGithubCached(firstRoot)).toEqual({ available: true });
   });
 });
 
@@ -1493,37 +1536,438 @@ describe('fetchGithub omits statusCheckRollup from the list call (#664)', () => 
   });
 
   it('does not request the rollup field and leaves list PR checks null', async () => {
-    let prJsonArg = '';
+    let graphqlQuery = '';
     execFileMock.mockImplementation((...args: unknown[]) => {
       const argv = args[1] as string[];
       const cb = args[args.length - 1] as (e: unknown, r: unknown) => void;
       let stdout = '{}';
       if (argv[0] === 'repo') stdout = 'owner/n\n';
-      else if (argv[0] === 'issue') stdout = '[]';
-      else if (argv[0] === 'pr') {
-        prJsonArg = argv[argv.indexOf('--json') + 1] ?? '';
-        stdout = JSON.stringify([
-          {
-            number: 7,
-            title: 'a pr',
-            author: { login: 'x' },
-            createdAt: '2026-07-01T00:00:00Z',
-            labels: [],
-            body: 'b',
-            url: 'https://github.com/owner/n/pull/7',
-            isDraft: false,
-            additions: 1,
-            deletions: 2,
-          },
-        ]);
+      else if (argv[0] === 'api' && argv[1] === 'graphql') {
+        graphqlQuery = argv[argv.indexOf('-f') + 1] ?? '';
+        stdout = JSON.stringify({ data: { repository: {
+          issues: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          pullRequests: { totalCount: 9, nodes: [{ number: 7, title: 'a pr', author: { login: 'x' }, createdAt: '2026-07-01T00:00:00Z', labels: [], url: 'https://github.com/owner/n/pull/7', comments: { totalCount: 4 }, isDraft: false, additions: 1, deletions: 2 }], pageInfo: { hasNextPage: true, endCursor: 'next-pr' } },
+        } } });
       }
       cb(null, { stdout, stderr: '' });
     });
 
     const data = await fetchGithub('/repo/no-rollup-664');
-    expect(prJsonArg).not.toContain('statusCheckRollup');
-    expect(prJsonArg).toContain('isDraft');
+    expect(graphqlQuery).not.toContain('statusCheckRollup');
+    expect(graphqlQuery).toContain('isDraft');
+    expect(graphqlQuery).toContain('comments { totalCount }');
     expect(data.prs[0]?.checks).toBeNull();
+    expect(data.prs[0]?.comments).toBe(4);
+    expect(data.prsTotal).toBe(9);
+    expect(data.prsNextCursor).toBe('next-pr');
+  });
+
+  it('sends page sizes typed and splits a limit above 100 into exact pages', async () => {
+    // `-f limit=30` reached GitHub as a String and failed the whole tab ("Could not coerce value to Int").
+    const calls: string[][] = [];
+    const node = (n: number) => ({ number: n, title: `#${n}`, author: { login: 'x' }, createdAt: '2026-07-01T00:00:00Z', labels: { nodes: [{ name: 'bug', color: 'd73a4a' }] }, url: `https://github.com/owner/n/issues/${n}`, comments: { totalCount: 0 } });
+    execFileMock.mockImplementation((...args: unknown[]) => {
+      const argv = args[1] as string[];
+      const cb = args[args.length - 1] as (e: unknown, r: unknown) => void;
+      let stdout = '{}';
+      if (argv[0] === 'repo') stdout = 'owner/n\n';
+      else if (argv[0] === 'api' && argv[1] === 'graphql') {
+        calls.push(argv);
+        const value = (key: string) => argv.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1);
+        const issuesSize = Number(value('issuesLimit'));
+        const start = value('issuesCursor') ? Number(value('issuesCursor')) : 0;
+        const nodes = Array.from({ length: issuesSize }, (_, i) => node(start + i + 1));
+        stdout = JSON.stringify({ data: { repository: {
+          issues: { totalCount: 500, nodes, pageInfo: { hasNextPage: true, endCursor: issuesSize ? String(start + issuesSize) : null } },
+          pullRequests: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+        } } });
+      }
+      cb(null, { stdout, stderr: '' });
+    });
+
+    const data = await fetchGithub('/repo/typed-limit', false, 150);
+    expect(calls.length).toBe(2);
+    for (const argv of calls) {
+      for (const key of ['issuesLimit', 'prsLimit']) {
+        const at = argv.findIndex((a) => a.startsWith(`${key}=`));
+        expect(argv[at - 1]).toBe('-F');
+      }
+      expect(Number(argv.find((a) => a.startsWith('issuesLimit='))?.split('=')[1])).toBeLessThanOrEqual(100);
+    }
+    expect(data.issues.map((i) => i.number)).toEqual(Array.from({ length: 150 }, (_, i) => i + 1));
+    expect(data.issuesNextCursor).toBe('150');
+    expect(data.issuesTotal).toBe(500);
+    expect(data.issues[0]?.labels).toEqual(['bug']); // GraphQL labels arrive as a connection
+    expect(data.labelColors).toEqual({ bug: 'd73a4a' });
+  });
+
+  it('reports gh stderr, not a line of the multi-line query argv', async () => {
+    execFileMock.mockImplementation((...args: unknown[]) => {
+      const argv = args[1] as string[];
+      const cb = args[args.length - 1] as (e: unknown, r: unknown) => void;
+      if (argv[0] === 'repo') return cb(null, { stdout: 'owner/n\n', stderr: '' });
+      const err = Object.assign(new Error(`Command failed: gh ${argv.join(' ')}`), { stderr: "gh: Field 'name' doesn't exist on type 'LabelConnection'\n" });
+      cb(err, null);
+    });
+    const data = await fetchGithub('/repo/stderr-reason', true);
+    expect(data.available).toBe(false);
+    expect(data.reason).toBe("gh: Field 'name' doesn't exist on type 'LabelConnection'");
+  });
+});
+
+/**
+ * Cross-state search (#730).
+ *
+ * The bug this covers: `fetchGithub` lists the OPEN set only (`gh issue/pr list` defaults to
+ * `--state open`) and the tab's search is an in-memory filter over exactly that payload — so a
+ * merged or closed item is unreachable no matter what the user types. `searchGithubItems` is the
+ * path that asks GitHub instead, and these tests pin the three things that make it work: the
+ * numeric lookup is state-agnostic, the text search does not constrain state, and every failure
+ * degrades quietly instead of throwing into the tab.
+ */
+describe('searchGithubItems (#730)', () => {
+  /** Capture every `gh` argv while answering with `answer(argv)`. */
+  const ghSpy = (answer: (argv: string[]) => string | Error) => {
+    const argvs: string[][] = [];
+    execFileMock.mockImplementation((...args: unknown[]) => {
+      const argv = args[1] as string[];
+      argvs.push(argv);
+      const cb = args[args.length - 1] as (e: unknown, r: unknown) => void;
+      const out = answer(argv);
+      if (out instanceof Error) cb(out, null);
+      else cb(null, { stdout: out, stderr: '' });
+    });
+    return argvs;
+  };
+
+  const searchHit = (over: Record<string, unknown> = {}) => ({
+    number: 4507,
+    title: 'reconcile payment-session amount with order total',
+    author: { login: 'wojciechszyjka' },
+    createdAt: '2026-07-25T07:08:17Z',
+    labels: [{ name: 'security', color: 'D93F0B' }],
+    body: 'body',
+    url: 'https://github.com/owner/n/pull/4507',
+    isDraft: false,
+    commentsCount: 20,
+    ...over,
+  });
+
+  beforeEach(() => {
+    vi.stubEnv('CEZ_DRY_RUN', '');
+    execFileMock.mockReset();
+    __clearRepoHandleCacheForTests();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('resolves a bare number through `pr view`, which finds merged and closed PRs alike', async () => {
+    const argvs = ghSpy((argv) =>
+      argv[0] === 'pr' && argv[1] === 'view'
+        ? JSON.stringify({
+            number: 4507,
+            title: 'a merged pr',
+            author: { login: 'someone' },
+            createdAt: '2026-07-25T07:08:17Z',
+            labels: [],
+            body: 'b',
+            url: 'https://github.com/owner/n/pull/4507',
+            isDraft: false,
+            additions: 3,
+            deletions: 1,
+          })
+        : '',
+    );
+
+    const res = await searchGithubItems('/repo/search-num', 'pr', '4507');
+
+    expect(res.available).toBe(true);
+    expect(res.items.map((i) => i.number)).toEqual([4507]);
+    expect(res.items[0]?.kind).toBe('pr');
+    // A view lookup carries no state filter at all — that is exactly why it reaches a merged PR.
+    const view = argvs.find((a) => a[0] === 'pr' && a[1] === 'view');
+    expect(view).toBeDefined();
+    expect(view).toContain('4507');
+    expect(view?.join(' ')).not.toContain('--state');
+  });
+
+  it('accepts the `#4507` spelling the search box invites', async () => {
+    ghSpy((argv) =>
+      argv[0] === 'issue' && argv[1] === 'view'
+        ? JSON.stringify({
+            number: 4507,
+            title: 'an issue',
+            author: { login: 'someone' },
+            createdAt: '2026-07-25T07:08:17Z',
+            labels: [],
+            body: '',
+            url: 'https://github.com/owner/n/issues/4507',
+          })
+        : '',
+    );
+
+    const res = await searchGithubItems('/repo/search-hash', 'issue', '#4507');
+    expect(res.items.map((i) => i.number)).toEqual([4507]);
+  });
+
+  it('does not misidentify a PR returned by the numeric issue lookup', async () => {
+    const argvs = ghSpy((argv) => {
+      if (argv[0] === 'issue' && argv[1] === 'view') {
+        return JSON.stringify({
+          number: 4507,
+          title: 'a pull request sharing the issue number',
+          author: { login: 'someone' },
+          createdAt: '2026-07-25T07:08:17Z',
+          labels: [],
+          body: '',
+          url: 'https://github.com/owner/n/pull/4507',
+        });
+      }
+      if (argv[0] === 'repo') return 'owner/n\n';
+      if (argv[0] === 'search') {
+        return JSON.stringify([searchHit({ title: 'a genuine issue mentioning 4507', url: 'https://github.com/owner/n/issues/12' })]);
+      }
+      return '';
+    });
+
+    const res = await searchGithubItems('/repo/search-issue-kind', 'issue', '4507');
+
+    expect(res.available).toBe(true);
+    expect(res.items[0]?.kind).toBe('issue');
+    expect(res.items[0]?.title).toBe('a genuine issue mentioning 4507');
+    expect(argvs.some((a) => a[0] === 'search' && a[1] === 'issues')).toBe(true);
+  });
+
+  it('searches text with NO --state flag, so closed and merged hits are included', async () => {
+    const argvs = ghSpy((argv) => {
+      if (argv[0] === 'repo') return 'owner/n\n';
+      if (argv[0] === 'search') return JSON.stringify([searchHit()]);
+      return '';
+    });
+
+    const res = await searchGithubItems('/repo/search-text', 'pr', 'payment-session');
+
+    expect(res.available).toBe(true);
+    expect(res.items[0]?.number).toBe(4507);
+    // `commentsCount` is the search API's spelling of the list tier's `comments`.
+    expect(res.items[0]?.comments).toBe(20);
+    expect(res.items[0]?.checks).toBeNull();
+    expect(res.labelColors).toEqual({ security: 'D93F0B' });
+    const search = argvs.find((a) => a[0] === 'search');
+    expect(search?.slice(0, 2)).toEqual(['search', 'prs']);
+    expect(search).toContain('--repo');
+    expect(search).toContain('owner/n');
+    // `gh search --state` only accepts open|closed; omitting it is what searches every state.
+    expect(search?.join(' ')).not.toContain('--state');
+  });
+
+  it('routes the issues view to `gh search issues`', async () => {
+    const argvs = ghSpy((argv) => {
+      if (argv[0] === 'repo') return 'owner/n\n';
+      if (argv[0] === 'search') return JSON.stringify([searchHit({ number: 12 })]);
+      return '';
+    });
+
+    await searchGithubItems('/repo/search-kind', 'issue', 'flaky');
+    expect(argvs.find((a) => a[0] === 'search')?.slice(0, 2)).toEqual(['search', 'issues']);
+  });
+
+  /**
+   * The query must sit behind an end-of-flags `--` (#836). Ahead of it, `gh` parses a query that
+   * starts with `-`/`--` as a flag: `--foo` answers `unknown flag: --foo`, which the quiet degrade
+   * turns into the tab's "GitHub could not be searched" — an infrastructure failure reported for
+   * ordinary search text — and the exact query `--web` matches `gh search`'s own `-w, --web` and
+   * opens a browser on the machine hosting the cockpit. A stub cannot reproduce the CLI's parser,
+   * so what is pinned is the argv shape that decides it: `--` immediately before the query, last.
+   */
+  it('sends the query behind `--`, so a flag-shaped query stays search text', async () => {
+    const argvs = ghSpy((argv) => {
+      if (argv[0] === 'repo') return 'owner/n\n';
+      if (argv[0] === 'search') return JSON.stringify([searchHit()]);
+      return '';
+    });
+
+    const res = await searchGithubItems('/repo/search-flagish', 'pr', '--web');
+
+    expect(res.available).toBe(true);
+    const search = argvs.find((a) => a[0] === 'search');
+    expect(search?.at(-1)).toBe('--web');
+    expect(search?.at(-2)).toBe('--');
+    // Nothing flag-shaped may precede the terminator either — the query is the only trailing arg.
+    expect(search?.slice(0, -2)).not.toContain('--web');
+  });
+
+  /**
+   * `gh search issues` does not define `isDraft` and rejects the whole call with
+   * `Unknown JSON field: "isDraft"` — so asking for it made EVERY text query on the Issues tab
+   * degrade to "GitHub could not be searched", leaving a closed issue reachable by number only.
+   * Stubbing `gh` cannot reproduce the CLI's own rejection, so what is pinned here is the input
+   * that provokes it: the field list this path sends, per kind.
+   */
+  it('never asks `gh search issues` for the PR-only isDraft field', async () => {
+    const argvs = ghSpy((argv) => {
+      if (argv[0] === 'repo') return 'owner/n\n';
+      // The real CLI omits the key entirely for issues; the hit must still parse.
+      if (argv[0] === 'search') {
+        const { isDraft: _drop, ...issueHit } = searchHit({ number: 797 });
+        return JSON.stringify([issueHit]);
+      }
+      return '';
+    });
+
+    const res = await searchGithubItems('/repo/search-issue-fields', 'issue', 'lease timing');
+
+    const search = argvs.find((a) => a[0] === 'search');
+    const fields = search?.[search.indexOf('--json') + 1];
+    expect(fields).not.toContain('isDraft');
+    expect(fields).toContain('commentsCount');
+    expect(res.available).toBe(true);
+    expect(res.items.map((i) => i.number)).toEqual([797]);
+    // Issues have no draft concept — the flag must not leak onto the row or its labels.
+    expect(res.items[0]?.isDraft).toBeUndefined();
+    expect(res.items[0]?.labels).not.toContain('draft');
+  });
+
+  it('still asks `gh search prs` for isDraft, which that search does define', async () => {
+    const argvs = ghSpy((argv) => {
+      if (argv[0] === 'repo') return 'owner/n\n';
+      if (argv[0] === 'search') return JSON.stringify([searchHit({ isDraft: true })]);
+      return '';
+    });
+
+    const res = await searchGithubItems('/repo/search-pr-fields', 'pr', 'payment-session');
+
+    const search = argvs.find((a) => a[0] === 'search');
+    expect(search?.[search.indexOf('--json') + 1]).toContain('isDraft');
+    expect(res.items[0]?.isDraft).toBe(true);
+    expect(res.items[0]?.labels).toContain('draft');
+  });
+
+  it('falls back to a text search when the number resolves to nothing', async () => {
+    const argvs = ghSpy((argv) => {
+      if (argv[0] === 'repo') return 'owner/n\n';
+      if (argv[0] === 'pr' && argv[1] === 'view') return new Error('no pull requests found for 4507');
+      if (argv[0] === 'search') return JSON.stringify([searchHit({ title: 'mentions 4507' })]);
+      return '';
+    });
+
+    const res = await searchGithubItems('/repo/search-fallthrough', 'pr', '4507');
+
+    expect(res.available).toBe(true);
+    expect(res.items[0]?.title).toBe('mentions 4507');
+    expect(argvs.some((a) => a[0] === 'search')).toBe(true);
+  });
+
+  it('marks the hit list truncated when it fills the cap', async () => {
+    ghSpy((argv) => {
+      if (argv[0] === 'repo') return 'owner/n\n';
+      if (argv[0] === 'search') {
+        return JSON.stringify(Array.from({ length: 3 }, (_, i) => searchHit({ number: i + 1 })));
+      }
+      return '';
+    });
+
+    const res = await searchGithubItems('/repo/search-cap', 'pr', 'anything', 3);
+    expect(res.truncated).toBe(true);
+    expect(res.items).toHaveLength(3);
+  });
+
+  it('caps the requested limit at GH_SEARCH_MAX', async () => {
+    const argvs = ghSpy((argv) => {
+      if (argv[0] === 'repo') return 'owner/n\n';
+      if (argv[0] === 'search') return '[]';
+      return '';
+    });
+
+    await searchGithubItems('/repo/search-limit', 'pr', 'anything', 10_000);
+    const search = argvs.find((a) => a[0] === 'search');
+    expect(search?.[search.indexOf('--limit') + 1]).toBe(String(GH_SEARCH_MAX));
+  });
+
+  it('honours `limit` and flags `truncated` in CEZ_DRY_RUN too, on the live rule (#838)', async () => {
+    vi.stubEnv('CEZ_DRY_RUN', '1');
+
+    // '1' appears in every fixture issue number (142 / 139 / 135), so the cap has something to bite
+    // on. Before #838 the dry-run branch returned ahead of `capped` and shipped all three unflagged
+    // — offline mode is the only place cap-and-truncate is exercised without `gh`.
+    const capped = await searchGithubItems('/repo/dry-cap', 'issue', '1', 2);
+    expect(capped.items.map((i) => i.number)).toEqual([142, 139]);
+    expect(capped.truncated).toBe(true);
+
+    const whole = await searchGithubItems('/repo/dry-cap', 'issue', '1');
+    expect(whole.items).toHaveLength(3);
+    expect(whole.truncated).toBe(false);
+
+    // Still entirely offline — the fixture path must never reach the CLI.
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('degrades to {available:false, reason} instead of throwing when gh fails', async () => {
+    ghSpy((argv) => (argv[0] === 'repo' ? 'owner/n\n' : new Error('HTTP 403: rate limit exceeded')));
+
+    const res = await searchGithubItems('/repo/search-fail', 'pr', 'anything');
+    expect(res.available).toBe(false);
+    expect(res.reason).toContain('rate limit');
+    expect(res.items).toEqual([]);
+  });
+
+  it('reports a missing gh CLI with the same hint the list tier uses', async () => {
+    ghSpy(() => Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT' }));
+
+    const res = await searchGithubItems('/repo/search-enoent', 'pr', 'anything');
+    expect(res.available).toBe(false);
+    expect(res.reason).toContain('gh CLI not found');
+  });
+
+  it('degrades when the repo handle is not parseable, without attempting a search', async () => {
+    const argvs = ghSpy((argv) => (argv[0] === 'repo' ? 'not-a-slug/with/too/many/parts\n' : ''));
+
+    const res = await searchGithubItems('/repo/search-nohandle', 'pr', 'anything');
+    expect(res.available).toBe(false);
+    expect(res.reason).toContain('no GitHub remote');
+    expect(argvs.some((a) => a[0] === 'search')).toBe(false);
+  });
+
+  it('never shells out for an empty query', async () => {
+    const argvs = ghSpy(() => '');
+    const res = await searchGithubItems('/repo/search-empty', 'pr', '   ');
+    expect(res).toEqual({ available: true, items: [] });
+    expect(argvs).toEqual([]);
+  });
+
+  it('finds a merged PR that the open-only list never returns — the bug in #730', async () => {
+    execFileMock.mockImplementation((...args: unknown[]) => {
+      const argv = args[1] as string[];
+      const cb = args[args.length - 1] as (e: unknown, r: unknown) => void;
+      let stdout = '';
+      if (argv[0] === 'repo') stdout = 'owner/n\n';
+      // The list tier: `gh pr list` without --state returns OPEN PRs only, and #4507 is merged.
+      else if (argv[0] === 'pr' && argv[1] === 'list') stdout = '[]';
+      else if (argv[0] === 'issue' && argv[1] === 'list') stdout = '[]';
+      else if (argv[0] === 'pr' && argv[1] === 'view') {
+        stdout = JSON.stringify({
+          number: 4507,
+          title: 'a merged pr',
+          author: { login: 'someone' },
+          createdAt: '2026-07-25T07:08:17Z',
+          labels: [],
+          body: '',
+          url: 'https://github.com/owner/n/pull/4507',
+          isDraft: false,
+          additions: 0,
+          deletions: 0,
+        });
+      } else stdout = '{}';
+      cb(null, { stdout, stderr: '' });
+    });
+
+    const list = await fetchGithub('/repo/search-regression');
+    expect(list.prs.find((p) => p.number === 4507)).toBeUndefined();
+
+    const found = await searchGithubItems('/repo/search-regression', 'pr', '4507');
+    expect(found.items.map((i) => i.number)).toEqual([4507]);
   });
 });
 
@@ -1582,7 +2026,7 @@ describe('derivePrReferenceStatus', () => {
     expect(
       pr({ reviewDecision: 'CHANGES_REQUESTED', checks: 'passing', reviewRequested: true }),
     ).toBe('review-required');
-    // …even with the review timestamps saying the review is the newest thing that happened.
+    // …even with nothing pushed since, as long as the request itself POSTDATES the review.
     expect(
       pr({
         reviewDecision: 'CHANGES_REQUESTED',
@@ -1590,8 +2034,48 @@ describe('derivePrReferenceStatus', () => {
         reviewRequested: true,
         changesRequestedAt: '2026-08-11T12:00:00Z',
         headCommittedAt: '2026-08-11T09:00:00Z',
+        reviewRequestedAt: '2026-08-11T12:30:00Z',
       }),
     ).toBe('review-required');
+  });
+
+  it('does NOT read a reviewer asked BEFORE the review as an answer to it', () => {
+    // The reported case: three reviewers requested at once, one of them requested changes the
+    // next day, the other two never looked — so `reviewRequests.totalCount` stays 1 with nothing
+    // whatsoever having happened since. Counting that as the author re-requesting painted "Waiting
+    // for review" over a live rejection, which is the opposite of whose move it is.
+    expect(
+      pr({
+        reviewDecision: 'CHANGES_REQUESTED',
+        checks: 'passing',
+        reviewRequested: true,
+        reviewRequestedAt: '2026-08-18T10:28:43Z',
+        changesRequestedAt: '2026-08-19T11:00:27Z',
+        headCommittedAt: '2026-08-18T10:23:40Z',
+      }),
+    ).toBe('changes-requested');
+    // A stale request does not stop a PUSH from handing the ball back, though — that rule is
+    // untouched, and it is the one the reporter called fine.
+    expect(
+      pr({
+        reviewDecision: 'CHANGES_REQUESTED',
+        checks: 'passing',
+        reviewRequested: true,
+        reviewRequestedAt: '2026-08-18T10:28:43Z',
+        changesRequestedAt: '2026-08-19T11:00:27Z',
+        headCommittedAt: '2026-08-19T14:00:00Z',
+      }),
+    ).toBe('review-required');
+    // An undated request against a dated review is the unusable-pair case: conservative, so the
+    // chip keeps pointing at the author rather than dismissing a review on a guess.
+    expect(
+      pr({
+        reviewDecision: 'CHANGES_REQUESTED',
+        checks: 'passing',
+        reviewRequested: true,
+        changesRequestedAt: '2026-08-19T11:00:27Z',
+      }),
+    ).toBe('changes-requested');
   });
 
   it('hands it back on a PUSH too, for an author who re-requested nothing', () => {
@@ -1603,6 +2087,78 @@ describe('derivePrReferenceStatus', () => {
         headCommittedAt: '2026-08-11T12:00:00Z',
       }),
     ).toBe('review-required');
+    // One parent is an ordinary commit, stated or not — the count only ever rules a merge OUT.
+    expect(
+      pr({
+        reviewDecision: 'CHANGES_REQUESTED',
+        checks: 'passing',
+        changesRequestedAt: '2026-08-11T09:00:00Z',
+        headCommittedAt: '2026-08-11T12:00:00Z',
+        headParentCount: 1,
+      }),
+    ).toBe('review-required');
+  });
+
+  it('does NOT let "Update branch" clear a rejection — a merge answers nothing', () => {
+    // GitHub's Update-branch button writes `Merge branch 'main' into <branch>` dated NOW, newer
+    // than any review while addressing none of it. Shape confirmed on a real PR,
+    // whose head commit reports two parents. Counting it as a push would let the one click people
+    // make reflexively on a stale PR wipe a live rejection off the chip.
+    const updated = {
+      reviewDecision: 'CHANGES_REQUESTED' as const,
+      changesRequestedAt: '2026-08-11T09:00:00Z',
+      headCommittedAt: '2026-08-11T12:00:00Z',
+      headParentCount: 2,
+    };
+    expect(pr({ ...updated, checks: 'passing' })).toBe('changes-requested');
+    // An octopus merge is no more of an answer than a two-parent one.
+    expect(pr({ ...updated, checks: 'passing', headParentCount: 3 })).toBe('changes-requested');
+    // …but a re-request still hands the ball back, merge or no merge: that signal is the author
+    // SAYING they are done, where the merge only looks like it.
+    expect(
+      pr({ ...updated, checks: 'passing', reviewRequested: true, reviewRequestedAt: '2026-08-11T12:30:00Z' }),
+    ).toBe('review-required');
+  });
+
+  it('does NOT let a merge landing on top ERASE an answer the author already gave', () => {
+    // The other half of the merge rule, and the one that bites in practice: a merge is transparent,
+    // not disqualifying. Sequence — reviewer requests changes at 09:00; author pushes a real fix at
+    // 12:00 (chip correctly goes blue); the base moves on and the PR conflicts; the author presses
+    // this cockpit's own "Resolve conflicts" (or GitHub's "Update branch") at 15:00. Reading only
+    // the head would see a 2-parent commit, discard the 12:00 fix and flip the chip back to red,
+    // blaming an author who answered two steps ago. The merge's FIRST parent still carries 12:00.
+    expect(
+      pr({
+        reviewDecision: 'CHANGES_REQUESTED',
+        checks: 'passing',
+        changesRequestedAt: '2026-08-11T09:00:00Z',
+        headCommittedAt: '2026-08-11T15:00:00Z',
+        headParentCount: 2,
+        headFirstParentCommittedAt: '2026-08-11T12:00:00Z',
+      }),
+    ).toBe('review-required');
+    // The plain "Update branch" case is unchanged: nothing was pushed after the review, so the
+    // first parent is the pre-review commit and the rejection still stands.
+    expect(
+      pr({
+        reviewDecision: 'CHANGES_REQUESTED',
+        checks: 'passing',
+        changesRequestedAt: '2026-08-11T09:00:00Z',
+        headCommittedAt: '2026-08-11T15:00:00Z',
+        headParentCount: 2,
+        headFirstParentCommittedAt: '2026-08-11T06:00:00Z',
+      }),
+    ).toBe('changes-requested');
+    // A merge with no first-parent date is the unusable-pair case: conservative, review stands.
+    expect(
+      pr({
+        reviewDecision: 'CHANGES_REQUESTED',
+        checks: 'passing',
+        changesRequestedAt: '2026-08-11T09:00:00Z',
+        headCommittedAt: '2026-08-11T15:00:00Z',
+        headParentCount: 2,
+      }),
+    ).toBe('changes-requested');
   });
 
   it('still puts a red build above a waiting reviewer — they cannot approve it anyway', () => {
@@ -1620,7 +2176,7 @@ describe('derivePrReferenceStatus', () => {
   });
 
   it('lets an APPROVAL outrank a reviewer still listed as requested', () => {
-    // Real shape, from shopware/frontends#2574: approved, mergeable, green — and one reviewer left
+    // Real shape, observed live: approved, mergeable, green — and one reviewer left
     // on the request list after someone else approved. That is a courtesy ask, not an unmet gate,
     // and reading it as "waiting for review" would stick for as long as anyone stays listed, which
     // is indefinitely. A repo needing two approvals reports REVIEW_REQUIRED until it has both, so
@@ -1676,9 +2232,11 @@ describe('derivePrReferenceStatus', () => {
  * The whole combination space, checked against INVARIANTS rather than a second copy of the
  * ranking.
  *
- * The precedence has been edited three times — checks-pending above a requested change, the
- * re-request handoff, then `APPROVED` outranking a pending request — and each edit reordered
- * branches that the curated examples above only sample. Restating the expected answer for all 64
+ * The precedence has been edited five times — checks-pending above a requested change, the
+ * re-request handoff, `APPROVED` outranking a pending request, that handoff being narrowed to
+ * requests that postdate the review, then merge commits dropping out of the push rule — and each
+ * edit reordered branches that the curated examples above only sample. Restating the expected
+ * answer for all 256
  * combinations would just be the implementation written twice, and would agree with a bug as
  * readily as with a fix. These are the properties that must hold whatever the ordering is; a
  * future edit that violates one is a bug by construction.
@@ -1698,22 +2256,29 @@ describe('derivePrReferenceStatus over every combination', () => {
     'ready',
   ]);
 
-  /** Every open, non-draft shape: 4 check states × 4 decisions × requested × pushed-since. */
+  /** Every open, non-draft shape: 4 check states × 4 decisions × requested × pushed-since ×
+   *  request-postdates-the-review × head-is-a-merge. */
   const openRows = () => {
     const rows: Parameters<typeof derivePrReferenceStatus>[0][] = [];
     for (const checks of CHECKS) {
       for (const reviewDecision of DECISIONS) {
         for (const reviewRequested of BOOLS) {
           for (const pushed of BOOLS) {
-            rows.push({
-              state: 'OPEN',
-              isDraft: false,
-              reviewDecision,
-              checks,
-              reviewRequested,
-              changesRequestedAt: '2026-08-11T09:00:00Z',
-              headCommittedAt: pushed ? '2026-08-11T12:00:00Z' : '2026-08-11T06:00:00Z',
-            });
+            for (const reRequested of BOOLS) {
+              for (const merge of BOOLS) {
+                rows.push({
+                  state: 'OPEN',
+                  isDraft: false,
+                  reviewDecision,
+                  checks,
+                  reviewRequested,
+                  changesRequestedAt: '2026-08-11T09:00:00Z',
+                  headCommittedAt: pushed ? '2026-08-11T12:00:00Z' : '2026-08-11T06:00:00Z',
+                  reviewRequestedAt: reRequested ? '2026-08-11T12:00:00Z' : '2026-08-11T06:00:00Z',
+                  headParentCount: merge ? 2 : 1,
+                });
+              }
+            }
           }
         }
       }
@@ -1723,8 +2288,8 @@ describe('derivePrReferenceStatus over every combination', () => {
 
   const describeRow = (row: Parameters<typeof derivePrReferenceStatus>[0]) => JSON.stringify(row);
 
-  it('covers 64 open shapes', () => {
-    expect(openRows()).toHaveLength(64);
+  it('covers 256 open shapes', () => {
+    expect(openRows()).toHaveLength(256);
   });
 
   it('only ever answers with a PULL REQUEST status', () => {
@@ -1751,7 +2316,7 @@ describe('derivePrReferenceStatus over every combination', () => {
   });
 
   it('never blames the author once the forge says APPROVED', () => {
-    // The shopware/frontends#2574 class of bug: an approved PR must not read as waiting on a
+    // The approved-but-still-requested class of bug: an approved PR must not read as waiting on a
     // reviewer or owing edits, however many reviewers are still listed as requested.
     for (const row of openRows()) {
       const status = derivePrReferenceStatus({ ...row, reviewDecision: 'APPROVED' });
@@ -1764,6 +2329,33 @@ describe('derivePrReferenceStatus over every combination', () => {
       if (derivePrReferenceStatus(row) === 'changes-requested') {
         expect(row.reviewDecision, describeRow(row)).toBe('CHANGES_REQUESTED');
       }
+    }
+  });
+
+  it('never lets a request OLDER than the review dismiss that review', () => {
+    // The stale-review-request class of bug, as an invariant: with nothing pushed since and the
+    // standing request predating the review, no combination may report the ball as the reviewer's.
+    for (const row of openRows()) {
+      if (row.reviewDecision !== 'CHANGES_REQUESTED') continue;
+      if (row.checks === 'pending' || row.checks === 'failing') continue; // those outrank it by design
+      const stale =
+        row.headCommittedAt === '2026-08-11T06:00:00Z' && row.reviewRequestedAt === '2026-08-11T06:00:00Z';
+      if (!stale) continue;
+      expect(derivePrReferenceStatus(row), describeRow(row)).toBe('changes-requested');
+    }
+  });
+
+  it('never lets a MERGE at the head stand in for the author answering', () => {
+    // The "Update branch" class of bug, as an invariant: with a merge commit on top and no
+    // re-request, the head's date is irrelevant — a rejection stays a rejection however fresh the
+    // merge is. Only `reviewRequested` may overrule it, and it does so on its own merits.
+    for (const row of openRows()) {
+      if (row.reviewDecision !== 'CHANGES_REQUESTED') continue;
+      if (row.checks === 'pending' || row.checks === 'failing') continue; // those outrank it by design
+      if (row.headParentCount !== 2) continue;
+      const reRequested = row.reviewRequested === true && row.reviewRequestedAt === '2026-08-11T12:00:00Z';
+      if (reRequested) continue;
+      expect(derivePrReferenceStatus(row), describeRow(row)).toBe('changes-requested');
     }
   });
 
@@ -1823,13 +2415,20 @@ describe('fetchRefStatuses', () => {
   const prNode = (over: Record<string, unknown> = {}) => ({
     __typename: 'PullRequest',
     state: 'OPEN',
+    // What GitHub answers for a settled open PR. Defaulted so the cases below stay about
+    // STATUSES; the mergeability cases override it, and one of them omits it on purpose.
+    mergeable: 'MERGEABLE',
     isDraft: false,
     reviewDecision: null,
     commits: { nodes: [{ commit: { committedDate: '2026-08-11T12:00:00Z', statusCheckRollup: { state: 'SUCCESS' } } }] },
     reviews: { nodes: [] },
     reviewRequests: { totalCount: 0 },
+    timelineItems: { nodes: [] },
     ...over,
   });
+  /** A requested reviewer as both connections spell one. `Team` uses `slug` instead — see the
+   *  team test below. */
+  const reviewer = (login: string) => ({ __typename: 'User', login });
   const issueNode = (over: Record<string, unknown> = {}) => ({
     __typename: 'Issue',
     state: 'OPEN',
@@ -1849,7 +2448,7 @@ describe('fetchRefStatuses', () => {
     const { resolved: out } = await fetchRefStatuses(runGraphql, 'o', 'n', [7, 12, 3]);
     expect(runGraphql).toHaveBeenCalledTimes(1);
     expect(sent).toContain('issueOrPullRequest');
-    expect(out[7]).toEqual({ kind: 'pr', status: 'ready' });
+    expect(out[7]).toEqual({ kind: 'pr', status: 'ready', mergeable: 'mergeable' });
     expect(out[12]).toEqual({ kind: 'pr', status: 'merged' });
     expect(out[3]).toEqual({ kind: 'issue', status: 'not-planned' });
   });
@@ -1905,7 +2504,157 @@ describe('fetchRefStatuses', () => {
       });
     });
     expect((await fetchRefStatuses(runGraphql, 'o', 'n', [774])).resolved[774]?.status).toBe('review-required');
-    expect(sent).toContain('reviewRequests(first: 1) { totalCount }');
+    expect(sent).toContain('reviewRequests(first: 20) { totalCount');
+  });
+
+  it('carries the review-request DATE too, so an old request cannot dismiss a review', async () => {
+    // The reported PR's exact payload. The count alone is identical to the #774 shape
+    // above; only the timeline event tells the two apart, so it has to survive the query and the
+    // parse — dropping either would silently restore the bug.
+    let sent = '';
+    const runGraphql = vi.fn(async (query: string) => {
+      sent = query;
+      return reply({
+        r0: prNode({
+          reviewDecision: 'CHANGES_REQUESTED',
+          commits: {
+            nodes: [{ commit: { committedDate: '2026-08-18T10:23:40Z', statusCheckRollup: { state: 'SUCCESS' } } }],
+          },
+          reviews: { nodes: [{ submittedAt: '2026-08-19T11:00:27Z' }] },
+          reviewRequests: { totalCount: 1, nodes: [{ requestedReviewer: reviewer('carol') }] },
+          timelineItems: { nodes: [{ createdAt: '2026-08-18T10:28:43Z', requestedReviewer: reviewer('carol') }] },
+        }),
+      });
+    });
+    expect((await fetchRefStatuses(runGraphql, 'o', 'n', [2642])).resolved[2642]?.status).toBe('changes-requested');
+    expect(sent).toContain('itemTypes: [REVIEW_REQUESTED_EVENT]');
+  });
+
+  it('dates the request that STILL STANDS, not one that was made and then withdrawn', async () => {
+    // The two connections answer about different requests: `reviewRequests` is who is on the hook
+    // now, a `ReviewRequestedEvent` survives the request being withdrawn. Here carol was asked
+    // before the review and never looked (so she still stands), while dave was asked after it and
+    // then removed. Taking the newest event blindly would date the request from dave's withdrawn
+    // one, read the rejection as answered, and hide it behind "waiting for review" — the same bug
+    // one step rarer. Matching by reviewer keeps the date on a request that is really there.
+    const runGraphql = vi.fn(async () =>
+      reply({
+        r0: prNode({
+          reviewDecision: 'CHANGES_REQUESTED',
+          commits: {
+            nodes: [{ commit: { committedDate: '2026-08-18T10:00:00Z', statusCheckRollup: { state: 'SUCCESS' } } }],
+          },
+          reviews: { nodes: [{ submittedAt: '2026-08-19T11:00:00Z' }] },
+          reviewRequests: { totalCount: 1, nodes: [{ requestedReviewer: reviewer('carol') }] },
+          timelineItems: {
+            nodes: [
+              { createdAt: '2026-08-18T10:30:00Z', requestedReviewer: reviewer('carol') },
+              { createdAt: '2026-08-19T14:00:00Z', requestedReviewer: reviewer('dave') }, // withdrawn
+            ],
+          },
+        }),
+      }),
+    );
+    expect((await fetchRefStatuses(runGraphql, 'o', 'n', [7])).resolved[7]?.status).toBe('changes-requested');
+  });
+
+  it('hands the ball back when the STANDING reviewer is the one asked after the review', async () => {
+    // The mirror of the test above, so the correlation cannot pass by simply never matching:
+    // carol's own request postdates the review and still stands, which is a real re-request.
+    const runGraphql = vi.fn(async () =>
+      reply({
+        r0: prNode({
+          reviewDecision: 'CHANGES_REQUESTED',
+          commits: {
+            nodes: [{ commit: { committedDate: '2026-08-18T10:00:00Z', statusCheckRollup: { state: 'SUCCESS' } } }],
+          },
+          reviews: { nodes: [{ submittedAt: '2026-08-19T11:00:00Z' }] },
+          reviewRequests: { totalCount: 1, nodes: [{ requestedReviewer: reviewer('carol') }] },
+          timelineItems: { nodes: [{ createdAt: '2026-08-19T14:00:00Z', requestedReviewer: reviewer('carol') }] },
+        }),
+      }),
+    );
+    expect((await fetchRefStatuses(runGraphql, 'o', 'n', [7])).resolved[7]?.status).toBe('review-required');
+  });
+
+  it('matches a TEAM reviewer by slug, since a team carries no login', async () => {
+    const team = { __typename: 'Team', slug: 'platform' };
+    const runGraphql = vi.fn(async () =>
+      reply({
+        r0: prNode({
+          reviewDecision: 'CHANGES_REQUESTED',
+          commits: {
+            nodes: [{ commit: { committedDate: '2026-08-18T10:00:00Z', statusCheckRollup: { state: 'SUCCESS' } } }],
+          },
+          reviews: { nodes: [{ submittedAt: '2026-08-19T11:00:00Z' }] },
+          reviewRequests: { totalCount: 1, nodes: [{ requestedReviewer: team }] },
+          timelineItems: { nodes: [{ createdAt: '2026-08-19T14:00:00Z', requestedReviewer: team }] },
+        }),
+      }),
+    );
+    expect((await fetchRefStatuses(runGraphql, 'o', 'n', [7])).resolved[7]?.status).toBe('review-required');
+  });
+
+  it('carries the head commit\'s PARENT COUNT, so "Update branch" cannot clear a review', async () => {
+    // A real "Update branch" head's shape: a `Merge branch 'main' into <branch>` head reporting two
+    // parents. `parents(first: 0)` asks for the count and no parent — if the query or the parse
+    // dropped it, the merge would read as a push and the chip would go blue on a rejected PR.
+    let sent = '';
+    const runGraphql = vi.fn(async (query: string) => {
+      sent = query;
+      return reply({
+        r0: prNode({
+          reviewDecision: 'CHANGES_REQUESTED',
+          commits: {
+            nodes: [
+              {
+                commit: {
+                  committedDate: '2026-08-19T15:00:00Z',
+                  parents: { totalCount: 2 },
+                  statusCheckRollup: { state: 'SUCCESS' },
+                },
+              },
+            ],
+          },
+          reviews: { nodes: [{ submittedAt: '2026-08-19T11:00:27Z' }] },
+        }),
+      });
+    });
+    expect((await fetchRefStatuses(runGraphql, 'o', 'n', [2639])).resolved[2639]?.status).toBe('changes-requested');
+    // `first: 1`, not `first: 0`: the first parent's date is what a merge answers WITH.
+    expect(sent).toContain('parents(first: 1) { totalCount nodes { committedDate } }');
+  });
+
+  it('reads an absent parent count as an ORDINARY commit, so a real push still counts', async () => {
+    // The push rule is the common path; a field GitHub declined to send must not switch it off.
+    const runGraphql = vi.fn(async () =>
+      reply({
+        r0: prNode({
+          reviewDecision: 'CHANGES_REQUESTED',
+          commits: {
+            nodes: [{ commit: { committedDate: '2026-08-19T15:00:00Z', statusCheckRollup: { state: 'SUCCESS' } } }],
+          },
+          reviews: { nodes: [{ submittedAt: '2026-08-19T11:00:27Z' }] },
+        }),
+      }),
+    );
+    expect((await fetchRefStatuses(runGraphql, 'o', 'n', [7])).resolved[7]?.status).toBe('review-required');
+  });
+
+  it('reads an absent timeline as an UNDATED request, not as a fresh one', async () => {
+    // Same defensive shape as the missing `reviewRequests` below: an omitted field must not invent
+    // a re-request and dismiss a review that is still about the code on screen.
+    const runGraphql = vi.fn(async () =>
+      reply({
+        r0: prNode({
+          reviewDecision: 'CHANGES_REQUESTED',
+          reviews: { nodes: [{ submittedAt: '2026-08-19T11:00:27Z' }] },
+          reviewRequests: { totalCount: 1 },
+          timelineItems: null,
+        }),
+      }),
+    );
+    expect((await fetchRefStatuses(runGraphql, 'o', 'n', [7])).resolved[7]?.status).toBe('changes-requested');
   });
 
   it('reads an absent reviewRequests as nobody waiting, not as somebody', async () => {
@@ -1947,6 +2696,61 @@ describe('fetchRefStatuses', () => {
     expect(await fetchRefStatuses(runGraphql, 'o', 'n', [])).toEqual({ resolved: {}, failed: [] });
     expect(runGraphql).not.toHaveBeenCalled();
   });
+
+  it('carries mergeability as its OWN axis, on the same query and without touching the status', async () => {
+    // The reported case: green, nobody waited on, and GitHub refusing to merge it. `ready` is
+    // still the honest answer to "whose move is it on the review" — the conflict is the second
+    // fact, and it rides the same aliased node, so it costs no extra request.
+    let sent = '';
+    const runGraphql = vi.fn(async (query: string) => {
+      sent = query;
+      return reply({ r0: prNode({ mergeable: 'CONFLICTING' }) });
+    });
+    const { resolved: out } = await fetchRefStatuses(runGraphql, 'o', 'n', [7]);
+
+    expect(runGraphql).toHaveBeenCalledTimes(1);
+    expect(sent).toContain('mergeable');
+    expect(out[7]).toEqual({ kind: 'pr', status: 'ready', mergeable: 'conflicting' });
+  });
+
+  it('keeps "still computing" apart from "merges cleanly" instead of collapsing both to false', async () => {
+    // `UNKNOWN` is what GitHub answers while it computes — seconds after every push — so treating
+    // it as a conflict would flash an orange chip on half the pushes in the repo. Treating it as
+    // CLEAN is the bug this axis was reported for a second time: it is not an answer, and it has
+    // to survive as far as the cache, which asks again in seconds rather than in a minute.
+    const runGraphql = vi.fn(async () =>
+      reply({
+        r0: prNode({ mergeable: 'UNKNOWN' }),
+        r1: prNode({ mergeable: 'MERGEABLE' }),
+        r2: prNode({ mergeable: null }),
+        // The field omitted entirely — `prNode` defaults it, so this strips it back off.
+        r3: { ...prNode(), mergeable: undefined },
+      }),
+    );
+    const { resolved: out } = await fetchRefStatuses(runGraphql, 'o', 'n', [7, 8, 9, 10]);
+
+    expect(out[7]?.mergeable).toBe('unknown');
+    expect(out[8]?.mergeable).toBe('mergeable');
+    // A field GitHub omitted, or nulled, is not a statement that the branch is clean.
+    expect(out[9]?.mergeable).toBe('unknown');
+    expect(out[10]?.mergeable).toBe('unknown');
+  });
+
+  it('never calls a merged or closed pull request conflicting', async () => {
+    // GitHub reports UNKNOWN on a terminal PR, but a stale CONFLICTING would be worse than
+    // useless: there is nothing left to resolve, and the chip would contradict `merged`.
+    const runGraphql = vi.fn(async () =>
+      reply({
+        r0: prNode({ state: 'MERGED', mergeable: 'CONFLICTING' }),
+        r1: prNode({ state: 'CLOSED', mergeable: 'CONFLICTING' }),
+      }),
+    );
+    const { resolved: out } = await fetchRefStatuses(runGraphql, 'o', 'n', [7, 8]);
+
+    // No `mergeable` at all — the question does not apply, which is not the same as answering it.
+    expect(out[7]).toEqual({ kind: 'pr', status: 'merged' });
+    expect(out[8]).toEqual({ kind: 'pr', status: 'closed' });
+  });
 });
 
 /** The route-facing wrapper: one repo-handle lookup, then one batched query for the misses, and
@@ -1981,6 +2785,48 @@ describe('fetchGithubRefStatus', () => {
     const second = await fetchGithubRefStatus('/repo/ref-status-cache', { prs: [7] });
     expect(second.available && second.prs[7]).toBe('merged');
     expect(execFileMock.mock.calls.length).toBe(calls); // nothing spawned the second time
+  });
+
+  it('names the conflicting pull requests beside the statuses, and only those', async () => {
+    // Both axes in one answer: #7 is `ready` AND unmergeable, #8 is merely ready. `conflicts` is
+    // a list rather than a map because the empty case is the normal one.
+    stubGh(
+      JSON.stringify({
+        data: {
+          repository: {
+            r0: { __typename: 'PullRequest', state: 'OPEN', isDraft: false, reviewDecision: null, mergeable: 'CONFLICTING', commits: { nodes: [] } },
+            r1: { __typename: 'PullRequest', state: 'OPEN', isDraft: false, reviewDecision: null, mergeable: 'MERGEABLE', commits: { nodes: [] } },
+          },
+        },
+      }),
+    );
+    const out = await fetchGithubRefStatus('/repo/ref-status-conflicts', { prs: [7, 8] });
+
+    expect(out.available).toBe(true);
+    if (!out.available) throw new Error('expected available');
+    expect(out.prs[7]).toBe('ready');
+    expect(out.prs[8]).toBe('ready');
+    expect(out.conflicts).toEqual([7]);
+  });
+
+  it('remembers the conflict alongside the status, so a cached answer still carries both', async () => {
+    // The cache stores the resolved reference, not the payload — a second read that spawns
+    // nothing must not quietly lose the axis the first one learned.
+    stubGh(
+      JSON.stringify({
+        data: {
+          repository: {
+            r0: { __typename: 'PullRequest', state: 'OPEN', isDraft: false, reviewDecision: null, mergeable: 'CONFLICTING', commits: { nodes: [] } },
+          },
+        },
+      }),
+    );
+    await fetchGithubRefStatus('/repo/ref-status-conflict-cache', { prs: [7] });
+    const calls = execFileMock.mock.calls.length;
+    const cached = await fetchGithubRefStatus('/repo/ref-status-conflict-cache', { prs: [7] });
+
+    expect(execFileMock.mock.calls.length).toBe(calls);
+    expect(cached.available && cached.conflicts).toEqual([7]);
   });
 
   it('keeps every good alias when gh exits non-zero on a PARTIAL failure', async () => {
@@ -2046,6 +2892,7 @@ describe('fetchGithubRefStatus', () => {
               state,
               isDraft: false,
               reviewDecision: null,
+              mergeable: 'MERGEABLE',
               commits: { nodes: [{ commit: { committedDate: '2026-08-11T12:00:00Z', statusCheckRollup: rollup ? { state: rollup } : null } }] },
               reviews: { nodes: [] },
             },
@@ -2083,6 +2930,7 @@ describe('fetchGithubRefStatus', () => {
               state,
               isDraft: false,
               reviewDecision: null,
+              mergeable: 'MERGEABLE',
               commits: { nodes: [{ commit: { committedDate: '2026-08-11T12:00:00Z', statusCheckRollup: rollup ? { state: rollup } : null } }] },
               reviews: { nodes: [] },
             },
@@ -2112,7 +2960,7 @@ describe('fetchGithubRefStatus', () => {
         data: {
           repository: {
             r0: { __typename: 'PullRequest', state: 'MERGED', isDraft: false, reviewDecision: null, commits: { nodes: [] }, reviews: { nodes: [] } },
-            r1: { __typename: 'PullRequest', state: 'OPEN', isDraft: false, reviewDecision: null, commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] }, reviews: { nodes: [] } },
+            r1: { __typename: 'PullRequest', state: 'OPEN', isDraft: false, reviewDecision: null, mergeable: 'MERGEABLE', commits: { nodes: [{ commit: { statusCheckRollup: { state: 'PENDING' } } }] }, reviews: { nodes: [] } },
           },
         },
       }),
@@ -2120,6 +2968,71 @@ describe('fetchGithubRefStatus', () => {
     return fetchGithubRefStatus('/repo/recheck-mixed', { prs: [7, 8] }).then((out) => {
       expect(out.recheckAfterMs).toBe(60_000);
     });
+  });
+
+  // The reported regression, and the reason mergeability is a tri-state rather than a boolean:
+  // GitHub COMPUTES it when asked and answers `UNKNOWN` while the job runs, which is the normal
+  // reply for the first seconds after every push. Cached as an answer for the usual minute, that
+  // is a conflicting pull request wearing "Ready to merge" until the page is reloaded.
+  const unknownMergeability = (mergeable: string | null) =>
+    JSON.stringify({
+      data: {
+        repository: {
+          r0: {
+            __typename: 'PullRequest',
+            state: 'OPEN',
+            isDraft: false,
+            reviewDecision: null,
+            mergeable,
+            commits: { nodes: [{ commit: { statusCheckRollup: { state: 'SUCCESS' } } }] },
+            reviews: { nodes: [] },
+          },
+        },
+      },
+    })
+
+  it('comes back in seconds while GitHub is still computing mergeability, not in a minute', async () => {
+    stubGh(unknownMergeability('UNKNOWN'));
+    const out = await fetchGithubRefStatus('/repo/mergeability-unknown', { prs: [7] });
+
+    expect(out.available).toBe(true);
+    if (!out.available) throw new Error('expected available');
+    // The status itself is settled and would hold for a minute; the OTHER axis is what is still
+    // moving, and the batch travels at the speed of its most impatient member.
+    expect(out.prs[7]).toBe('ready');
+    expect(out.conflicts).toEqual([]);
+    expect(out.recheckAfterMs).toBe(5_000);
+  });
+
+  it('and does not cache that non-answer for the usual minute either', async () => {
+    stubGh(unknownMergeability('UNKNOWN'));
+    await fetchGithubRefStatus('/repo/mergeability-recheck', { prs: [7] });
+    const calls = execFileMock.mock.calls.length;
+
+    // Six seconds later the computation has landed. The cache must not still be serving the
+    // shrug — this is the read that used to answer "no conflicts" for another 54 seconds.
+    vi.advanceTimersByTime(6_000);
+    stubGh(unknownMergeability('CONFLICTING'));
+    const second = await fetchGithubRefStatus('/repo/mergeability-recheck', { prs: [7] });
+
+    expect(execFileMock.mock.calls.length).toBeGreaterThan(calls);
+    expect(second.available && second.conflicts).toEqual([7]);
+    // Answered now, so back to the ordinary cadence.
+    expect(second.available && second.recheckAfterMs).toBe(60_000);
+  });
+
+  it('gives up the fast cadence for a forge that never answers, instead of polling forever', async () => {
+    // A five-second poll that outlives the computation it was waiting for is a `gh` subprocess
+    // every five seconds, indefinitely, for a repository that is simply never going to say.
+    stubGh(unknownMergeability('UNKNOWN'));
+    await fetchGithubRefStatus('/repo/mergeability-stuck', { prs: [7] });
+
+    // Past the window, still unknown: the impatience is measured from the FIRST such answer, so
+    // it cannot be renewed by the answers that kept it going.
+    vi.advanceTimersByTime(61_000);
+    const later = await fetchGithubRefStatus('/repo/mergeability-stuck', { prs: [7] });
+
+    expect(later.available && later.recheckAfterMs).toBe(60_000);
   });
 
   it('asks the cockpit to back off rather than hammer a forge that is not there', async () => {
@@ -2242,5 +3155,237 @@ describe('refNumberFromUrl', () => {
     expect(refNumberFromUrl('https://example.com/')).toBeNull();
     expect(refNumberFromUrl('')).toBeNull();
     expect(refNumberFromUrl('https://github.com/o/r/pull/0')).toBeNull();
+  });
+});
+
+/**
+ * The merge panel's own read (#969).
+ *
+ * `statusCheckRollup` used to ride along in the one `gh pr view` call that also carried
+ * `mergeable`, `mergeStateStatus` and `reviewDecision`. Under a fine-grained PAT the rollup's
+ * `CheckRun` contexts are unreadable — `gh` exits 1 with EMPTY stdout, one GraphQL error per
+ * context — so the whole call was lost and the panel reported `available: false` for every PR,
+ * hiding three fields the same token reads fine. No permission fixes that: a check run needs the
+ * `checks` scope and fine-grained PATs have no Checks permission at all.
+ *
+ * These drive the real `gh` argv through `execFileMock`, so they assert the split itself, not a
+ * paraphrase of it.
+ */
+describe('fetchPrMergeState and an unreadable statusCheckRollup (#969)', () => {
+  const repoRef = { owner: 'acme', repo: 'demo' };
+  const CORE_FIELDS = 'number,title,url,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,reviewDecision';
+  const corePr = {
+    number: 353,
+    title: 'Ship it',
+    url: 'https://github.com/acme/demo/pull/353',
+    state: 'OPEN',
+    isDraft: false,
+    headRefName: 'feat/ship',
+    baseRefName: 'main',
+    headRefOid: 'a'.repeat(40),
+    mergeable: 'MERGEABLE',
+    mergeStateStatus: 'CLEAN',
+    reviewDecision: 'APPROVED',
+  };
+  const policy = { allow_merge_commit: true, allow_squash_merge: true, allow_rebase_merge: true };
+
+  /** Exactly what the issue recorded: exit 1, empty stdout, the permission error on stderr. */
+  const notAccessible = (command: string) =>
+    Object.assign(
+      new Error(`Command failed: ${command}\nGraphQL: Resource not accessible by personal access token`),
+      { code: 1, stdout: '', stderr: '' },
+    );
+
+  const aggregate = (state: string | null) => ({
+    data: { repository: { p0: { commits: { nodes: [{ commit: { statusCheckRollup: state === null ? null : { state } } }] } } } },
+  });
+
+  /** Every `gh` argv the merge-state read makes, routed by the call it actually is. A route left
+   *  out answers the way a fine-grained PAT does: unreadable. */
+  function routeGh(routes: {
+    core?: () => unknown;
+    detail?: () => unknown;
+    aggregate?: () => unknown;
+    protection?: () => unknown;
+  }) {
+    const calls: string[] = [];
+    execFileMock.mockImplementation((...args: unknown[]) => {
+      const argv = args[1] as string[];
+      const cb = args[args.length - 1] as (e: unknown, r: unknown) => void;
+      calls.push(argv.join(' '));
+      const answer = (produce: () => unknown) => {
+        let value: unknown;
+        try {
+          value = produce();
+        } catch (err) {
+          return cb(err, { stdout: '', stderr: '' });
+        }
+        return cb(null, { stdout: typeof value === 'string' ? value : JSON.stringify(value), stderr: '' });
+      };
+      if (argv[0] === 'pr' && argv[1] === 'view') {
+        const fields = argv[argv.indexOf('--json') + 1] ?? '';
+        if (fields === 'statusCheckRollup') {
+          return answer(routes.detail ?? (() => { throw notAccessible(`gh pr view 353 --json statusCheckRollup`); }));
+        }
+        return answer(routes.core ?? (() => corePr));
+      }
+      if (argv[0] === 'api' && argv[1] === 'graphql') {
+        return answer(routes.aggregate ?? (() => { throw notAccessible('gh api graphql'); }));
+      }
+      if (argv[0] === 'api' && (argv[1] ?? '').includes('/protection/')) {
+        return answer(routes.protection ?? (() => { throw notAccessible('gh api …/protection/required_status_checks'); }));
+      }
+      if (argv[0] === 'api') return answer(() => policy);
+      return cb(new Error(`unexpected gh ${argv.join(' ')}`), null);
+    });
+    return calls;
+  }
+
+  beforeEach(() => {
+    vi.stubEnv('CEZ_DRY_RUN', ''); // dry-run short-circuits the whole gh path under test
+    execFileMock.mockReset();
+    __clearMergeStateCacheForTests();
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('never asks the core call for statusCheckRollup', async () => {
+    const calls = routeGh({ detail: () => ({ statusCheckRollup: [] }) });
+
+    await fetchPrMergeState('/repo/split', repoRef, 353);
+
+    const coreCall = calls.find((c) => c.includes(CORE_FIELDS));
+    expect(coreCall).toBeDefined();
+    expect(coreCall).not.toContain('statusCheckRollup');
+    expect(calls).toContain('pr view 353 --json statusCheckRollup');
+  });
+
+  it('keeps mergeable, mergeStateStatus and reviewDecision when the rollup detail is unreadable', async () => {
+    // The fine-grained-PAT shape: detail exits 1 with empty stdout, the aggregate state is readable.
+    routeGh({ aggregate: () => aggregate('SUCCESS') });
+
+    const out = await fetchPrMergeState('/repo/fine-grained', repoRef, 353);
+
+    expect(out.available).toBe(true);
+    if (!out.available) throw new Error('expected the merge state to survive');
+    expect(out.mergeState.mergeable).toBe('mergeable');
+    expect(out.mergeState.reviewDecision).toBe('approved');
+    expect(out.mergeState.methods).toEqual(['squash', 'merge', 'rebase']);
+    expect(out.mergeState.headSha).toBe('a'.repeat(40));
+  });
+
+  it('degrades the check tier to the readable aggregate rollup rather than losing it', async () => {
+    routeGh({ aggregate: () => aggregate('SUCCESS') });
+
+    const out = await fetchPrMergeState('/repo/aggregate-ok', repoRef, 353);
+
+    if (!out.available) throw new Error('expected the merge state to survive');
+    expect(out.mergeState.checksTier).toBe('aggregate');
+    expect(out.mergeState.checks).toEqual([{ name: AGGREGATE_CHECK_NAME, state: 'passing', required: null }]);
+    expect(out.mergeState.checksReason).toContain('Resource not accessible by personal access token');
+  });
+
+  it('still blocks on a red CI it could only read in aggregate', async () => {
+    routeGh({ aggregate: () => aggregate('FAILURE'), protection: () => ['ci'] });
+
+    const out = await fetchPrMergeState('/repo/aggregate-red', repoRef, 353);
+
+    if (!out.available) throw new Error('expected the merge state to survive');
+    expect(out.mergeState.checks[0]?.state).toBe('failing');
+    // One row standing for every check, required ones included — requiredness is unknowable, and
+    // `false` would read as "not required" even with branch protection readable.
+    expect(out.mergeState.checks[0]?.required).toBeNull();
+    expect(out.mergeState.eligibility).toBe('blocked');
+    expect(out.mergeState.blockers.map((b) => b.code)).toContain('checks-failing');
+    expect(out.mergeState.canMerge).toBe(false);
+  });
+
+  it('says so, rather than "no checks", when neither tier is readable', async () => {
+    // Empty `checks` with a `detailed` tier means "this PR has no CI"; here it means "we never
+    // found out", and that must never read as ready to merge.
+    routeGh({ protection: () => ['ci'] });
+
+    const out = await fetchPrMergeState('/repo/both-dark', repoRef, 353);
+
+    if (!out.available) throw new Error('expected the merge state to survive');
+    expect(out.mergeState.checksTier).toBe('none');
+    expect(out.mergeState.checks).toEqual([]);
+    expect(out.mergeState.eligibility).toBe('unknown');
+    expect(out.mergeState.blockers.map((b) => b.code)).toContain('checks-unknown');
+    expect(out.mergeState.canMerge).toBe(false);
+    expect(out.mergeState.canOverride).toBe(true); // a human may still merge deliberately
+  });
+
+  it('reports a head with no CI as no CI, not as an unreadable tier', async () => {
+    routeGh({ aggregate: () => aggregate(null), protection: () => ['ci'] });
+
+    const out = await fetchPrMergeState('/repo/no-ci', repoRef, 353);
+
+    if (!out.available) throw new Error('expected the merge state to survive');
+    expect(out.mergeState.checksTier).toBe('aggregate');
+    expect(out.mergeState.checks).toEqual([]);
+    expect(out.mergeState.blockers.map((b) => b.code)).not.toContain('checks-unknown');
+  });
+
+  it('keeps the full per-check detail on a token that can read it', async () => {
+    // The classic-token shape — nothing about the split may cost the readable case its rows.
+    routeGh({
+      protection: () => ['lint · typecheck · build'],
+      detail: () => ({
+        statusCheckRollup: [
+          { name: 'lint · typecheck · build', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'https://github.com/acme/demo/actions/runs/1' },
+          { name: 'unit tests (1/3)', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'https://github.com/acme/demo/actions/runs/2' },
+        ],
+      }),
+    });
+
+    const out = await fetchPrMergeState('/repo/classic', repoRef, 353);
+
+    if (!out.available) throw new Error('expected the merge state to survive');
+    expect(out.mergeState.checksTier).toBe('detailed');
+    expect(out.mergeState.checksReason).toBeUndefined();
+    expect(out.mergeState.checks).toEqual([
+      { name: 'lint · typecheck · build', state: 'passing', required: true, url: 'https://github.com/acme/demo/actions/runs/1' },
+      { name: 'unit tests (1/3)', state: 'passing', required: false, url: 'https://github.com/acme/demo/actions/runs/2' },
+    ]);
+    expect(out.mergeState.eligibility).toBe('ready');
+    expect(out.mergeState.canMerge).toBe(true);
+  });
+
+  it('never queries the aggregate fallback when the detail call succeeded', async () => {
+    const calls = routeGh({ detail: () => ({ statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }] }) });
+
+    await fetchPrMergeState('/repo/no-wasted-call', repoRef, 353);
+
+    expect(calls.some((c) => c.startsWith('api graphql'))).toBe(false);
+  });
+
+  it('still reports the whole state unavailable when the CORE call fails', async () => {
+    // The split narrows what counts as fatal; it does not paper over a genuinely failed read.
+    routeGh({ core: () => { throw notAccessible('gh pr view 353'); } });
+
+    const out = await fetchPrMergeState('/repo/core-fails', repoRef, 353);
+
+    expect(out.available).toBe(false);
+    if (out.available) throw new Error('expected unavailable');
+    expect(out.reason).toContain('Resource not accessible by personal access token');
+  });
+});
+
+describe('whyLine', () => {
+  it('skips the "Command failed" preamble and reports what actually went wrong', () => {
+    expect(
+      whyLine('Command failed: gh pr view 353 --json statusCheckRollup\nGraphQL: Resource not accessible by personal access token'),
+    ).toBe('GraphQL: Resource not accessible by personal access token');
+  });
+
+  it('falls back to the preamble when the failure said nothing else', () => {
+    expect(whyLine('Command failed: gh pr view 353')).toBe('Command failed: gh pr view 353');
+  });
+
+  it('answers something for an empty message', () => {
+    expect(whyLine('')).toBe('gh failed');
+    expect(whyLine('\n  \n')).toBe('gh failed');
   });
 });

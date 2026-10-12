@@ -26,7 +26,8 @@ export const githubItemSchema = z.object({
   author: z.string(),
   createdAt: z.string(),
   labels: z.array(z.string()),
-  body: z.string(),
+  /** Deprecated in the list tier; hydrated through the detail endpoint when omitted. */
+  body: z.string().optional(),
   url: z.string(),
   comments: z.number(),
   /** PRs only. */
@@ -54,8 +55,21 @@ export const githubDataSchema = z.object({
   prs: z.array(githubItemSchema),
   /** Repo-wide label name → 6-hex color (no `#`); lets chips tint like GitHub. Additive. */
   labelColors: z.record(z.string(), z.string()).optional(),
+  issuesTotal: z.number().int().nonnegative().optional(),
+  prsTotal: z.number().int().nonnegative().optional(),
+  issuesNextCursor: z.string().nullable().optional(),
+  prsNextCursor: z.string().nullable().optional(),
 });
 export type GithubData = z.infer<typeof githubDataSchema>;
+
+/** Query for the cursor-paged open GitHub list. Cursor values are opaque to clients. */
+export const githubListQuerySchema = z.object({
+  limit: z.string().optional(),
+  refresh: z.string().optional(),
+  issuesCursor: z.string().max(2_000).optional(),
+  prsCursor: z.string().max(2_000).optional(),
+});
+export type GithubListQuery = z.infer<typeof githubListQuerySchema>;
 
 /**
  * `GET /api/v1/github/checks?prs=…` (#664) — lazy PR checks glyphs, `number → glyph`. The list
@@ -73,6 +87,33 @@ export const githubChecksDataSchema = z.discriminatedUnion('available', [
   }),
 ]);
 export type GithubChecksData = z.infer<typeof githubChecksDataSchema>;
+
+/**
+ * `GET /api/v1/github/search?kind=…&q=…&limit=…` (#730) — issues/PRs in ANY state.
+ *
+ * `GET /api/v1/github` lists the OPEN set only, and the tab's search is an in-memory filter over
+ * exactly that payload, so a closed or merged item is not "outside the fetched window" — it was
+ * never fetched, and nothing the user types can reach it. This is the cross-state lookup the tab
+ * falls back to.
+ *
+ * Not a discriminated union, like `githubDataSchema` and unlike `githubChecksDataSchema`: the
+ * driver always answers the full record and merely flips `available`, so an unavailable payload
+ * still carries `items: []`.
+ */
+export const githubSearchDataSchema = z.object({
+  available: z.boolean(),
+  /** Why it could not search (`gh` missing, no remote, rate-limited…). A hint, never an error. */
+  reason: z.string().optional(),
+  /** The same rows the list ships. `checks` is always `null` here — hydrated lazily through
+   *  `/github/checks`, exactly as list rows have been since #664. */
+  items: z.array(githubItemSchema),
+  /** The hit list filled the server's cap; there may be more matches on the forge. */
+  truncated: z.boolean().optional(),
+  /** Label name → 6-hex color for the labels these hits carry. A closed item often wears labels
+   *  no open one does, which the repo-wide map from the list call would not cover. Additive. */
+  labelColors: z.record(z.string(), z.string()).optional(),
+});
+export type GithubSearchData = z.infer<typeof githubSearchDataSchema>;
 
 /**
  * Where a referenced PR or issue STANDS — the vocabulary a task's tracker chip paints.
@@ -151,6 +192,26 @@ export const githubRefStatusDataSchema = z.discriminatedUnion('available', [
     available: z.literal(true),
     prs: z.record(z.number(), referenceStatusSchema),
     issues: z.record(z.number(), referenceStatusSchema),
+    /**
+     * The pull request numbers that do NOT merge cleanly into their base right now.
+     *
+     * A second list rather than a twelfth status, because a conflict is a different AXIS from the
+     * one `referenceStatusSchema` ranks. That enum answers *whose move is it*, and it answers with
+     * one word; mergeability is an independent fact that can be true alongside any of them — a PR
+     * can be green, approved and conflicting at the same time, and folding the two together would
+     * force the cockpit to pick which of two true things to say. Kept apart, it paints a second
+     * chip next to the first and says both.
+     *
+     * It rides the same GraphQL node the statuses come from (`mergeable`), so unlike
+     * `githubPrMergeStateResponseSchema` — the full per-PR probe, blockers and all — it costs no
+     * extra request for the batch.
+     *
+     * Optional on the wire, and its absence means *nothing is known about mergeability*, never
+     * *no conflicts*: a server from before this field simply omits it. Only OPEN pull requests are
+     * ever named — GitHub reports `UNKNOWN` for merged and closed ones, and `UNKNOWN` (which is
+     * also what it answers while it is still computing) is never listed.
+     */
+    conflicts: z.array(z.number()).optional(),
     recheckAfterMs: recheckAfterMsSchema,
   }),
   z.object({
@@ -238,6 +299,11 @@ export const githubCommentsDataSchema = z.object({
   /** Timeline events (#525) — additive; absent when the server degraded to the legacy
    *  comments-only fetch. Capped independently of `comments`. */
   events: z.array(githubTimelineEventSchema).optional(),
+  detail: z.object({
+    body: z.string(),
+    additions: z.number().int().nonnegative().optional(),
+    deletions: z.number().int().nonnegative().optional(),
+  }).optional(),
 });
 export type GithubCommentsData = z.infer<typeof githubCommentsDataSchema>;
 
@@ -266,6 +332,16 @@ export const githubPrMergeStateSchema = z.object({
   mergeable: z.enum(['mergeable', 'conflicting', 'unknown']),
   reviewDecision: z.enum(['approved', 'changes-requested', 'review-required', 'unknown']),
   checks: z.array(githubPrCheckSchema),
+  /**
+   * How much of the check tier the forge token could read (#969). `detailed` = one row per check;
+   * `aggregate` = only the rolled-up state was readable, collapsed into a single row (a
+   * fine-grained PAT lands here — `statusCheckRollup`'s `CheckRun` contexts need the `checks`
+   * scope, which fine-grained PATs cannot grant, while `statusCheckRollup { state }` stays
+   * readable); `none` = nothing was, so an empty `checks` means "never found out", not "no CI".
+   */
+  checksTier: z.enum(['detailed', 'aggregate', 'none']),
+  /** Why the check tier degraded. Absent when `checksTier` is `detailed`. */
+  checksReason: z.string().optional(),
   methods: z.array(githubMergeMethodSchema),
   defaultMethod: githubMergeMethodSchema.nullable(),
   eligibility: z.enum(['ready', 'blocked', 'pending', 'unauthorized', 'terminal', 'unknown']),
