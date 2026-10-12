@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProviderAuthService, type ProviderId } from '../core/provider-auth.ts';
+import type { RunnerId } from '../core/agent-runner.ts';
 import { RunStore } from '../runs/store.ts';
 import { defaultWorkspaceConfig, type WorkspaceConfig } from '../workspace/config.ts';
 import { mergeWriteAgentAccounts } from '../workspace/agent-accounts.ts';
@@ -10,9 +11,29 @@ import type { RunManager } from '../workflows/run.ts';
 import { openInTerminal } from './open-in-terminal.ts';
 import { apiRequest } from './loopback-request.testkit.ts';
 
+// The claude binary these cases assert on is discovered from the real machine, so without a pin
+// the handoff command would be whatever the DEVELOPER has — `'/Users/x/.local/bin/claude' --resume
+// …` on a host installed by `install.sh`, a bare `claude` on CI. `claudeShellCommand` is pinned
+// alongside `resolveClaudeBin` because it is what `open-in-app.ts` and `server.ts` call, and a
+// mock of one does not reach the other's in-module use of it. Discovery itself is covered by
+// `claude-bin.test.ts`, and the handoff's own use of it by `open-in-app-claude-bin.test.ts`.
+vi.mock('../core/claude-bin.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../core/claude-bin.ts')>()),
+  resolveClaudeBin: () => process.env.CEZ_CLAUDE_BIN ?? 'claude',
+  claudeShellCommand: () => process.env.CEZ_CLAUDE_BIN ?? null,
+}));
+
 // The terminal launcher actually spawns a process (osascript/cmd/x-terminal-emulator) — mocked
 // so this suite exercises only the command construction, never a real terminal window.
 vi.mock('./open-in-terminal.js', () => ({ openInTerminal: vi.fn(async () => true) }));
+
+// Junie has no read-only auth-status command, so `ProviderAuthService` probes it through a real
+// ACP session instead of `runCommand`. Left unmocked, every status probe in this suite spawned a
+// real `junie` process — on a machine with Junie installed and logged in, that authenticates
+// against JetBrains for real per test case (#M3 review).
+vi.mock('../core/junie-auth-probe.ts', () => ({
+  probeJunieAuthentication: vi.fn(async () => ({ connected: true })),
+}));
 
 const mockOpenInTerminal = vi.mocked(openInTerminal);
 
@@ -21,11 +42,24 @@ const { createApp } = await import('./server.ts');
 const providerAuth = (disconnected: ProviderId[] = []) => new ProviderAuthService({
   platform: 'linux',
   runCommand: async (executable) => {
-    const provider = executable === 'claude' ? 'claude' : executable === 'codex' ? 'codex' : 'opencode';
+    const provider = executable === 'claude'
+      ? 'claude'
+      : executable === 'codex'
+        ? 'codex'
+        : executable === 'opencode'
+          ? 'opencode'
+          : 'pi';
     if (disconnected.includes(provider)) return { stdout: '', stderr: '', exitCode: 1 };
     if (provider === 'claude') return { stdout: '{"loggedIn":true}', stderr: '', exitCode: 0 };
     if (provider === 'codex') return { stdout: 'Logged in using ChatGPT', stderr: '', exitCode: 0 };
-    return { stdout: '┌  Credentials ~/.local/share/opencode/auth.json\n└  1 credential', stderr: '', exitCode: 0 };
+    if (provider === 'opencode') {
+      return { stdout: '┌  Credentials ~/.local/share/opencode/auth.json\n└  1 credential', stderr: '', exitCode: 0 };
+    }
+    return {
+      stdout: 'provider  model  context  max-out  thinking  images\nanthropic  claude  200K  64K  yes  yes',
+      stderr: '',
+      exitCode: 0,
+    };
   },
 });
 
@@ -88,7 +122,7 @@ describe('POST /api/v1/runs/:id/open-in — agent CLI resume vs fresh launch', (
 
   /** A FINISHED run by default — `createRun` parks new records at `queued`, which the engine still
    *  owns, and only a run the engine has let go of resumes at all (see the status cases below). */
-  const makeRun = (runner: 'claude' | 'codex' | 'opencode' | undefined, sessionId?: string) => {
+  const makeRun = (runner: RunnerId | undefined, sessionId?: string) => {
     const run = store.createRun({
       title: 't',
       workflow: 'quick-task',

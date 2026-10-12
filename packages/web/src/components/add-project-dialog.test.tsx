@@ -183,6 +183,21 @@ describe('AddProjectDialog', () => {
     expect(document.querySelector('[data-slot="add-project-error"]')).toBeNull()
   })
 
+  it('does not mark the folder cezar is serving but has not registered', async () => {
+    serve({
+      browse: { '': json(PROJECTS) },
+      // What `GET /api/v1/projects` answers when the boot folder is not in the registry: the row
+      // is there so the cockpit can reach it, flagged so nothing reads it as saved. Badging it
+      // "already added" here would contradict Settings, which offers to add the same folder.
+      projects: [project({ id: 'cezar', root: '/home/me/Projects/cezar', unregistered: true })],
+    })
+    renderDialog()
+    await waitFor(() => expect(rows().getByText('cezar')).toBeTruthy())
+    expect(
+      within(rows().getByText('cezar').closest('button') as HTMLElement).queryByText('already added'),
+    ).toBeNull()
+  })
+
   it('shows a register refusal verbatim and stays put', async () => {
     serve({
       browse: { '': json(HOME) },
@@ -213,6 +228,44 @@ describe('AddProjectDialog', () => {
     expect(document.querySelector('[data-slot="fs-listing"]')).toBeNull()
     // Same wrap-don't-widen contract as the register error.
     expect(document.querySelector('[data-slot="fs-error"]')?.className).toContain('break-words')
+  })
+
+  it('a folder macOS privacy blocks offers System Settings, a retry, and a way back', async () => {
+    let blocked = true
+    serve({
+      browse: {
+        '': json(HOME),
+        '/home/me': json(HOME),
+        '/home/me/Projects': () =>
+          blocked
+            ? json({ error: 'macOS privacy settings do not allow cezar to read this folder.' }, 403)
+            : json(PROJECTS),
+      },
+    })
+    renderDialog()
+    await waitFor(() => expect(rows().getByText('Projects')).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Open Projects' }))
+    await waitFor(() => expect(document.querySelector('[data-slot="fs-privacy-settings"]')).toBeTruthy())
+    expect(document.querySelector('[data-slot="fs-privacy-settings"]')?.getAttribute('href')).toBe(
+      'x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders',
+    )
+    // A failed listing has no "up" row, so the error itself leads back out.
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    await waitFor(() => expect(breadcrumb().textContent).toBe('/home/me'))
+
+    // Allowed in System Settings meanwhile — "Try again" lists it without leaving the folder.
+    fireEvent.click(screen.getByRole('button', { name: 'Open Projects' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Try again' })).toBeTruthy())
+    blocked = false
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
+    await waitFor(() => expect(rows().getByText('cezar')).toBeTruthy())
+  })
+
+  it('a plain browse failure offers no privacy settings', async () => {
+    serve({ browse: { '': json({ error: 'no such directory' }, 404) } })
+    renderDialog()
+    await waitFor(() => expect(document.querySelector('[data-slot="fs-error"]')).toBeTruthy())
+    expect(document.querySelector('[data-slot="fs-privacy-settings"]')).toBeNull()
   })
 
   it('surfaces the truncated flag rather than showing a silently short list', async () => {

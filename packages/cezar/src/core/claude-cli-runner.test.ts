@@ -1,12 +1,36 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from './agent-runner.ts';
 import { isSignalTerminationExit, prependSystemPrompt } from './agent-runner.ts';
-import { buildClaudeArgs, ClaudeCliRunner } from './claude-cli-runner.ts';
+import {
+  buildClaudeArgs,
+  CLAUDE_HEADLESS_GUIDANCE,
+  ClaudeCliRunner,
+  appendClaudeSystemPrompt,
+  EOF_KILL_GRACE_MS,
+  EOF_TERM_GRACE_MS,
+  KILL_GRACE_MS,
+} from './claude-cli-runner.ts';
 import type { UiEvent } from './ui-events.ts';
+
+/** Only the escalation tests below swap the child out; every other test in this
+ *  file keeps spawning its real stub binary through the untouched `spawn`. */
+const spawnHook = vi.hoisted(() => ({ override: null as null | (() => unknown) }));
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawn: (...args: Parameters<typeof actual.spawn>) =>
+      spawnHook.override ? spawnHook.override() : actual.spawn(...args),
+  };
+});
 
 /**
  * The per-backend system-prompt delivery mechanism (spec §protocol v2
@@ -21,11 +45,40 @@ describe('buildClaudeArgs systemPrompt', () => {
     const args = buildClaudeArgs({ ...spec, systemPrompt: 'Extra rules.\n\n---\n\nContract.' });
     const idx = args.indexOf('--append-system-prompt');
     expect(idx).toBeGreaterThanOrEqual(0);
-    expect(args[idx + 1]).toBe('Extra rules.\n\n---\n\nContract.');
+    expect(args[idx + 1]).toBe(appendClaudeSystemPrompt('Extra rules.\n\n---\n\nContract.'));
   });
 
-  it('omits the flag entirely when no systemPrompt is set', () => {
-    expect(buildClaudeArgs(spec)).not.toContain('--append-system-prompt');
+  it('always appends Claude-local headless denial guidance', () => {
+    const args = buildClaudeArgs(spec);
+    const idx = args.indexOf('--append-system-prompt');
+    expect(args[idx + 1]).toBe(CLAUDE_HEADLESS_GUIDANCE);
+  });
+
+  it('preserves caller instructions before the backend guidance', () => {
+    expect(appendClaudeSystemPrompt('Caller rules.')).toBe(
+      `Caller rules.\n\n---\n\n${CLAUDE_HEADLESS_GUIDANCE}`,
+    );
+  });
+
+  it('uses the same guidance for a resumed call without changing resume args', () => {
+    const initial = buildClaudeArgs({ ...spec, sessionId: 'session-1' });
+    const resumed = buildClaudeArgs({ ...spec, sessionId: 'session-1', resume: true });
+    expect(initial[initial.indexOf('--append-system-prompt') + 1]).toBe(CLAUDE_HEADLESS_GUIDANCE);
+    expect(resumed[resumed.indexOf('--append-system-prompt') + 1]).toBe(CLAUDE_HEADLESS_GUIDANCE);
+    expect(initial).toContain('--session-id');
+    expect(resumed).toContain('--resume');
+  });
+});
+
+describe('buildClaudeArgs output mode', () => {
+  const spec = { userPrompt: 'do it', cwd: '/tmp' };
+
+  it('runs in print mode, which both stream-json formats require', () => {
+    expect(buildClaudeArgs(spec)).toContain('--print');
+  });
+
+  it('asks for partial messages so text streams as deltas', () => {
+    expect(buildClaudeArgs(spec)).toContain('--include-partial-messages');
   });
 });
 
@@ -109,6 +162,123 @@ describe('a teardown cezar initiated', () => {
   }, 15_000);
 });
 
+/**
+ * #844 — the watchdogs used to ask `!child.killed` before escalating, but Node
+ * sets `killed` the moment a signal is *delivered*. claude installs its own
+ * SIGTERM handler, so the flag went true while the process ran on and the
+ * SIGKILL that exists for exactly that case was never sent — one leaked CLI per
+ * teardown. The escalation now follows real termination instead.
+ */
+describe('SIGTERM→SIGKILL escalation for a CLI that survives SIGTERM', () => {
+  function signallableChild(): {
+    child: ChildProcessWithoutNullStreams;
+    signals: NodeJS.Signals[];
+    exit: (code: number) => void;
+  } {
+    const signals: NodeJS.Signals[] = [];
+    const emitter = new EventEmitter();
+    const child = Object.assign(emitter, {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      killed: false,
+      pid: 4242,
+      // Node's semantics: delivery flips `killed`; a CLI with its own handler
+      // keeps running with `exitCode` still null.
+      kill: (signal: NodeJS.Signals) => {
+        signals.push(signal);
+        Object.assign(child, { killed: true });
+        return true;
+      },
+    }) as unknown as ChildProcessWithoutNullStreams;
+    const exit = (code: number) => {
+      Object.assign(child, { exitCode: code });
+      emitter.emit('exit', code, null);
+    };
+    return { child, signals, exit };
+  }
+
+  function withFakeChild(run: (fake: ReturnType<typeof signallableChild>) => void): void {
+    const fake = signallableChild();
+    spawnHook.override = () => fake.child;
+    vi.useFakeTimers();
+    try {
+      run(fake);
+    } finally {
+      vi.useRealTimers();
+      spawnHook.override = null;
+    }
+  }
+
+  it('escalates after end() even though Node already flagged the child as killed', () => {
+    withFakeChild((fake) => {
+      const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 0 }).startSession({
+        userPrompt: 'do it',
+        cwd: process.cwd(),
+      });
+      session.end();
+
+      vi.advanceTimersByTime(EOF_TERM_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM']);
+      // Delivered, not dead — the state that used to disable the escalation.
+      expect(fake.child.killed).toBe(true);
+      expect(fake.child.exitCode).toBeNull();
+
+      vi.advanceTimersByTime(EOF_KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    });
+  });
+
+  it('escalates on the wall-clock timeout path as well', () => {
+    withFakeChild((fake) => {
+      const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 20 }).startSession({
+        userPrompt: 'do it',
+        cwd: process.cwd(),
+      });
+      void session.result.catch(() => undefined);
+
+      vi.advanceTimersByTime(20);
+      expect(fake.signals).toEqual(['SIGTERM']);
+
+      vi.advanceTimersByTime(KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    });
+  });
+
+  it('stops escalating once the CLI really exits after SIGTERM', () => {
+    withFakeChild((fake) => {
+      const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 0 }).startSession({
+        userPrompt: 'do it',
+        cwd: process.cwd(),
+      });
+      session.end();
+
+      vi.advanceTimersByTime(EOF_TERM_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM']);
+      fake.exit(143);
+
+      vi.advanceTimersByTime(EOF_KILL_GRACE_MS);
+      expect(fake.signals).toEqual(['SIGTERM']);
+    });
+  });
+
+  it('stops accepting messages once the child has exited on its own', () => {
+    withFakeChild((fake) => {
+      const session = new ClaudeCliRunner({ bin: 'claude', timeoutMs: 0 }).startSession({
+        userPrompt: 'do it',
+        cwd: process.cwd(),
+      });
+      expect(session.open).toBe(true);
+      fake.exit(1);
+
+      expect(session.open).toBe(false);
+      expect(session.sendMessage([{ type: 'text', text: 'are you there?' }])).toBe(false);
+    });
+  });
+});
+
 describe('prependSystemPrompt (codex/opencode delivery)', () => {
   it('prepends the prompt as a leading block of the first user message', () => {
     expect(prependSystemPrompt('Extra rules.', 'do it')).toBe('Extra rules.\n\n---\n\ndo it');
@@ -147,6 +317,32 @@ describe('ClaudeCliRunner token usage', () => {
       expect(events.filter((event) => event.type === 'token-usage')).toEqual([
         { type: 'token-usage', tokensUsed: 1_455 },
       ]);
+    } finally {
+      rmSync(cwd, { force: true, recursive: true });
+    }
+  });
+});
+
+describe('ClaudeCliRunner private MCP (spec 2026-10-07-private-project-mcp)', () => {
+  it('spawns with --mcp-config pointing at a 0600 file that is gone once the session ends', async () => {
+    const mockBin = fileURLToPath(new URL('../../scripts/mock-claude.mjs', import.meta.url));
+    const runner = new ClaudeCliRunner({ bin: mockBin, timeoutMs: 60_000 });
+    const cwd = mkdtempSync(join(tmpdir(), 'cez-claude-private-mcp-'));
+    const argsFile = join(cwd, 'args.ndjson');
+    try {
+      await runner.run({
+        userPrompt: 'do it',
+        cwd,
+        env: { CEZ_HANDOFF_FILE: '', CEZ_MOCK_ARGS_FILE: argsFile, CEZ_TODOS_FILE: '' },
+        allowedTools: ['Read'],
+        mcpServers: [{ name: 'tracker', transport: 'stdio', command: 'tracker-mcp', args: [], env: { TOKEN: 's3cret' }, headers: {} }],
+      });
+      const argv = JSON.parse(readFileSync(argsFile, 'utf8').trim().split('\n')[0]!) as string[];
+      const configPath = argv[argv.indexOf('--mcp-config') + 1]!;
+      expect(argv).toContain('--mcp-config');
+      expect(argv[argv.indexOf('--allowedTools') + 1]).toBe('Read,mcp__tracker');
+      expect(argv.join(' ')).not.toContain('s3cret');
+      expect(existsSync(configPath)).toBe(false);
     } finally {
       rmSync(cwd, { force: true, recursive: true });
     }

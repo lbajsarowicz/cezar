@@ -9,6 +9,7 @@ import { clearProjectProbeCache, listProjects, registerProject } from '../worksp
 import { ProjectContexts } from './project-context.ts';
 import { apiRequest } from './loopback-request.testkit.ts';
 import { createApp, type ServerDeps } from './server.ts';
+import { __seedRefStatusCacheForTests } from './forge/github.ts';
 
 /**
  * `GET /api/v1/workspace/runs-index` — the ⌘K palette's cross-project task finder.
@@ -78,7 +79,7 @@ describe('workspace runs index API', () => {
 
   it('answers an empty index for an empty registry — never a 404', async () => {
     const body = await getIndex();
-    expect(body).toEqual({ runs: [], perProjectLimit: 200, truncated: [] });
+    expect(body).toEqual({ runs: [], perProjectLimit: 200, truncated: [], referenceStatuses: {} });
   });
 
   it('merges the boot project’s live store with a cold project read off disk, newest first', async () => {
@@ -165,6 +166,7 @@ describe('workspace runs index API', () => {
       'issueNumber',
       'referencedIssueUrl',
       'markerRefs',
+      'prRefs',
       'costUsd',
       'peakRssBytes',
       'peakProcCount',
@@ -290,6 +292,66 @@ describe('workspace runs index API', () => {
     });
   });
 
+  it('carries `awaitingAnswerSince`, so an unanswered question still reads as "needs you"', async () => {
+    await registerProject(repoRoot);
+    await registerProject(otherRoot);
+    seedColdProject(otherRoot, [
+      storedRun({
+        id: 'asked',
+        title: 'Waiting on an answer',
+        status: 'failed',
+        finishedAt: '2026-07-14T11:00:00Z',
+        awaitingAnswerSince: '2026-07-14T11:00:00.000Z',
+      }),
+    ]);
+
+    const body = await getIndex();
+
+    expect(body.runs[0]).toMatchObject({
+      id: 'asked',
+      status: 'failed',
+      awaitingAnswerSince: '2026-07-14T11:00:00.000Z',
+    });
+  });
+
+  it('carries `automationId` from every provenance key, so the origin filter can split the rows', async () => {
+    await registerProject(repoRoot);
+    await registerProject(otherRoot);
+    const base = { automationRevision: 1, receiptId: 'rc' };
+    seedColdProject(otherRoot, [
+      storedRun({ id: 'mine', title: 'A person’s task', createdAt: '2026-07-14T10:04:00Z' }),
+      storedRun({
+        id: 'gh',
+        title: 'From a PR poll',
+        createdAt: '2026-07-14T10:03:00Z',
+        automation: { ...base, automationId: 'auto-gh', event: 'pull_request.opened', githubUrl: 'https://github.com/acme/demo/pull/1' },
+      }),
+      storedRun({
+        id: 'cron',
+        title: 'From a schedule',
+        createdAt: '2026-07-14T10:02:00Z',
+        automationTrigger: { ...base, automationId: 'auto-cron', trigger: 'schedule', occurrenceAt: '2026-07-14T10:00:00Z' },
+      }),
+      storedRun({
+        id: 'jira',
+        title: 'From a tracker',
+        createdAt: '2026-07-14T10:01:00Z',
+        automationTracker: { ...base, automationId: 'auto-jira', provider: 'jira', key: 'OPS-1', url: 'https://acme.atlassian.net/browse/OPS-1' },
+      }),
+    ]);
+
+    const body = await getIndex();
+
+    expect(body.runs.map((run) => [run.id, run.automationId])).toEqual([
+      ['mine', undefined],
+      ['gh', 'auto-gh'],
+      ['cron', 'auto-cron'],
+      ['jira', 'auto-jira'],
+    ]);
+    // Absent, not null, on a person's task — the slim row's rule for every optional key.
+    expect(Object.keys(body.runs[0]!)).not.toContain('automationId');
+  });
+
   it('reads a crashed process’s `running` row as interrupted, exactly as opening it would', async () => {
     await registerProject(repoRoot);
     await registerProject(otherRoot);
@@ -313,5 +375,71 @@ describe('workspace runs index API', () => {
 
     // One unreadable project costs its own rows, never the whole workspace's search.
     expect(body.runs.map((run) => run.id)).toEqual([live.id]);
+  });
+
+  /**
+   * Statuses ride along with the rows that carry the references, so the chips are coloured in the
+   * same paint as the table rather than a round trip later. The rule that makes it free — and
+   * therefore safe on a route the palette hits — is that it reads the ref-status cache and NEVER
+   * asks the forge.
+   */
+  describe('reference statuses', () => {
+    it('ships an empty map when the server has looked nothing up', async () => {
+      await registerProject(repoRoot);
+      const run = store.createRun({ title: 'Has a PR', workflow: 'build', task: 't', steps: [] });
+      store.updateRun(run.id, { pullRequestUrl: 'https://github.com/acme/demo/pull/42' });
+
+      const body = await getIndex();
+
+      // Present but empty — never absent, so a consumer can read it without a guard, and never
+      // invented, so a cold reference stays "nothing known" rather than a guessed status.
+      expect(body.referenceStatuses).toEqual({});
+      expect(body.runs.some((row) => row.id === run.id)).toBe(true);
+    });
+
+    it('ships what the cache holds, keyed by project', async () => {
+      await registerProject(repoRoot);
+      const run = store.createRun({ title: 'Has a PR', workflow: 'build', task: 't', steps: [] });
+      store.updateRun(run.id, {
+        pullRequestUrl: 'https://github.com/acme/demo/pull/42',
+        issueNumber: 7,
+      });
+      // Warm the cache the way the lazy route would have.
+      __seedRefStatusCacheForTests(realpathSync(repoRoot), [
+        [42, { kind: 'pr', status: 'merged' }],
+        [7, { kind: 'issue', status: 'open' }],
+      ]);
+
+      const body = await getIndex();
+
+      const project = Object.keys(body.referenceStatuses)[0]!;
+      expect(body.referenceStatuses[project]).toEqual({ prs: { 42: 'merged' }, issues: { 7: 'open' } });
+    });
+
+    it('looks up every number a run MENTIONS, not just the one its chip will show', async () => {
+      // Which reference is displayed is the cockpit's rule (#407, #526) and is deliberately not
+      // re-derived here. A cache read costs nothing per number, so the superset is free — and it
+      // is what lets the client apply its own rule to whatever it gets.
+      await registerProject(repoRoot);
+      const run = store.createRun({ title: 'Several', workflow: 'build', task: 't', steps: [] });
+      store.updateRun(run.id, {
+        pullRequestUrl: 'https://github.com/acme/demo/pull/42',
+        referencedPullRequestUrl: 'https://github.com/acme/demo/pull/40',
+        referencedIssueUrl: 'https://github.com/acme/demo/issues/12',
+      });
+      __seedRefStatusCacheForTests(realpathSync(repoRoot), [
+        [42, { kind: 'pr', status: 'merged' }],
+        [40, { kind: 'pr', status: 'ready' }],
+        [12, { kind: 'issue', status: 'completed' }],
+      ]);
+
+      const body = await getIndex();
+
+      const project = Object.keys(body.referenceStatuses)[0]!;
+      expect(body.referenceStatuses[project]).toEqual({
+        prs: { 40: 'ready', 42: 'merged' },
+        issues: { 12: 'completed' },
+      });
+    });
   });
 });

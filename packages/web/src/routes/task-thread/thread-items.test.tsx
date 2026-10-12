@@ -1,9 +1,12 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { QueryClientProvider } from '@tanstack/react-query'
+import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { RunEvent } from '@open-mercato/cezar-api-client'
 import type { UiToolItem } from '@open-mercato/cezar-api-client'
+import { createQueryClient } from '@/api/query-client'
 
 import bashAndScreenshot from '../../../../cezar/src/core/__fixtures__/claude/bash-and-screenshot.expected.json'
 import failedAndDenied from '../../../../cezar/src/core/__fixtures__/claude/failed-and-denied.expected.json'
@@ -19,6 +22,8 @@ import {
   ReasoningItem,
   ToolCard,
   ToolStreak,
+  UserBubble,
+  WorkingIndicator,
 } from './thread-items'
 import { reduceThread } from './thread-state'
 import { SessionTranscript } from './session-transcript'
@@ -99,6 +104,73 @@ describe('ToolCard — states', () => {
     expect(document.querySelector('[data-slot="tool-output"]')).toBeNull()
   })
 
+  it('expanding grows the header to the FULL command from the raw input, shown once', () => {
+    const item = goldenItem(bashAndScreenshot, 'toolu_mock_1', 'completed')
+    const long = `for f in a b c; do\n  echo ${'x'.repeat(300)} "$f"\ndone`
+    const capped = `${long.slice(0, 119)}…`
+    render(<ToolCard item={{ ...item, title: `Ran ${capped}`, input: { command: long } }} />)
+    const codeTexts = () => [...card().querySelectorAll('code')].map((code) => code.textContent)
+    expect(codeTexts()).toEqual([capped]) // collapsed: the one-line capped title
+    fireEvent.click(trigger(/Ran/))
+    const commands = document.querySelectorAll('[data-slot="tool-command"]')
+    expect(commands).toHaveLength(1)
+    expect(commands[0]?.textContent).toBe(long)
+    expect(codeTexts()).toEqual([long]) // printed once, never alongside the capped title
+    expect(screen.getByRole('button', { name: 'Copy command' })).toBeTruthy()
+  })
+
+  it('a running command too long for the header is expandable before any output arrives', () => {
+    const running = goldenItem(bashAndScreenshot, 'toolu_mock_1', 'running')
+    const long = `npm test -- ${'packages/web/src/routes/task-thread '.repeat(5)}`
+    render(<ToolCard item={{ ...running, title: `Ran ${long.slice(0, 119)}…`, input: { command: long } }} />)
+    const button = trigger(/Ran/) as HTMLButtonElement
+    expect(button.disabled).toBe(false)
+    fireEvent.click(button)
+    expect(document.querySelector('[data-slot="tool-command"]')?.textContent).toBe(long)
+  })
+
+  it('a short command that fits the header shows no copy button when expanded', () => {
+    const item = goldenItem(bashAndScreenshot, 'toolu_mock_1', 'completed')
+    render(<ToolCard item={item} />)
+    fireEvent.click(trigger(/Ran.*git status --short/))
+    expect(document.querySelector('[data-slot="tool-command"]')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Copy command' })).toBeNull()
+  })
+
+  it('falls back to the title when the raw input carries no command', () => {
+    const item = goldenItem(bashAndScreenshot, 'toolu_mock_1', 'completed')
+    const long = `echo ${'y'.repeat(100)}`
+    render(<ToolCard item={{ ...item, title: `Ran ${long}`, input: undefined }} />)
+    fireEvent.click(trigger(/Ran/))
+    expect(document.querySelector('[data-slot="tool-command"]')?.textContent).toBe(long)
+  })
+
+  it('copy writes the full command and leaves the card open', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } })
+    try {
+      const item = goldenItem(bashAndScreenshot, 'toolu_mock_1', 'completed')
+      const long = `for f in a b; do\n  echo ${'z'.repeat(120)} "$f"\ndone`
+      render(<ToolCard item={{ ...item, input: { command: long } }} />)
+      fireEvent.click(trigger(/Ran/))
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Copy command' }))
+      })
+      expect(writeText).toHaveBeenCalledWith(long)
+      expect(card().getAttribute('data-state')).toBe('open')
+      expect(screen.getByRole('button', { name: 'Copied' })).toBeTruthy()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('joins an argv-array command (Codex shape)', () => {
+    const item = goldenItem(bashAndScreenshot, 'toolu_mock_1', 'completed')
+    render(<ToolCard item={{ ...item, input: { command: ['bash', '-lc', 'npm test'] } }} />)
+    fireEvent.click(trigger(/Ran/))
+    expect(document.querySelector('[data-slot="tool-command"]')?.textContent).toBe('bash -lc npm test')
+  })
+
   it('running execute WITH output: open by default — the live tail is visible while streaming', () => {
     const running = goldenItem(bashAndScreenshot, 'toolu_mock_1', 'running')
     // What the reducer holds mid-stream: the running golden item + accumulated `item.delta{output}`.
@@ -126,6 +198,12 @@ describe('ToolCard — states', () => {
     render(<ToolCard item={item} />)
     expect(card().getAttribute('data-status')).toBe('declined')
     expect(screen.getByText('declined')).toBeTruthy()
+    expect((screen.getByRole('button', { name: /declined/ }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('a non-execute tool with no detail stays locked', () => {
+    const item = goldenItem(failedAndDenied, 'toolu_denied_01', 'declined')
+    render(<ToolCard item={{ ...item, toolKind: 'read', input: undefined }} />)
     expect((screen.getByRole('button', { name: /declined/ }) as HTMLButtonElement).disabled).toBe(true)
   })
 
@@ -302,5 +380,79 @@ describe('sub-agent nesting (golden subagent-task fixture, end to end through th
     const nested = document.querySelector('[data-slot="tool-nested"]')!
     expect(nested.querySelector('[data-slot="assistant-message"]')?.textContent).toContain('Scanning the auth middleware')
     expect(nested.querySelectorAll('[data-slot="tool-card"]')).toHaveLength(1)
+  })
+})
+
+
+/**
+ * #950 — images and files share one list of URLs on the record, so the bubble has to tell them
+ * apart by the persisted NAME. Rendering a `.pdf` in an `<img>` is what the user would see as a
+ * broken attachment, on the one screen that is supposed to show them their own message back.
+ */
+describe('UserBubble attachments', () => {
+  const withQueries = (child: ReactNode) => (
+    <QueryClientProvider client={createQueryClient()}>{child}</QueryClientProvider>
+  )
+
+  it('shows an image inline and a file as a download chip', () => {
+    render(withQueries(
+      <MemoryRouter>
+        <UserBubble
+          text="read the brief"
+          imageCount={2}
+          images={['/api/v1/runs/r1/images/pasted-1.png', '/api/v1/runs/r1/images/pasted-2.pdf']}
+        />
+      </MemoryRouter>,
+    ))
+    const img = screen.getByAltText('attached') as HTMLImageElement
+    expect(img.getAttribute('src')).toBe('/api/v1/runs/r1/images/pasted-1.png')
+    const chip = screen.getByText('pasted-2.pdf').closest('a') as HTMLAnchorElement
+    expect(chip.getAttribute('href')).toBe('/api/v1/runs/r1/images/pasted-2.pdf')
+    expect(chip.hasAttribute('download')).toBe(true)
+    // The file must not have been rendered as an image anywhere.
+    expect(screen.queryAllByAltText('attached')).toHaveLength(1)
+  })
+
+  it('renders a .md and a .txt as chips too', () => {
+    render(withQueries(
+      <MemoryRouter>
+        <UserBubble
+          text="two briefs"
+          imageCount={2}
+          images={['/api/v1/runs/r1/images/pasted-1.md', '/api/v1/runs/r1/images/pasted-2.txt']}
+        />
+      </MemoryRouter>,
+    ))
+    expect(screen.queryAllByAltText('attached')).toHaveLength(0)
+    expect(screen.getByText('pasted-1.md')).toBeTruthy()
+    expect(screen.getByText('pasted-2.txt')).toBeTruthy()
+  })
+})
+
+describe('WorkingIndicator — live clock', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('ticks the elapsed time and names the last activity', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-23T10:01:30.000Z'))
+    render(<WorkingIndicator since="2026-09-23T10:00:00.000Z" lastActivityAt="2026-09-23T10:01:18.000Z" />)
+    const elapsed = () => document.querySelector('[data-slot="working-elapsed"]')?.textContent
+    const last = () => document.querySelector('[data-slot="working-last-activity"]')?.textContent
+    expect(elapsed()).toBe('1m 30s')
+    expect(last()).toContain('(12s ago)')
+    act(() => {
+      vi.advanceTimersByTime(5000)
+    })
+    expect(elapsed()).toBe('1m 35s')
+    expect(last()).toContain('(17s ago)')
+  })
+
+  it('stays a bare spinner when there are no stamps', () => {
+    render(<WorkingIndicator />)
+    expect(screen.getByRole('status', { name: 'Working' })).toBeTruthy()
+    expect(document.querySelector('[data-slot="working-elapsed"]')).toBeNull()
+    expect(document.querySelector('[data-slot="working-last-activity"]')).toBeNull()
   })
 })

@@ -8,12 +8,14 @@ import {
   formatCost,
   formatMem,
   githubRepoBase,
+  ownedTaskPr,
   prNumber,
   scheduledResume,
   taskReference,
   taskPrUrl,
   taskIssueUrl,
   taskReferences,
+  prioritizeTaskReferences,
   usageCells,
   workflowLabel,
 } from '@/lib/tasks-table'
@@ -189,6 +191,8 @@ describe('finishedRunCount', () => {
         run({ status: 'waiting' }),
         run({ status: 'running' }),
         run({ status: 'queued' }),
+        // A closed session's unanswered question is a gate too.
+        run({ status: 'failed', awaitingAnswerSince: '2026-10-05T10:00:00.000Z' }),
         // Already archived — nothing to archive again.
         run({ status: 'done', archived: true }),
       ]),
@@ -197,6 +201,20 @@ describe('finishedRunCount', () => {
 })
 
 describe('taskPrUrl', () => {
+  it('projects the primary PR from the ordered association list', () => {
+    const r = run({
+      prRefs: [
+        { number: 7, origin: 'marker', at: '2026-01-01T00:00:00.000Z' },
+        { number: 8, origin: 'marker', at: '2026-01-02T00:00:00.000Z' },
+      ],
+      prNumber: 7,
+    } as never)
+    expect(taskReferences(r, 'https://github.com/o/r')).toEqual([
+      { kind: 'PR', number: 7, url: 'https://github.com/o/r/pull/7' },
+      { kind: 'PR', number: 8, url: 'https://github.com/o/r/pull/8' },
+    ])
+  })
+
   it('prefers the PR the task created over the one it referenced', () => {
     const r = run({
       pullRequestUrl: 'https://github.com/o/r/pull/7',
@@ -246,6 +264,35 @@ describe('taskPrUrl', () => {
 describe('taskReferences', () => {
   const REPO = 'https://github.com/o/r'
 
+  it('moves only known closed PRs behind live and merged references', () => {
+    const refs = [
+      { kind: 'PR' as const, number: 10 },
+      { kind: 'PR' as const, number: 11 },
+      { kind: 'Issue' as const, number: 12 },
+    ]
+    expect(
+      prioritizeTaskReferences(refs, (reference) =>
+        reference.number === 10 ? 'closed' : reference.number === 11 ? 'merged' : 'completed',
+      ),
+    ).toEqual([refs[1], refs[2], refs[0]])
+  })
+
+  it('keeps same-number PRs from different repositories distinct', () => {
+    expect(
+      taskReferences(
+        run({
+          prRefs: [
+            { number: 7, url: `${REPO}/pull/7`, origin: 'created', at: '2026-01-01T00:00:00.000Z' },
+            { number: 7, url: 'https://github.com/other/r/pull/7', origin: 'marker', at: '2026-01-02T00:00:00.000Z' },
+          ],
+        } as never),
+      ),
+    ).toEqual([
+      { kind: 'PR', number: 7, url: `${REPO}/pull/7` },
+      { kind: 'PR', number: 7, url: 'https://github.com/other/r/pull/7' },
+    ])
+  })
+
   it('returns every reference a task has, strongest first', () => {
     // The real multi-reference case: a review task opened on an issue, ABOUT one PR, having
     // created another. All three are true at once.
@@ -263,6 +310,50 @@ describe('taskReferences', () => {
       { kind: 'PR', number: 530, url: `${REPO}/pull/530` },
       { kind: 'Issue', number: 524, url: `${REPO}/issues/524` },
     ])
+  })
+
+  // The record this rule was written from, verbatim: the task declared the PR it opened (#901),
+  // while the created-PR field had been poisoned with a PR from ANOTHER repository that the
+  // transcript merely quoted. The declared one leads — including on the surfaces with room for
+  // exactly one chip, which is where the wrong PR was all you could see.
+  it('leads with a declared PR that no scraped URL corroborates', () => {
+    const r = run({
+      pullRequestUrl: 'https://github.com/o/other/pull/5366',
+      prNumber: 901,
+      markerRefs: { pr: 901 },
+    })
+    expect(taskReferences(r, REPO)).toEqual([
+      { kind: 'PR', number: 901, url: `${REPO}/pull/901` },
+      { kind: 'PR', number: 5366, url: 'https://github.com/o/other/pull/5366' },
+    ])
+    expect(taskReference(r)?.number).toBe(901)
+  })
+
+  it('leaves the order alone when a URL does carry the declared number', () => {
+    // The ordinary shape — the agent re-declared with the PR it opened — so nothing is ahead of
+    // the created PR and the declaration adds no chip of its own.
+    expect(
+      taskReferences(
+        run({
+          pullRequestUrl: `${REPO}/pull/533`,
+          referencedPullRequestUrl: `${REPO}/pull/530`,
+          markerRefs: { pr: 533 },
+        }),
+      ).map((reference) => reference.number),
+    ).toEqual([533, 530])
+  })
+
+  it('keeps #526 with a declaration too: an issue-subject run adopts no stray PR', () => {
+    expect(
+      taskReferences(
+        run({
+          referencedPullRequestUrl: `${REPO}/pull/900`,
+          referencedIssueUrl: `${REPO}/issues/524`,
+          markerRefs: { issue: 524 },
+        }),
+        REPO,
+      ),
+    ).toEqual([{ kind: 'Issue', number: 524, url: `${REPO}/issues/524` }])
   })
 
   it('is what taskReference takes its single answer from', () => {
@@ -511,5 +602,31 @@ describe('compareGroups', () => {
 
   it('ignores ungrouped runs entirely', () => {
     expect(compareGroups([run(), run()], 'active')).toEqual([])
+  })
+})
+
+describe('ownedTaskPr — the PR a task may ACT on', () => {
+  it('is the PR the task created', () => {
+    expect(ownedTaskPr({ pullRequestUrl: 'https://github.com/o/r/pull/9' })).toEqual({
+      url: 'https://github.com/o/r/pull/9',
+      number: 9,
+    })
+  })
+
+  it('is the PR it declared, even known only by number', () => {
+    expect(ownedTaskPr({ markerRefs: { pr: 12 } })).toEqual({ number: 12 })
+    expect(ownedTaskPr({ prRefs: [{ number: 12, origin: 'marker' }] })).toEqual({ number: 12 })
+  })
+
+  it('is never a PR merely scraped from the transcript', () => {
+    expect(ownedTaskPr({ referencedPullRequestUrl: 'https://github.com/o/r/pull/534' })).toBeUndefined()
+    expect(
+      ownedTaskPr({
+        prRefs: [
+          { number: 534, url: 'https://github.com/o/r/pull/534', origin: 'legacy' },
+          { number: 7, origin: 'derived' },
+        ],
+      }),
+    ).toBeUndefined()
   })
 })

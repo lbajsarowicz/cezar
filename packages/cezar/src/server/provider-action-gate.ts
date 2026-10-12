@@ -2,14 +2,19 @@ import type {
   ProviderId,
   ProviderStatusResponse,
 } from '../core/provider-auth.ts';
+import { PROVIDER_IDS } from '../core/provider-auth.ts';
 import type { RunRecord } from '../runs/store.ts';
 import { stepKind, type WorkflowDef } from '../workflows/types.ts';
 
-const ORDER: readonly ProviderId[] = ['claude', 'codex', 'opencode'];
+const ORDER: readonly ProviderId[] = PROVIDER_IDS;
 const LABEL: Record<ProviderId, string> = {
   claude: 'Claude Code',
   codex: 'Codex',
   opencode: 'OpenCode',
+  cursor: 'Cursor',
+  pi: 'pi',
+  junie: 'Junie',
+  copilot: 'GitHub Copilot CLI',
 };
 
 export function providersRequiredByWorkflow(
@@ -61,7 +66,9 @@ export function unavailableProviderMessage(
     if (row?.enabled === false) {
       return `${LABEL[provider]} is disabled. Enable it in Settings → Agents → Providers.`;
     }
-    if (row?.status !== 'connected') {
+    // Junie has no read-only auth-status command: its probe deliberately reports unknown.
+    // Let ACP authenticate at run startup; a real runtime rejection is still latched as disconnected.
+    if (row?.status !== 'connected' && !(provider === 'junie' && row?.status === 'unknown')) {
       return `${LABEL[provider]} credentials are unavailable. Authorize it in Settings → Agents → Providers.`;
     }
   }

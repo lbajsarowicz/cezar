@@ -1,8 +1,29 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RunStore } from './store.ts';
+
+import type { RunRecord } from './store.ts';
+
+/** Every store a case opens schedules its debounced runs.json write 300ms out, and every case
+ *  removes its data dir in `afterEach` — so the timer fires into a deleted directory and logs
+ *  "failed to save runs.json" after the case settled. A log landing while the worker tears down
+ *  fails the whole run (`EnvironmentTeardownError: Closing rpc while "onUserConsoleLog" was
+ *  pending`, the 0.13.0 release run). Cancel what is still pending once each case ends. */
+const openedStores = new Set<RunStore>();
+const openStore = RunStore.open.bind(RunStore);
+RunStore.open = (dataDir, opts) => {
+  const store = openStore(dataDir, opts);
+  openedStores.add(store);
+  return store;
+};
+afterEach(() => {
+  for (const store of openedStores) {
+    clearTimeout((store as unknown as { saveTimer: NodeJS.Timeout | null }).saveTimer ?? undefined);
+  }
+  openedStores.clear();
+});
 
 /** A minimal pre-#389 record, exactly as an old runs.json holds it — no
  *  titleSummary, no diffStat. Loading it must keep working (additive proof). */
@@ -376,6 +397,73 @@ describe('RunStore — PR auto-link only on real creation (#fake-pr)', () => {
       result: 'https://github.com/open-mercato/cezar/pull/321\nDraft pull request created.',
     } as never);
     expect(store.getRun(run.id)?.pullRequestUrl).toBe('https://github.com/open-mercato/cezar/pull/321');
+  });
+
+  // The claim must come from something that can speak FOR this run. Verbatim from the task that
+  // wrote this guard: it dumped ANOTHER run's stored events while investigating them, and the
+  // dump contained that run's `"title": "Ran gh pr create …"` next to its PR URL — so this run
+  // adopted a PR in a different repository as its own, forever (the first created URL wins).
+  it('does not believe a creation phrase that arrives inside tool OUTPUT', () => {
+    const { store, run } = freshRun();
+    store.appendEvent(run.id, {
+      type: 'item.completed',
+      item: {
+        kind: 'tool',
+        id: 't1',
+        name: 'Bash',
+        toolKind: 'execute',
+        title: 'Ran python3 - <<PY … PY',
+        status: 'completed',
+        input: { command: 'python3 - <<PY\nprint(open("other-run.ndjson").read())\nPY' },
+        output:
+          '{"type":"item.completed","item":{"kind":"tool","title":"Ran gh pr create --repo o/other …",' +
+          '"output":"https://github.com/o/other/pull/5366"}}',
+      },
+    });
+    const loaded = store.getRun(run.id);
+    expect(loaded?.pullRequestUrl).toBeUndefined();
+    // Still a PR URL the conversation mentioned, so the referenced tier keeps it as a candidate —
+    // that tier is allowed to be wrong about a subject, never about authorship.
+    expect(loaded?.referencedPrCandidates).toEqual(['https://github.com/o/other/pull/5366']);
+  });
+
+  it('does not believe a creation phrase the agent merely WROTE into a file', () => {
+    const { store, run } = freshRun();
+    store.appendEvent(run.id, {
+      type: 'item.completed',
+      item: {
+        kind: 'tool',
+        id: 't2',
+        name: 'Edit',
+        toolKind: 'edit',
+        title: 'packages/cezar/src/runs/store.test.ts',
+        status: 'completed',
+        input: {
+          new_string: "result: 'Opened a draft pull request: https://github.com/open-mercato/cezar/pull/42'",
+        },
+      },
+    });
+    expect(store.getRun(run.id)?.pullRequestUrl).toBeUndefined();
+  });
+
+  it('still adopts the PR from a real `gh pr create`, whose URL only appears in the output', () => {
+    const { store, run } = freshRun();
+    store.appendEvent(run.id, {
+      type: 'item.completed',
+      item: {
+        kind: 'tool',
+        id: 't3',
+        name: 'Bash',
+        toolKind: 'execute',
+        title: 'Ran gh pr create --repo open-mercato/cezar --base main --head cez/x --title "fix…',
+        status: 'completed',
+        input: { command: 'gh pr create --repo open-mercato/cezar --base main' },
+        output: 'https://github.com/open-mercato/cezar/pull/901',
+      },
+    });
+    expect(store.getRun(run.id)?.pullRequestUrl).toBe(
+      'https://github.com/open-mercato/cezar/pull/901',
+    );
   });
 });
 
@@ -761,6 +849,43 @@ describe('RunStore — agent-declared marker refs (spec 2026-07-18-task-ref-mark
     return { store, run };
   };
 
+  it('keeps earlier PR associations when a follow-up declaration arrives', () => {
+    const { store, run } = freshRun('Address GitHub pull request #4326');
+    store.applyMarkerRefs(run.id, { pr: 4326 });
+    store.applyMarkerRefs(run.id, { pr: 5366 });
+    expect(store.getRun(run.id)?.prRefs?.map((ref) => ref.number)).toEqual([4326, 5366]);
+    expect(store.getRun(run.id)?.prNumber).toBe(4326);
+  });
+
+  it('deduplicates repeated declarations and preserves a URL when it arrives later', () => {
+    const { store, run } = freshRun();
+    store.applyMarkerRefs(run.id, { pr: 42 });
+    store.recordPrRef(run.id, {
+      number: 42,
+      url: 'https://github.com/open-mercato/cezar/pull/42',
+      origin: 'marker',
+    });
+    expect(store.getRun(run.id)?.prRefs).toHaveLength(1);
+    expect(store.getRun(run.id)?.prRefs?.[0]?.url).toBe('https://github.com/open-mercato/cezar/pull/42');
+  });
+
+  it('preserves legacy scalar associations before a replacement patch is applied', () => {
+    const { store, run } = freshRun();
+    store.updateRun(run.id, { pullRequestUrl: 'https://github.com/o/r/pull/7' });
+    store.updateRun(run.id, { pullRequestUrl: 'https://github.com/o/r/pull/8' });
+    expect(store.getRun(run.id)?.prRefs?.map((ref) => ref.number)).toEqual([7, 8]);
+  });
+
+  it('keeps same-number PRs from different repositories as separate links', () => {
+    const { store, run } = freshRun();
+    store.recordPrRef(run.id, { number: 7, url: 'https://github.com/o/r/pull/7', origin: 'created' });
+    store.recordPrRef(run.id, { number: 7, url: 'https://github.com/other/r/pull/7', origin: 'marker' });
+    expect(store.getRun(run.id)?.prRefs?.map((ref) => ref.url)).toEqual([
+      'https://github.com/o/r/pull/7',
+      'https://github.com/other/r/pull/7',
+    ]);
+  });
+
   it('marker numbers land on the record and persist', () => {
     const { store, run } = freshRun();
     store.applyMarkerRefs(run.id, { pr: 442, issue: 433 });
@@ -846,6 +971,118 @@ describe('RunStore — agent-declared marker refs (spec 2026-07-18-task-ref-mark
     const { store, run } = freshRun();
     store.applyMarkerRefs(run.id, {});
     expect(store.getRun(run.id)?.markerRefs).toBeUndefined();
+  });
+
+  // Verbatim from the run that reported it: a task opened on open-mercato#4326 pushed a
+  // fix as its own #5366 and re-declared with the new number, as the marker contract asks. Both
+  // PRs are true, and the record has a field for each — but feeding the re-declaration to the
+  // referenced tier cleared #4326 (no candidate ends in /5366), so the cockpit painted one chip.
+  it('a declaration naming the PR the task CREATED keeps the PR it is about', () => {
+    const { store, run } = freshRun('Address GitHub pull request #4326');
+    store.applyMarkerRefs(run.id, { pr: 4326 });
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Reviewing https://github.com/open-mercato/open-mercato/pull/4326.',
+    });
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Ran gh pr create … → https://github.com/open-mercato/open-mercato/pull/5366',
+    });
+    store.applyMarkerRefs(run.id, { pr: 5366 });
+
+    const loaded = store.getRun(run.id);
+    expect(loaded?.pullRequestUrl).toBe('https://github.com/open-mercato/open-mercato/pull/5366');
+    expect(loaded?.referencedPullRequestUrl).toBe(
+      'https://github.com/open-mercato/open-mercato/pull/4326',
+    );
+    // The compatibility projection follows the created tier; the about PR remains in prRefs.
+    expect(loaded?.prNumber).toBe(5366);
+    expect(loaded?.markerRefs?.pr).toBe(5366);
+  });
+
+  it('restores the about-PR when the declaration arrives BEFORE the creation evidence', () => {
+    const { store, run } = freshRun('Address GitHub pull request #4326');
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Reviewing https://github.com/open-mercato/open-mercato/pull/4326.',
+    });
+    store.applyMarkerRefs(run.id, { pr: 5366 });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBeUndefined(); // nothing created yet
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Ran gh pr create … → https://github.com/open-mercato/open-mercato/pull/5366',
+    });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/open-mercato/open-mercato/pull/4326',
+    );
+  });
+
+  it('still fills an unknown prNumber from a declaration that names the created PR', () => {
+    const { store, run } = freshRun('ship the devices work');
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Created a pull request: https://github.com/open-mercato/cezar/pull/42',
+    });
+    store.applyMarkerRefs(run.id, { pr: 42 });
+    expect(store.getRun(run.id)?.prNumber).toBe(42);
+  });
+
+  it('heals a record already written by the bug, on load', () => {
+    // Exactly the shape the bug left on disk: the created PR, the declaration that named it, the
+    // about-PR still sitting in the working set, and the chip it should have painted gone.
+    const { store, run } = freshRun('Address GitHub pull request #4326');
+    store.updateRun(run.id, {
+      pullRequestUrl: 'https://github.com/open-mercato/open-mercato/pull/5366',
+      referencedPullRequestUrl: undefined,
+      referencedPrCandidates: ['https://github.com/open-mercato/open-mercato/pull/4326'],
+      markerRefs: { pr: 5366 },
+      prNumber: 5366,
+    });
+    store.flush();
+    expect(RunStore.open(dataDir).getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/open-mercato/open-mercato/pull/4326',
+    );
+  });
+
+  it('never resurrects a chip a live declaration deliberately cleared', () => {
+    // The other direction of the heal, and the one that would quietly undo "no chip beats a wrong
+    // chip": here the declaration names a PR this run did NOT create, so it still owns the
+    // referenced tier and its contradiction with the candidate must survive a reload.
+    const { store, run } = freshRun('task');
+    store.updateRun(run.id, {
+      referencedPullRequestUrl: undefined,
+      referencedPrCandidates: ['https://github.com/open-mercato/cezar/pull/777'],
+      markerRefs: { pr: 500 },
+    });
+    store.flush();
+    expect(RunStore.open(dataDir).getRun(run.id)?.referencedPullRequestUrl).toBeUndefined();
+  });
+
+  it('never takes a referenced PR away from a record whose candidates no longer explain it', () => {
+    const { store, run } = freshRun('task');
+    store.updateRun(run.id, {
+      referencedPullRequestUrl: 'https://github.com/open-mercato/cezar/pull/777',
+      referencedPrCandidates: undefined,
+      markerRefs: { pr: 777 },
+    });
+    store.flush();
+    expect(RunStore.open(dataDir).getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/open-mercato/cezar/pull/777',
+    );
+  });
+
+  it('a declaration naming some OTHER PR stays alongside the created PR', () => {
+    const { store, run } = freshRun('task');
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Created a pull request: https://github.com/open-mercato/cezar/pull/42',
+    });
+    store.applyMarkerRefs(run.id, { pr: 500 });
+    const loaded = store.getRun(run.id);
+    // Created provenance is stronger than a later marker; both remain reachable in prRefs.
+    expect(loaded?.prNumber).toBe(42);
+    expect(loaded?.prRefs?.map((ref) => ref.number)).toEqual([42, 500]);
+    expect(loaded?.referencedPullRequestUrl).toBeUndefined(); // no candidate ends in /500
   });
 });
 
@@ -989,6 +1226,266 @@ describe('RunStore — referenced-issue discovery (spec 2026-07-21-report-ref-di
       result: 'Mentioned in https://github.com/open-mercato/cezar/issues/9',
     });
     expect(store.getRun(run.id)?.issueNumber).toBe(500);
+  });
+});
+
+describe("RunStore — a task never adopts another repository's ref (#945)", () => {
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cez-store-repo-scope-'));
+  });
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const HANDLE = { owner: 'open-mercato', name: 'cezar' };
+
+  /** A store that already knows which repository it is, as the background arming leaves it. */
+  const scopedRun = (task = 'task', handle: typeof HANDLE | null = HANDLE) => {
+    const store = RunStore.open(dataDir);
+    store.setRepoHandle(handle);
+    const run = store.createRun({ title: 't', workflow: 'w', task, steps: [] });
+    return { store, run };
+  };
+
+  it('drops a lone foreign PR the prompt never named — the reported defect', () => {
+    // "assessing Phase 0 SQL safety": a research task cites one upstream PR, and the
+    // one-distinct-candidate rule made it the task's identity.
+    const { store, run } = scopedRun('assessing Phase 0 SQL safety');
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Migration safety is discussed in https://github.com/supabase/cli/pull/6056.',
+    });
+    const loaded = store.getRun(run.id);
+    expect(loaded?.referencedPullRequestUrl).toBeUndefined();
+    // Collected as evidence all the same — the guard changes what is PROMOTED, never what is
+    // recorded (the #526 rule).
+    expect(loaded?.referencedPrCandidates).toEqual(['https://github.com/supabase/cli/pull/6056']);
+  });
+
+  it('drops a lone foreign issue AND refuses to seed issueNumber from it', () => {
+    const { store, run } = scopedRun('assessing Phase 0 SQL safety');
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Tracked upstream as https://github.com/supabase/cli/issues/6056.',
+    });
+    const loaded = store.getRun(run.id);
+    expect(loaded?.referencedIssueUrl).toBeUndefined();
+    expect(loaded?.issueNumber).toBeUndefined();
+    expect(loaded?.referencedIssueCandidates).toEqual([
+      'https://github.com/supabase/cli/issues/6056',
+    ]);
+  });
+
+  it('keeps a foreign PR the task prompt itself names — the #819 cross-repo case', () => {
+    const { store, run } = scopedRun(
+      'om-auto-fix-pr https://github.com/open-mercato/open-mercato/pull/1977',
+    );
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Working on https://github.com/open-mercato/open-mercato/pull/1977 now.',
+    });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/open-mercato/open-mercato/pull/1977',
+    );
+  });
+
+  it('corroboration accepts the bare owner/repo, not only a pasted URL', () => {
+    const { store, run } = scopedRun('port the fix over to open-mercato/open-mercato');
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'See https://github.com/open-mercato/open-mercato/pull/1977.',
+    });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/open-mercato/open-mercato/pull/1977',
+    );
+  });
+
+  it("leaves the project's own PRs alone — the ordinary #407 path", () => {
+    const { store, run } = scopedRun();
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Reviewed https://github.com/open-mercato/cezar/pull/407 — looks good.',
+    });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/open-mercato/cezar/pull/407',
+    );
+  });
+
+  it('matches the handle case-insensitively', () => {
+    const { store, run } = scopedRun('task', { owner: 'Open-Mercato', name: 'Cezar' });
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'See https://github.com/open-mercato/cezar/pull/407.',
+    });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/open-mercato/cezar/pull/407',
+    );
+  });
+
+  it('an unknown handle keeps pre-#945 behavior — degrade, never fail', () => {
+    // No `gh`, no remote, a non-git root, hosted mode: `resolveRepoHandle` answers null and the
+    // foreign URL is adopted exactly as it was before this guard existed.
+    const { store, run } = scopedRun('assessing Phase 0 SQL safety', null);
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'Migration safety is discussed in https://github.com/supabase/cli/pull/6056.',
+    });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/supabase/cli/pull/6056',
+    );
+  });
+
+  it('a store that was never armed keeps pre-#945 behavior too', () => {
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({ title: 't', workflow: 'w', task: 'task', steps: [] });
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'See https://github.com/supabase/cli/pull/6056.',
+    });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBe(
+      'https://github.com/supabase/cli/pull/6056',
+    );
+  });
+
+  it('vetoes a foreign URL a CEZ:PR marker declared', () => {
+    // The marker owns the resolution, but it can only ever pick from the candidate list — and a
+    // foreign candidate is not adoptable, so the chip stays empty rather than pointing away.
+    const { store, run } = scopedRun('task');
+    store.appendEvent(run.id, {
+      type: 'result',
+      result: 'See https://github.com/supabase/cli/pull/6056.',
+    });
+    store.applyMarkerRefs(run.id, { pr: 6056 });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBeUndefined();
+  });
+
+  describe('healing records the un-scoped rule already poisoned', () => {
+    /** Persist one record, then reopen and arm — what a cockpit restart does. */
+    const reopenArmed = (
+      record: Partial<RunRecord> & { task: string },
+      handle: typeof HANDLE | null = HANDLE,
+    ) => {
+      const seed = RunStore.open(dataDir);
+      const run = seed.createRun({ title: 't', workflow: 'w', task: record.task, steps: [] });
+      seed.updateRun(run.id, record);
+      seed.flush();
+
+      const reopened = RunStore.open(dataDir);
+      // Snapshot the VALUE, not the record: `getRun` hands back the live object the sweep
+      // mutates in place, so holding the reference would show the healed state either way.
+      const before = reopened.getRun(run.id)?.referencedPullRequestUrl;
+      reopened.setRepoHandle(handle);
+      return { before, after: reopened.getRun(run.id) };
+    };
+
+    it('drops a stored foreign referencedPullRequestUrl when the handle arrives', () => {
+      const { before, after } = reopenArmed({
+        task: 'assessing Phase 0 SQL safety',
+        referencedPullRequestUrl: 'https://github.com/supabase/cli/pull/6056',
+        referencedPrCandidates: ['https://github.com/supabase/cli/pull/6056'],
+      });
+      // Before arming, the poisoned value is still there — the heal is not a load-time rewrite.
+      expect(before).toBe('https://github.com/supabase/cli/pull/6056');
+      expect(after?.referencedPullRequestUrl).toBeUndefined();
+      // Evidence survives the heal — only the conclusion drawn from it was wrong.
+      expect(after?.referencedPrCandidates).toEqual(['https://github.com/supabase/cli/pull/6056']);
+    });
+
+    it('keeps a stored foreign URL the prompt corroborates', () => {
+      const { after } = reopenArmed({
+        task: 'om-auto-fix-pr https://github.com/open-mercato/open-mercato/pull/1977',
+        referencedPullRequestUrl: 'https://github.com/open-mercato/open-mercato/pull/1977',
+      });
+      expect(after?.referencedPullRequestUrl).toBe(
+        'https://github.com/open-mercato/open-mercato/pull/1977',
+      );
+    });
+
+    it("keeps a stored URL from the project's own repo", () => {
+      const { after } = reopenArmed({
+        task: 'task',
+        referencedPullRequestUrl: 'https://github.com/open-mercato/cezar/pull/407',
+      });
+      expect(after?.referencedPullRequestUrl).toBe('https://github.com/open-mercato/cezar/pull/407');
+    });
+
+    it('revokes an issueNumber this janitor seeded from the dropped URL', () => {
+      const { after } = reopenArmed({
+        task: 'assessing Phase 0 SQL safety',
+        referencedIssueUrl: 'https://github.com/supabase/cli/issues/6056',
+        issueNumber: 6056,
+        referencedIssueNumberSeeded: true,
+      });
+      expect(after?.referencedIssueUrl).toBeUndefined();
+      expect(after?.issueNumber).toBeUndefined();
+      expect(after?.referencedIssueNumberSeeded).toBeUndefined();
+    });
+
+    it('leaves an issueNumber it did NOT seed alone', () => {
+      // The prompt, the namer or a CEZ:ISSUE marker owns that number — dropping the foreign URL
+      // must not take it with them.
+      const { after } = reopenArmed({
+        task: 'fix issue 42',
+        referencedIssueUrl: 'https://github.com/supabase/cli/issues/6056',
+        issueNumber: 42,
+      });
+      expect(after?.referencedIssueUrl).toBeUndefined();
+      expect(after?.issueNumber).toBe(42);
+    });
+
+    it('a null handle heals nothing — there is nothing to prove foreign against', () => {
+      const { after } = reopenArmed(
+        {
+          task: 'assessing Phase 0 SQL safety',
+          referencedPullRequestUrl: 'https://github.com/supabase/cli/pull/6056',
+        },
+        null,
+      );
+      expect(after?.referencedPullRequestUrl).toBe('https://github.com/supabase/cli/pull/6056');
+    });
+
+    it('is one-directional — it never invents an association', () => {
+      // A record with candidates but no resolution stays unresolved: the sweep only ever clears.
+      const { after } = reopenArmed({
+        task: 'task',
+        referencedPullRequestUrl: undefined,
+        referencedPrCandidates: [
+          'https://github.com/open-mercato/cezar/pull/1',
+          'https://github.com/supabase/cli/pull/6056',
+        ],
+      });
+      expect(after?.referencedPullRequestUrl).toBeUndefined();
+    });
+
+    it('emits the corrected record so an open cockpit repaints', () => {
+      const seed = RunStore.open(dataDir);
+      const run = seed.createRun({
+        title: 't',
+        workflow: 'w',
+        task: 'assessing Phase 0 SQL safety',
+        steps: [],
+      });
+      seed.updateRun(run.id, {
+        referencedPullRequestUrl: 'https://github.com/supabase/cli/pull/6056',
+      });
+      const seen: string[] = [];
+      seed.on('run', (r: RunRecord) => seen.push(r.id));
+      seed.setRepoHandle(HANDLE);
+      expect(seen).toContain(run.id);
+    });
+  });
+
+  it('does not rescue a candidate today’s rule already calls ambiguous', () => {
+    // Strictly subtractive: two candidates, one foreign, still resolves to nothing. Filtering the
+    // list before resolving would have promoted the local one — a wider change than the fix needs.
+    const { store, run } = scopedRun('task');
+    store.appendEvent(run.id, {
+      type: 'result',
+      result:
+        'Compare https://github.com/open-mercato/cezar/pull/1 with https://github.com/supabase/cli/pull/6056.',
+    });
+    expect(store.getRun(run.id)?.referencedPullRequestUrl).toBeUndefined();
   });
 });
 
@@ -1311,6 +1808,103 @@ describe('RunStore — read receipts (#unread-done-items)', () => {
   });
 });
 
+/**
+ * `awaitingAnswerSince`: a `failed` run whose session closed on an unanswered `CEZ:ASK`. The
+ * cockpit keeps it under "needs you", so the store owns the invariant that only a `failed` run
+ * carries it — a Continue, a Finish, a cancel, an archive and a reload all retire it on their own.
+ */
+describe('RunStore — awaitingAnswerSince', () => {
+  let dataDir: string;
+  const AT = '2026-10-05T10:00:00.000Z';
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cez-store-awaiting-'));
+  });
+
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const awaiting = (store: RunStore): string => {
+    const run = store.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] });
+    store.updateRun(run.id, { status: 'failed', finishedAt: AT, awaitingAnswerSince: AT });
+    return run.id;
+  };
+
+  it('survives a failed-to-failed write and a reload', () => {
+    const store = RunStore.open(dataDir);
+    const id = awaiting(store);
+    store.updateRun(id, { status: 'failed', error: 'still unanswered' });
+    expect(store.getRun(id)?.awaitingAnswerSince).toBe(AT);
+    store.flush();
+    expect(RunStore.open(dataDir, { keepLive: true }).getRun(id)?.awaitingAnswerSince).toBe(AT);
+  });
+
+  it.each(['running', 'queued', 'waiting', 'done', 'review', 'cancelled'] as const)(
+    'is retired when the run moves to %s',
+    (status) => {
+      const store = RunStore.open(dataDir);
+      const id = awaiting(store);
+      store.updateRun(id, { status });
+      expect(store.getRun(id)?.awaitingAnswerSince).toBeUndefined();
+    },
+  );
+
+  it('is retired by archiving that one run', () => {
+    const store = RunStore.open(dataDir);
+    const one = awaiting(store);
+    store.setArchived(one, true);
+    expect(store.getRun(one)?.awaitingAnswerSince).toBeUndefined();
+  });
+
+  it('is a gate the "Archive finished" sweep leaves alone, like review', () => {
+    const store = RunStore.open(dataDir);
+    const open = awaiting(store);
+    const outcome = store.createRun({ title: 'o', workflow: 'quick-task', task: 'o', steps: [] });
+    store.updateRun(outcome.id, { status: 'failed', finishedAt: AT });
+    expect(store.archiveFinished()).toBe(1);
+    expect(store.getRun(outcome.id)?.archived).toBe(true);
+    expect(store.getRun(open)?.archived).toBe(false);
+    expect(store.getRun(open)?.awaitingAnswerSince).toBe(AT);
+  });
+
+  it('markAllRead leaves an awaiting run alone, exactly as the cockpit rule does', () => {
+    const store = RunStore.open(dataDir);
+    const id = awaiting(store);
+    expect(store.markAllRead()).toBe(0);
+    expect(store.getRun(id)?.seenAt).toBeUndefined();
+  });
+
+  it('a reader that does not recover turns a waiting ASK park into an awaiting failure', () => {
+    const store = RunStore.open(dataDir);
+    const parked = store.createRun({ title: 'p', workflow: 'quick-task', task: 'p', steps: [] });
+    store.updateRun(parked.id, { status: 'waiting', askParked: true });
+    const plain = store.createRun({ title: 'w', workflow: 'quick-task', task: 'w', steps: [] });
+    store.updateRun(plain.id, { status: 'waiting' });
+    store.flush();
+
+    const reopened = RunStore.open(dataDir);
+    expect(reopened.getRun(parked.id)?.status).toBe('failed');
+    // Stamped from `finishedAt`, so repeated cold reads agree on the instant.
+    expect(reopened.getRun(parked.id)?.awaitingAnswerSince).toBe(reopened.getRun(parked.id)?.finishedAt);
+    expect(reopened.getRun(parked.id)?.askParked).toBeUndefined();
+    expect(reopened.getRun(plain.id)?.status).toBe('failed');
+    expect(reopened.getRun(plain.id)?.awaitingAnswerSince).toBeUndefined();
+  });
+
+  it('drops a stray value from a non-failed record on load', () => {
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] });
+    store.updateRun(run.id, { status: 'done', finishedAt: AT });
+    store.flush();
+    const path = join(dataDir, 'runs.json');
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as Array<Record<string, unknown>>;
+    raw.find((r) => r.id === run.id)!.awaitingAnswerSince = AT;
+    writeFileSync(path, JSON.stringify(raw));
+    expect(RunStore.open(dataDir).getRun(run.id)?.awaitingAnswerSince).toBeUndefined();
+  });
+});
+
 describe('RunStore — the legacy `claude-cli` runner id (#547)', () => {
   let dataDir: string;
 
@@ -1370,6 +1964,25 @@ describe('RunStore — the legacy `claude-cli` runner id (#547)', () => {
     expect(store.getRun('modern')?.runner).toBe('codex');
   });
 
+  it('a `cursor` record and a `claude-cli` record round-trip together — neither evicts the file (#807)', () => {
+    // The regression this guards: widening `storedRunnerSchema` for the fourth backend without
+    // keeping the legacy `claude-cli` member (or vice versa) would make one of the two records
+    // a parse failure, and since the loader `safeParse`s the WHOLE array, that drops every run
+    // in the file — not just the one carrying the id neither side kept.
+    writeFileSync(
+      join(dataDir, 'runs.json'),
+      JSON.stringify([
+        { ...LEGACY_RUN, id: 'legacy-cli', runner: 'claude-cli' },
+        { ...LEGACY_RUN, id: 'cursor-run', runner: 'cursor' },
+      ]),
+      'utf8',
+    );
+
+    const store = RunStore.open(dataDir);
+    expect(store.getRun('legacy-cli')?.runner).toBe('claude');
+    expect(store.getRun('cursor-run')?.runner).toBe('cursor');
+  });
+
   it('rewrites the folded id on the next save, so the narrowing is one-way', () => {
     writeFileSync(
       join(dataDir, 'runs.json'),
@@ -1387,6 +2000,38 @@ describe('RunStore — the legacy `claude-cli` runner id (#547)', () => {
     expect(JSON.parse(onDisk)[0].runner).toBe('claude');
   });
 
+  it('persists and reloads a `pi` run, index and step alike (#387)', () => {
+    // `storedRunnerSchema` derives from `RUNNER_IDS` rather than re-listing the ids, so a new
+    // runner is readable the moment it is registered. Without this, a completed pi run would
+    // fail the whole-array parse on the next boot and take every other run down with it.
+    writeFileSync(
+      join(dataDir, 'runs.json'),
+      JSON.stringify([
+        {
+          ...LEGACY_RUN,
+          runner: 'pi',
+          steps: [
+            {
+              id: 'task',
+              name: 'Do the task',
+              kind: 'agent',
+              status: 'done',
+              iterations: 1,
+              tokensUsed: 0,
+              sessionId: 'pi-sess-1',
+              backend: 'pi',
+            },
+          ],
+        },
+      ]),
+      'utf8',
+    );
+
+    const run = RunStore.open(dataDir).getRun('legacy-1');
+    expect(run?.runner).toBe('pi');
+    expect(run?.steps[0]?.backend).toBe('pi');
+  });
+
   it('still rejects a runner id that is not a legacy spelling of a real backend', () => {
     // Widening the READ side is not an invitation to accept anything: an unknown id is still
     // a parse failure, which is what keeps the enum meaningful.
@@ -1396,5 +2041,449 @@ describe('RunStore — the legacy `claude-cli` runner id (#547)', () => {
       'utf8',
     );
     expect(RunStore.open(dataDir).getRun('legacy-1')).toBeUndefined();
+  });
+});
+
+describe('RunStore — pinned tasks (#935)', () => {
+  let dataDir: string;
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cez-store-'));
+  });
+
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const newRun = (store: RunStore): string =>
+    store.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] }).id;
+
+  it('setPinned stamps the pin, round-trips it, and returns the record', () => {
+    const store = RunStore.open(dataDir);
+    const id = newRun(store);
+    expect(store.getRun(id)?.pinned).toBeUndefined();
+
+    const updated = store.setPinned(id, true);
+    expect(updated?.pinned).toBe(true);
+    expect(updated?.pinnedAt).toBeDefined();
+
+    store.flush();
+    expect(RunStore.open(dataDir).getRun(id)?.pinned).toBe(true);
+  });
+
+  it('unpinning DELETES both keys rather than writing pinned:false', () => {
+    // The compatibility promise (BACKWARD_COMPATIBILITY.md §3): an unpinned record is
+    // byte-identical to one written by a cezar that never heard of pins.
+    const store = RunStore.open(dataDir);
+    const id = newRun(store);
+    store.setPinned(id, true);
+    store.setPinned(id, false);
+    store.flush();
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, 'runs.json'), 'utf8')) as Array<
+      Record<string, unknown>
+    >;
+    const record = persisted.find((entry) => entry.id === id);
+    expect(record).toBeDefined();
+    expect(record).not.toHaveProperty('pinned');
+    expect(record).not.toHaveProperty('pinnedAt');
+  });
+
+  it('is idempotent and unconditional — every status can be pinned', () => {
+    const store = RunStore.open(dataDir);
+    const id = newRun(store);
+    store.updateRun(id, { status: 'running' });
+    expect(store.setPinned(id, true)?.pinned).toBe(true);
+    expect(store.setPinned(id, true)?.pinned).toBe(true);
+    // Unpinning something that was never pinned is legal too, and changes nothing.
+    const other = newRun(store);
+    expect(store.setPinned(other, false)?.pinned).toBeUndefined();
+  });
+
+  it('answers undefined for a run it does not know', () => {
+    expect(RunStore.open(dataDir).setPinned('no-such-run', true)).toBeUndefined();
+  });
+
+  it('archiving clears the pin — one run and in bulk', () => {
+    // Archiving IS resigning from a task, so the pin goes with it. In the store rather than in
+    // the route for the same reason the auto-resume rule is: the "Archive finished" sweep never
+    // goes through a route.
+    const store = RunStore.open(dataDir);
+    const one = newRun(store);
+    store.setPinned(one, true);
+    store.setArchived(one, true);
+    expect(store.getRun(one)?.pinned).toBeUndefined();
+    expect(store.getRun(one)?.pinnedAt).toBeUndefined();
+
+    const swept = newRun(store);
+    store.updateRun(swept, { status: 'done', finishedAt: '2026-08-29T10:00:00.000Z' });
+    store.setPinned(swept, true);
+    expect(store.archiveFinished()).toBeGreaterThanOrEqual(1);
+    expect(store.getRun(swept)?.archived).toBe(true);
+    expect(store.getRun(swept)?.pinned).toBeUndefined();
+
+    // Un-archiving restores the task, never the pin — the same rule the pending resume follows.
+    store.setArchived(one, false);
+    expect(store.getRun(one)?.pinned).toBeUndefined();
+  });
+
+  it('loads a record written before pins existed, and one hand-edited to carry them', () => {
+    writeFileSync(
+      join(dataDir, 'runs.json'),
+      JSON.stringify([
+        { ...LEGACY_RUN, id: 'no-pin' },
+        { ...LEGACY_RUN, id: 'hand-pinned', pinned: true, pinnedAt: '2026-08-29T10:00:00.000Z' },
+      ]),
+      'utf8',
+    );
+
+    const store = RunStore.open(dataDir);
+    expect(store.getRun('no-pin')?.pinned).toBeUndefined();
+    expect(store.getRun('hand-pinned')?.pinned).toBe(true);
+  });
+});
+
+describe('RunStore — a save never drops another process’s runs', () => {
+  let dataDir: string;
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cez-store-'));
+  });
+
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const newRun = (store: RunStore, title: string): string =>
+    store.createRun({ title, workflow: 'quick-task', task: title, steps: [] }).id;
+
+  const idsOnDisk = (): string[] =>
+    (JSON.parse(readFileSync(join(dataDir, 'runs.json'), 'utf8')) as RunRecord[]).map((r) => r.id);
+
+  const recordOnDisk = (id: string): RunRecord | undefined =>
+    (JSON.parse(readFileSync(join(dataDir, 'runs.json'), 'utf8')) as RunRecord[]).find(
+      (r) => r.id === id,
+    );
+
+  it('keeps the run a second process started — the cockpit-plus-`cezar run` case', () => {
+    // The reported symptom exactly: a cockpit is already open (store A) when a headless
+    // `cezar run` (store B) opens the same data directory and starts a task. A's next save
+    // used to serialize its own map over the whole file, so B's run left an .ndjson behind
+    // with nothing in the index pointing at it.
+    const cockpit = RunStore.open(dataDir);
+    const fromCockpit = newRun(cockpit, 'started in the cockpit');
+    cockpit.flush();
+
+    const headless = RunStore.open(dataDir);
+    const fromHeadless = newRun(headless, 'started by cezar run');
+    headless.flush();
+
+    cockpit.updateRun(fromCockpit, { status: 'running' });
+    cockpit.flush();
+
+    expect(idsOnDisk()).toEqual(expect.arrayContaining([fromCockpit, fromHeadless]));
+  });
+
+  it('adopts an id it has never seen and keeps its own version of one it holds', () => {
+    const store = RunStore.open(dataDir);
+    const mine = newRun(store, 'mine');
+    store.flush();
+
+    // Another process rewrote the index: a staler copy of a run we hold, plus one we have
+    // never heard of.
+    writeFileSync(
+      join(dataDir, 'runs.json'),
+      JSON.stringify([
+        { ...LEGACY_RUN, id: mine, title: 'a staler copy from the other process' },
+        { ...LEGACY_RUN, id: 'foreign-1', title: 'only the other process knows this one' },
+      ]),
+      'utf8',
+    );
+    store.flush();
+
+    expect(recordOnDisk(mine)?.title).toBe('mine');
+    expect(recordOnDisk('foreign-1')?.title).toBe('only the other process knows this one');
+  });
+
+  it('does not lose our runs to an index it cannot parse', () => {
+    const store = RunStore.open(dataDir);
+    const mine = newRun(store, 'mine');
+    writeFileSync(join(dataDir, 'runs.json'), '{ this is not json', 'utf8');
+    store.flush();
+
+    expect(idsOnDisk()).toContain(mine);
+  });
+
+  it('keeps an adopted run across later saves, not only the save that adopted it', () => {
+    // `saveNow` skips re-reading an index it recognizes as its own last write, so what it
+    // remembered has to include the records it adopted — otherwise the second save drops the
+    // foreign run again and the bug comes back one tick later.
+    const store = RunStore.open(dataDir);
+    const mine = newRun(store, 'mine');
+    store.flush();
+
+    writeFileSync(
+      join(dataDir, 'runs.json'),
+      JSON.stringify([{ ...LEGACY_RUN, id: 'foreign-1' }]),
+      'utf8',
+    );
+    store.flush();
+    expect(idsOnDisk()).toEqual(expect.arrayContaining([mine, 'foreign-1']));
+
+    store.updateRun(mine, { status: 'running' });
+    store.flush();
+    expect(idsOnDisk()).toEqual(expect.arrayContaining([mine, 'foreign-1']));
+  });
+
+  it('picks up a write that lands after our own save', () => {
+    // The other half of that cache: a signature that no longer matches must force the re-read.
+    const store = RunStore.open(dataDir);
+    const mine = newRun(store, 'mine');
+    store.flush();
+
+    const onDisk = JSON.parse(readFileSync(join(dataDir, 'runs.json'), 'utf8')) as RunRecord[];
+    writeFileSync(
+      join(dataDir, 'runs.json'),
+      JSON.stringify([...onDisk, { ...LEGACY_RUN, id: 'arrived-later' }]),
+      'utf8',
+    );
+
+    store.updateRun(mine, { status: 'running' });
+    store.flush();
+    expect(idsOnDisk()).toEqual(expect.arrayContaining([mine, 'arrived-later']));
+  });
+
+  it('one unreadable row on disk costs only itself', () => {
+    // Records are validated one at a time here, unlike `open()`'s whole-array parse, so a single
+    // hand-mangled row does not take the other process's good records down with it.
+    const store = RunStore.open(dataDir);
+    const mine = newRun(store, 'mine');
+    writeFileSync(
+      join(dataDir, 'runs.json'),
+      JSON.stringify([{ id: 'garbage', title: 42 }, { ...LEGACY_RUN, id: 'foreign-1' }]),
+      'utf8',
+    );
+    store.flush();
+
+    expect(idsOnDisk()).toEqual(expect.arrayContaining([mine, 'foreign-1']));
+    expect(idsOnDisk()).not.toContain('garbage');
+  });
+
+  it('a deleted run stays deleted — the merge never resurrects it', () => {
+    // The one way this merge could be worse than the bug it fixes: the index we re-read is
+    // the one WE wrote a moment ago, so a deletion would come straight back as a record
+    // whose event file `deleteRun` has already removed.
+    const store = RunStore.open(dataDir);
+    const kept = newRun(store, 'kept');
+    const doomed = newRun(store, 'doomed');
+    store.flush();
+
+    expect(store.deleteRun(doomed)).toBe(true);
+    store.flush();
+    expect(idsOnDisk()).toEqual([kept]);
+
+    // And it stays gone on every later save, not just the one that removed it.
+    store.updateRun(kept, { status: 'running' });
+    store.flush();
+    expect(idsOnDisk()).toEqual([kept]);
+  });
+});
+
+const SAVE_DEBOUNCE_WINDOW_MS = 1_000;
+
+describe('RunStore — seq rehydration from the persisted high-water mark', () => {
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cez-store-lastseq-'));
+  });
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A run whose creation save already landed, so a later explicit save is the only thing left. */
+  function savedRun(store: RunStore): RunRecord {
+    const run = store.createRun({ title: 't', workflow: 'w', task: 't', steps: [] });
+    vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS);
+    return run;
+  }
+
+  it('numbers above an ephemeral frame a client already saw, which the transcript never recorded', () => {
+    vi.useFakeTimers();
+    const store = RunStore.open(dataDir);
+    const run = savedRun(store);
+    store.appendEvent(run.id, { type: 'note', message: 'one' });
+    const delta = store.emitEphemeral(run.id, { type: 'item.delta', delta: 'x' });
+    store.flush();
+
+    const reopened = RunStore.open(dataDir, { keepLive: true });
+    expect(reopened.appendEvent(run.id, { type: 'note', message: 'after restart' }).seq).toBe(delta.seq + 1);
+  });
+
+  it('does not schedule an index save for a stream that dirties nothing else', () => {
+    vi.useFakeTimers();
+    const store = RunStore.open(dataDir);
+    const run = savedRun(store);
+    const saveNow = vi.spyOn(store as unknown as { saveNow: (...args: unknown[]) => void }, 'saveNow');
+
+    for (let index = 0; index < 60; index += 1) {
+      store.appendEvent(run.id, { type: 'note', message: `n${index}` });
+      store.emitEphemeral(run.id, { type: 'item.delta', delta: 'x' });
+    }
+    vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS * 6);
+
+    expect(saveNow).not.toHaveBeenCalled();
+    store.flush();
+    expect(saveNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes from the record and the transcript tail without re-reading the whole transcript', () => {
+    vi.useFakeTimers();
+    const store = RunStore.open(dataDir);
+    const run = savedRun(store);
+    for (let index = 0; index < 50; index += 1) store.appendEvent(run.id, { type: 'note', message: `n${index}` });
+    store.flush();
+
+    const reopened = RunStore.open(dataDir, { keepLive: true });
+    const readEvents = vi.spyOn(reopened, 'readEvents');
+    expect(reopened.appendEvent(run.id, { type: 'note', message: 'after restart' }).seq).toBe(51);
+    expect(readEvents).not.toHaveBeenCalled();
+  });
+
+  it('trusts the transcript tail over a record saved before the last appends', () => {
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({ title: 't', workflow: 'w', task: 't', steps: [] });
+    store.appendEvent(run.id, { type: 'note', message: 'one' });
+    store.flush();
+    const events = join(dataDir, 'runs', `${run.id}.ndjson`);
+    for (let seq = 2; seq <= 5; seq += 1) {
+      appendFileSync(events, `${JSON.stringify({ seq, ts: 'x', type: 'note', message: String(seq) })}\n`);
+    }
+    appendFileSync(events, '{"seq":6,"ty');
+
+    const reopened = RunStore.open(dataDir, { keepLive: true });
+    expect(reopened.getRun(run.id)?.lastSeq).toBe(1);
+    expect(reopened.appendEvent(run.id, { type: 'note', message: 'after crash' }).seq).toBe(6);
+  });
+
+  it('falls back to the full transcript maximum for a record written before lastSeq existed', () => {
+    const lines = [9, 4].map((seq) => JSON.stringify({ seq, ts: 'x', type: 'note', message: String(seq) }));
+    writeFileSync(join(dataDir, 'runs.json'), JSON.stringify([LEGACY_RUN]));
+    mkdirSync(join(dataDir, 'runs'), { recursive: true });
+    writeFileSync(join(dataDir, 'runs', `${LEGACY_RUN.id}.ndjson`), `${lines.join('\n')}\n`);
+
+    const store = RunStore.open(dataDir);
+    expect(store.appendEvent(LEGACY_RUN.id, { type: 'note', message: 'next' }).seq).toBe(10);
+  });
+});
+
+describe('RunStore — runs.json encoding', () => {
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cez-store-encoding-'));
+  });
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('writes compact by default, both on the debounce and on a plain flush', () => {
+    vi.useFakeTimers();
+    try {
+      const store = RunStore.open(dataDir);
+      store.createRun({ title: 't', workflow: 'w', task: 't', steps: [{ id: 's1', name: 'Agent', kind: 'agent' }] });
+      vi.advanceTimersByTime(SAVE_DEBOUNCE_WINDOW_MS);
+
+      const indexPath = join(dataDir, 'runs.json');
+      expect(readFileSync(indexPath, 'utf8')).not.toContain('\n');
+
+      store.flush();
+      const plainFlush = readFileSync(indexPath, 'utf8');
+      expect(plainFlush).not.toContain('\n');
+      expect(JSON.parse(plainFlush)).toEqual(JSON.parse(JSON.stringify(store.listRuns())));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('writes indented only when the shutdown flush asks for it', () => {
+    const store = RunStore.open(dataDir);
+    store.createRun({ title: 't', workflow: 'w', task: 't', steps: [{ id: 's1', name: 'Agent', kind: 'agent' }] });
+    store.flush({ pretty: true });
+
+    const indexPath = join(dataDir, 'runs.json');
+    const flushed = readFileSync(indexPath, 'utf8');
+    expect(flushed).toContain('\n  ');
+    expect(JSON.parse(flushed)).toEqual(JSON.parse(JSON.stringify(store.listRuns())));
+  });
+});
+
+describe('RunStore — janitor cost once its answer is settled (#540)', () => {
+  let dataDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cez-store-janitor-'));
+  });
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const issue = (n: number) => `https://github.com/o/r/issues/${n}`;
+
+  function settledRun(task = 'task') {
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({ title: 't', workflow: 'w', task, steps: [] });
+    store.updateRun(run.id, { pullRequestUrl: 'https://github.com/o/r/pull/1' });
+    for (let n = 1; n <= 8; n += 1) store.appendEvent(run.id, { type: 'note', message: `see ${issue(n)}` });
+    return { store, run };
+  }
+
+  it('skips the haystack once the PR is adopted and the issue working set is capped', () => {
+    const { store, run } = settledRun();
+    const before = structuredClone(store.getRun(run.id));
+    const track = vi.spyOn(store as unknown as { trackReferencedIssues: () => boolean }, 'trackReferencedIssues');
+
+    store.appendEvent(run.id, { type: 'text', text: `now ${issue(9)}` });
+
+    expect(track).not.toHaveBeenCalled();
+    expect({ ...store.getRun(run.id), lastSeq: before?.lastSeq }).toEqual(before);
+  });
+
+  it('keeps seeding issueNumber while a resolved issue has none, even at the cap', () => {
+    const { store, run } = settledRun('fix #3');
+    expect(store.getRun(run.id)?.referencedIssueUrl).toBe(issue(3));
+    store.updateRun(run.id, { issueNumber: undefined });
+
+    store.appendEvent(run.id, { type: 'text', text: `working on ${issue(3)}` });
+
+    expect(store.getRun(run.id)?.issueNumber).toBe(3);
+  });
+
+  it('keeps a repo handle that lands after settling in force for later events', () => {
+    const { store, run } = settledRun('fix #3');
+    store.appendEvent(run.id, { type: 'text', text: `working on ${issue(3)}` });
+    expect(store.getRun(run.id)).toMatchObject({ referencedIssueUrl: issue(3), issueNumber: 3 });
+
+    store.setRepoHandle({ owner: 'open-mercato', name: 'cezar' });
+    store.appendEvent(run.id, { type: 'text', text: `still on ${issue(3)}` });
+
+    expect(store.getRun(run.id)?.referencedIssueUrl).toBeUndefined();
+    expect(store.getRun(run.id)?.issueNumber).toBeUndefined();
+  });
+
+  it('bounds how much of a tool input it searches for references', () => {
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({ title: 't', workflow: 'w', task: 't', steps: [] });
+    store.appendEvent(run.id, {
+      type: 'item.completed',
+      item: { kind: 'tool', id: 'w1', status: 'completed', input: { content: `${'x'.repeat(10_000)} ${issue(7)}` } },
+    });
+    store.appendEvent(run.id, {
+      type: 'item.completed',
+      item: { kind: 'tool', id: 'w2', status: 'completed', input: { command: `gh issue view ${issue(8)}` } },
+    });
+
+    expect(store.getRun(run.id)?.referencedIssueCandidates).toEqual([issue(8)]);
   });
 });
