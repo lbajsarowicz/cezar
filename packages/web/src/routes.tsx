@@ -1,4 +1,4 @@
-import { Suspense, lazy } from 'react'
+import { lazy, memo, Suspense } from 'react'
 import {
   matchPath,
   Navigate,
@@ -11,8 +11,9 @@ import {
 
 import { useHealth, useProjects } from './api/queries'
 import { ProjectScopeProvider } from './api/project-scope-context'
-import { locationToRestore, readStoredLastLocation } from './lib/last-location'
+import { bareRootLanding, locationToRestore, readStoredLastLocation } from './lib/last-location'
 import { Navigate as ScopedNavigate, stripProjectPrefix } from './lib/project-router'
+import { AutomationsLoading } from './routes/automations/automations-loading'
 import { CompareLoading } from './routes/compare-loading'
 import { GithubLoading } from './routes/github/github-loading'
 import { InboxRoute } from './routes/inbox'
@@ -32,7 +33,11 @@ import {
 } from './routes/settings/settings-shell'
 import { TasksOverviewRoute } from './routes/tasks-overview'
 import { GlobalTasksRoute } from './routes/global-tasks'
-import { AutomationsRoute } from './routes/automations/automations'
+
+// Dashboard charts, drag controls and exports are paid for only on this route.
+const DashboardRoute = lazy(() =>
+  import('./routes/dashboard').then((m) => ({ default: m.DashboardRoute })),
+)
 
 /** Lazy ON PURPOSE: the thread view carries the markdown stack (Streamdown + remark/rehype,
  *  ~140 KB gz) — as a static import it would sit in the main bundle every visitor pays for
@@ -59,6 +64,9 @@ const TaskFilesRoute = lazy(() =>
 const TaskCommitsRoute = lazy(() =>
   import('./routes/task-git/task-commits').then((m) => ({ default: m.TaskCommitsRoute })),
 )
+const TaskNotesRoute = lazy(() =>
+  import('./routes/task-thread/task-notes').then((m) => ({ default: m.TaskNotesRoute })),
+)
 
 /** Lazy because the repo view renders through the `<Diff>` facade and the Shiki singleton —
  *  the same heavy chunk the task git tabs ride; the home screen must not pay for it. */
@@ -71,16 +79,19 @@ const RepoGitRoute = lazy(() =>
 const GithubRoute = lazy(() =>
   import('./routes/github/github').then((m) => ({ default: m.GithubRoute })),
 )
-/** `/github`'s index (#417) — restores the last-selected tab. Same chunk as `GithubRoute`,
- *  just a second named export off the same lazy import. */
-const GithubIndexRoute = lazy(() =>
-  import('./routes/github/github').then((m) => ({ default: m.GithubIndexRoute })),
+const TrackerRoute = lazy(() =>
+  import('./routes/tracker/tracker').then((m) => ({ default: m.TrackerRoute })),
 )
 
-/** Lazy because the builder carries dnd-kit (R6 Step 1.6) — drag machinery only this surface
- *  uses, so only this surface pays for it. */
-const WorkflowsRoute = lazy(() =>
-  import('./routes/workflows/workflows').then((m) => ({ default: m.WorkflowsRoute })),
+/** The live workflow graph of a task (same spec, phase 3) — the editor's chunk, loaded lazily. */
+const TaskGraphRoute = lazy(() =>
+  import('./routes/workflow-graph/task-graph').then((m) => ({ default: m.TaskGraphRoute })),
+)
+
+/** The workflow node editor (spec 2026-09-30-workflow-node-editor) — the Workflows surface. Lazy
+ *  so React Flow stays out of the main bundle. */
+const WorkflowGraphRoute = lazy(() =>
+  import('./routes/workflow-graph/workflow-graph').then((m) => ({ default: m.WorkflowGraphRoute })),
 )
 
 /** Lazy because the skill detail renders the skill body through the same markdown stack the
@@ -88,11 +99,23 @@ const WorkflowsRoute = lazy(() =>
  *  bundle as a static Settings section). */
 const SkillsRoute = lazy(() => import('./routes/skills').then((m) => ({ default: m.SkillsRoute })))
 
+/** Lazy because the surface carries the editor (templates, schedule/GitHub fields, a next-five-
+ *  runs preview), the week/day calendars, and the log — ~3k lines nothing outside this route
+ *  imports, and now that automations are on by default, every visitor would otherwise pay for
+ *  it before ever opening `/automations`. */
+const AutomationsRoute = lazy(() =>
+  import('./routes/automations/automations-route').then((m) => ({ default: m.AutomationsRoute })),
+)
+
 /** `/settings/skills` moved to the top-level `/skills` (out of the Settings shell). Redirect —
  *  preserving the `?skill=` selection and any hash — so pasted links and saved bookmarklets
  *  still land. The scoped Navigate keeps the redirect inside the active project. */
 function SettingsSkillsRedirect() {
   const location = useLocation()
+  const legacySkill = new URLSearchParams(location.search).get('skill')
+  if (legacySkill === '__bm') {
+    return <ScopedNavigate to={{ pathname: '/settings/bookmarklets', hash: location.hash }} replace />
+  }
   return (
     <ScopedNavigate
       to={{ pathname: '/skills', search: location.search, hash: location.hash }}
@@ -251,6 +274,15 @@ function LegacyPathRedirect() {
       resolvedBoot,
     )
     if (restored !== null) return <Navigate to={restored} replace />
+
+    // Nothing remembered. The boot folder is the landing project only while the registry lists
+    // it: since `/api/v1/projects` stopped listing an unregistered boot folder once the user has
+    // projects (the seed-once rule), landing there would open the cockpit on a project with no
+    // sidebar row — the launch folder quietly taking over a workspace the user filled on purpose.
+    // The most recently opened registered project is what the sidebar leads with, so it is what
+    // a bare launch opens. `/p/<bootProject>/` and every legacy deep link below still resolve.
+    const landing = bareRootLanding(projects.data, boot)
+    if (landing !== boot) return <Navigate to={`/p/${encodeURIComponent(landing)}/`} replace />
   }
 
   // A bare `/p` (or `/p/`) names no project — send it to the boot project's home rather than
@@ -274,10 +306,12 @@ const PAGE_TITLE_ROUTES = [
   // The global page. It is not project-scoped, so it never carries a `/p/` prefix to strip —
   // but it goes through the same table, because the browser title is one mechanism.
   { pattern: '/tasks', pageLabel: 'All tasks' },
+  { pattern: '/dashboard', pageLabel: 'Dashboard' },
   { pattern: '/new', pageLabel: 'New task' },
   { pattern: '/compare/:groupId', pageLabel: 'Compare' },
   { pattern: '/git/*', pageLabel: 'Git' },
   { pattern: '/github/*', pageLabel: 'GitHub' },
+  { pattern: '/tracker/*', pageLabel: 'Tracker' },
   { pattern: '/automations/*', pageLabel: 'Automations' },
   { pattern: '/skills', pageLabel: 'Skills' },
   { pattern: '/inbox', pageLabel: 'Inbox' },
@@ -307,7 +341,7 @@ export function pageTitleContext(pathname: string): PageTitleContext {
  *  `ProjectScopeRoute` layout above; the flat spellings below are relative to that prefix and
  *  stay stable — they are what teammates paste, and the legacy flat URLs redirect onto them.
  */
-export function AppRoutes() {
+export const AppRoutes = memo(function AppRoutes() {
   const capabilities = useHealth().data?.capabilities
   return (
     <Routes>
@@ -340,10 +374,26 @@ export function AppRoutes() {
           }
         />
         <Route
+          path="tasks/:id/graph"
+          element={
+            <Suspense fallback={<GitTabLoading tab="changes" />}>
+              <TaskGraphRoute />
+            </Suspense>
+          }
+        />
+        <Route
           path="tasks/:id/commits"
           element={
             <Suspense fallback={<GitTabLoading tab="changes" />}>
               <TaskCommitsRoute />
+            </Suspense>
+          }
+        />
+        <Route
+          path="tasks/:id/notes"
+          element={
+            <Suspense fallback={<GitTabLoading tab="notes" />}>
+              <TaskNotesRoute />
             </Suspense>
           }
         />
@@ -398,6 +448,25 @@ export function AppRoutes() {
             </Suspense>
           }
         />
+        {/* The repository file browser (#1279). Two routes, because a file path contains slashes:
+            the bare tab, and the splat that carries the selected file so `/git/files/a/b.ts` is the
+            file's own address. */}
+        <Route
+          path="git/files"
+          element={
+            <Suspense fallback={<RepoGitLoading />}>
+              <RepoGitRoute tab="files" />
+            </Suspense>
+          }
+        />
+        <Route
+          path="git/files/*"
+          element={
+            <Suspense fallback={<RepoGitLoading />}>
+              <RepoGitRoute tab="files" />
+            </Suspense>
+          }
+        />
         {/* The GitHub tab (R6 Step 1.1): issues and PRs are separate list URLs, each item a
             deep link. The nav item is forge-gated in the shell; the routes stay reachable so a
             pasted link renders the honest unavailable explainer instead of a 404. The bare
@@ -407,9 +476,22 @@ export function AppRoutes() {
           path="github"
           element={
             <Suspense fallback={<GithubLoading />}>
-              <GithubIndexRoute />
+              {/* `GithubRoute` itself, with `index`, rather than a wrapper component: React
+                  reconciles by element type, so any other type here would unmount the route on
+                  the hop to `github/issues/:n` and reset its search text — losing the very
+                  cross-state hit the user clicked (#730). The `prs` pair below already renders
+                  one type across its two paths, which is why it never had that bug. */}
+              <GithubRoute view="issues" index />
             </Suspense>
           }
+        />
+        <Route
+          path="tracker"
+          element={<Suspense fallback={<ScopeResolving />}><TrackerRoute /></Suspense>}
+        />
+        <Route
+          path="tracker/:id"
+          element={<Suspense fallback={<ScopeResolving />}><TrackerRoute /></Suspense>}
         />
         <Route
           path="github/prs"
@@ -443,10 +525,38 @@ export function AppRoutes() {
             </Suspense>
           }
         />
-        <Route path="automations" element={<AutomationsRoute />} />
-        <Route path="automations/new" element={<AutomationsRoute mode="new" />} />
-        <Route path="automations/:automationId" element={<AutomationsRoute mode="edit" />} />
-        <Route path="automations/:automationId/log" element={<AutomationsRoute mode="log" />} />
+        <Route
+          path="automations"
+          element={
+            <Suspense fallback={<AutomationsLoading />}>
+              <AutomationsRoute />
+            </Suspense>
+          }
+        />
+        <Route
+          path="automations/new"
+          element={
+            <Suspense fallback={<AutomationsLoading />}>
+              <AutomationsRoute mode="new" />
+            </Suspense>
+          }
+        />
+        <Route
+          path="automations/:automationId"
+          element={
+            <Suspense fallback={<AutomationsLoading />}>
+              <AutomationsRoute mode="edit" />
+            </Suspense>
+          }
+        />
+        <Route
+          path="automations/:automationId/log"
+          element={
+            <Suspense fallback={<AutomationsLoading />}>
+              <AutomationsRoute mode="log" />
+            </Suspense>
+          }
+        />
 
         {/* The skills catalog (R6 Step 1.4) — its own top-level surface, no settings sub-nav.
             `/settings/skills` redirects here (below) so pasted links keep working. */}
@@ -463,13 +573,13 @@ export function AppRoutes() {
             bundle like the overview does. */}
         <Route path="inbox" element={<InboxRoute />} />
 
-        {/* The workflow builder (R6 Step 1.6): /workflows opens the canvas on the repo's first
-            saved chain, /workflows/:name deep-links a specific one. */}
+        {/* The workflow node editor (spec 2026-09-30-workflow-node-editor): /workflows opens a new
+            canvas, /workflows/:name deep-links a saved workflow (v1 files open as graphs). */}
         <Route
           path="workflows"
           element={
             <Suspense fallback={<WorkflowsLoading />}>
-              <WorkflowsRoute />
+              <WorkflowGraphRoute />
             </Suspense>
           }
         />
@@ -477,10 +587,12 @@ export function AppRoutes() {
           path="workflows/:name"
           element={
             <Suspense fallback={<WorkflowsLoading />}>
-              <WorkflowsRoute />
+              <WorkflowGraphRoute />
             </Suspense>
           }
         />
+        {/* The editor's preview address while it was built beside the old builder. */}
+        <Route path="workflows-new/*" element={<ScopedNavigate to="/workflows" replace />} />
 
         {/* Settings (R6 Step 1.3): registry-driven — the section list, nav and routes all come
             from routes/settings/registry.tsx. Hidden sections are NOT routed, so their URLs are
@@ -521,6 +633,7 @@ export function AppRoutes() {
           keep redirecting to the boot project's thread (`LegacyPathRedirect` below owns it).
           React Router ranks this static segment above that `*`, so the two never compete. */}
       <Route path="/tasks" element={<GlobalTasksRoute />} />
+      <Route path="/dashboard" element={<Suspense fallback={<div role="status" className="p-6 text-sm text-muted-foreground">Loading dashboard…</div>}><DashboardRoute /></Suspense>} />
 
       {/* Global settings (multi-project spec, step 3.5) — the one cockpit area that is NOT
           under `/p/:projectId`, because nothing here belongs to a project: appearance and
@@ -544,4 +657,4 @@ export function AppRoutes() {
       <Route path="*" element={<LegacyPathRedirect />} />
     </Routes>
   )
-}
+})

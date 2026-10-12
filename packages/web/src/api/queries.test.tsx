@@ -6,7 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from './client'
 import { createQueryClient } from './query-client'
 import { setApiScope } from '@open-mercato/cezar-api-client'
+import { ProjectScopeContext } from './project-scope-context'
+import type { GithubRefStatusData } from '@open-mercato/cezar-api-client'
 import {
+  refStatusRecheckAfter,
+  useReferenceProjectId,
+  useProjectRepoBase,
   queryKeys,
   useProviderStatus,
   useRefreshProviderStatus,
@@ -19,10 +24,14 @@ import {
   usePatchRun,
   usePutAgentConfigFile,
   useRun,
+  useRepoFile,
+  useRepoTree,
   useRunChanges,
   useRuns,
   useSkills,
   useSkillsUpdate,
+  useStarCount,
+  STAR_COUNT_REFRESH_MS,
   workspaceQueryKeys,
 } from './queries'
 
@@ -117,12 +126,19 @@ class FakeHealthSocket {
 }
 
 describe('useRunnerModels', () => {
-  it('loads the workspace Codex catalog', async () => {
-    fetchMock.mockResolvedValue(json({ runner: 'codex', models: [{ id: 'gpt-future', label: 'Future', description: '' }], source: 'live', stale: false }))
-    const { result } = renderHook(() => useRunnerModels('codex'), { wrapper: wrapper() })
+  // One cache entry per runner (#794 for OpenCode, #784 for Claude): every runner cezar ships is
+  // read from its own host catalog, so the fetch must follow the pick rather than name one CLI.
+  it.each([
+    ['codex', 'gpt-future'],
+    ['claude', 'opus[1m]'],
+    ['opencode', 'openai/gpt-5.4'],
+    ['junie', 'v1:model:junie:sonnet'],
+  ] as const)('loads the workspace %s catalog from its own cache entry', async (runner, id) => {
+    fetchMock.mockResolvedValue(json({ runner, models: [{ id, label: 'Future', description: '' }], source: 'live', stale: false }))
+    const { result } = renderHook(() => useRunnerModels(runner), { wrapper: wrapper() })
     await waitFor(() => expect(result.current.isSuccess).toBe(true))
-    expect(result.current.data?.models[0]?.id).toBe('gpt-future')
-    expect(fetchMock.mock.calls.at(-1)?.[0]).toBe('/api/v1/models?runner=codex')
+    expect(result.current.data?.models[0]?.id).toBe(id)
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toBe(`/api/v1/models?runner=${runner}`)
   })
 
   it('loads the OpenCode catalog from its own cache entry (#794)', async () => {
@@ -133,11 +149,37 @@ describe('useRunnerModels', () => {
     expect(fetchMock.mock.calls.at(-1)?.[0]).toBe('/api/v1/models?runner=opencode')
   })
 
-  it('never asks the server about claude, which has no host catalog', async () => {
-    const { result } = renderHook(() => useRunnerModels('claude'), { wrapper: wrapper() })
+  it('loads the Cursor catalog from its own cache entry (#807)', async () => {
+    fetchMock.mockResolvedValue(json({ runner: 'cursor', models: [{ id: 'composer-2.5', label: 'Composer 2.5', description: '' }], source: 'live', stale: false }))
+    const { result } = renderHook(() => useRunnerModels('cursor'), { wrapper: wrapper() })
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(result.current.data?.models[0]?.id).toBe('composer-2.5')
+    expect(fetchMock.mock.calls.at(-1)?.[0]).toBe('/api/v1/models?runner=cursor')
+  })
+
+  // The other half of the `enabled` guard: a caller that only MIGHT render the pills (the
+  // thread's Continue) must not fetch a catalog it will never show.
+  it('never fetches while disabled', async () => {
+    const { result } = renderHook(() => useRunnerModels('claude', false), { wrapper: wrapper() })
     await waitFor(() => expect(result.current.fetchStatus).toBe('idle'))
     expect(result.current.data).toBeUndefined()
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('one runner erroring does not affect a separate hook instance for another runner (#807)', async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/models?runner=codex') {
+        return json({ runner: 'codex', models: [{ id: 'gpt-future', label: 'Future', description: '' }], source: 'live', stale: false })
+      }
+      if (url === '/api/v1/models?runner=cursor') return new Response('boom', { status: 500 })
+      return new Promise<never>(() => {})
+    })
+    const { result: codex } = renderHook(() => useRunnerModels('codex'), { wrapper: wrapper() })
+    const { result: cursor } = renderHook(() => useRunnerModels('cursor'), { wrapper: wrapper() })
+    await waitFor(() => expect(cursor.current.isError).toBe(true), { timeout: 5000 })
+    await waitFor(() => expect(codex.current.isSuccess).toBe(true))
+    expect(codex.current.data?.models[0]?.id).toBe('gpt-future')
   })
 })
 
@@ -147,7 +189,8 @@ describe('provider status workspace query', () => {
       { provider: 'claude', status: 'connected', enabled: true },
       { provider: 'codex', status: 'disconnected', enabled: true, hint: 'Run codex login.' },
       { provider: 'opencode', status: 'not-installed', enabled: true },
-    ],
+      { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
   }
 
   afterEach(() => {
@@ -248,7 +291,8 @@ describe('provider status workspace query', () => {
         { provider: 'claude', status: 'disconnected', enabled: true },
         { provider: 'codex', status: 'connected', enabled: true },
         { provider: 'opencode', status: 'not-installed', enabled: true },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     }
     fetchMock.mockResolvedValue(json(refreshed))
     const client = createQueryClient()
@@ -279,7 +323,8 @@ describe('provider status workspace query', () => {
         { provider: 'claude', status: 'disconnected', enabled: true, authFailureId: 'sse-1', hint: 'Reconnect.' },
         { provider: 'codex', status: 'connected', enabled: true },
         { provider: 'opencode', status: 'not-installed', enabled: true },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     })
 
     await act(async () => deferred.resolve(json(PROVIDERS)))
@@ -307,7 +352,8 @@ describe('provider status workspace query', () => {
         { provider: 'claude', status: 'disconnected', enabled: true, authFailureId: 'sse-1', hint: 'Reconnect.' },
         { provider: 'codex', status: 'connected', enabled: true },
         { provider: 'opencode', status: 'not-installed', enabled: true },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     })
 
     await act(async () => deferred.resolve(json(PROVIDERS)))
@@ -324,7 +370,8 @@ describe('provider status workspace query', () => {
         { provider: 'claude', status: 'connected', enabled: true },
         { provider: 'codex', status: 'connected', enabled: false },
         { provider: 'opencode', status: 'not-installed', enabled: true },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     }
     fetchMock.mockResolvedValue(json(confirmed))
     const client = createQueryClient()
@@ -352,7 +399,8 @@ describe('provider status workspace query', () => {
         { provider: 'claude', status: 'disconnected', enabled: true, authFailureId: 'retry-1', hint: 'Reconnect.' },
         { provider: 'codex', status: 'connected', enabled: true },
         { provider: 'opencode', status: 'not-installed', enabled: true },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     })
     const { result } = renderHook(() => useRetryProviderAuth(), {
       wrapper: ({ children }: { children: ReactNode }) => (
@@ -367,7 +415,8 @@ describe('provider status workspace query', () => {
         { provider: 'claude', status: 'disconnected', enabled: true, authFailureId: 'sse-2', hint: 'Reconnect again.' },
         { provider: 'codex', status: 'connected', enabled: true },
         { provider: 'opencode', status: 'not-installed', enabled: true },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     })
 
     await act(async () => deferred.resolve(json(PROVIDERS)))
@@ -384,7 +433,8 @@ describe('provider status workspace query', () => {
         { provider: 'claude', status: 'disconnected', enabled: true, authFailureId: 'incident-1' },
         { provider: 'codex', status: 'connected', enabled: true },
         { provider: 'opencode', status: 'not-installed', enabled: true },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     }
     fetchMock.mockResolvedValue(new Response(JSON.stringify({ error: 'stale incident' }), { status: 409 }))
     const client = createQueryClient()
@@ -489,6 +539,34 @@ describe('useSkills', () => {
       expect(result.current.data?.map((skill) => skill.name)).toEqual(['local', 'om-fix']),
     )
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(['/api/v1/skills', '/api/v1/skills?wait=1'])
+  })
+})
+
+describe('useStarCount', () => {
+  it('re-reads the count every ten seconds so the chip tracks the live number', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      let count = 100
+      fetchMock.mockImplementation(async () =>
+        json({ available: true, count: count++, url: 'https://github.com/open-mercato/cezar' }),
+      )
+      const client = createQueryClient()
+      const { result } = renderHook(() => useStarCount(), {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      })
+      await waitFor(() => expect(result.current.data?.count).toBe(100))
+      expect(STAR_COUNT_REFRESH_MS).toBe(10_000)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(STAR_COUNT_REFRESH_MS)
+      })
+      await waitFor(() => expect(result.current.data?.count).toBe(101))
+      expect(fetchMock.mock.calls.every(([path]) => path === '/api/v1/star-count')).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -872,10 +950,18 @@ describe('useMarkRunUnseen', () => {
 })
 
 describe('usePatchRun', () => {
-  it('PATCHes the title and invalidates every runs query on success', async () => {
-    fetchMock.mockResolvedValue(json({ id: 'run-1', title: 'New name', titleSummary: 'New name' }))
+  it('writes the successful title receipt into list/detail caches and invalidates the finder', async () => {
+    const current = {
+      id: 'run-1', title: 'Old name', titleSummary: 'Old name', titleOrigin: 'auto' as const,
+      workflow: 'quick-task', task: 'do it', status: 'running' as const, createdAt: '2026-01-01',
+      tokensUsed: 0, archived: false, steps: [],
+    }
+    const updated = { ...current, title: 'New name', titleSummary: 'New name', titleOrigin: 'user' as const }
+    fetchMock.mockResolvedValue(json(updated))
     const client = createQueryClient()
     const invalidate = vi.spyOn(client, 'invalidateQueries')
+    client.setQueryData(queryKeys.runs.list(), [current])
+    client.setQueryData(queryKeys.runs.detail('run-1'), current)
     const { result } = renderHook(() => usePatchRun('run-1'), {
       wrapper: ({ children }: { children: ReactNode }) => (
         <QueryClientProvider client={client}>{children}</QueryClientProvider>
@@ -889,8 +975,11 @@ describe('usePatchRun', () => {
     expect(path).toBe('/api/v1/runs/run-1')
     expect(init.method).toBe('PATCH')
     expect(JSON.parse(init.body as string)).toEqual({ title: 'New name' })
+    expect(client.getQueryData<typeof current[]>(queryKeys.runs.list())?.[0]).toMatchObject(updated)
+    expect(client.getQueryData<typeof current>(queryKeys.runs.detail('run-1'))).toMatchObject(updated)
     // `runs.all` is a prefix of the list, detail and diff keys — one call reaches them all.
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.runs.all })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: workspaceQueryKeys.runsIndex })
   })
 
   it('does not invalidate anything on failure', async () => {
@@ -953,5 +1042,205 @@ describe('query defaults', () => {
     expect(defaults?.refetchInterval).toBe(false)
     expect(defaults?.refetchOnWindowFocus).toBe(false)
     expect(defaults?.staleTime).toBeGreaterThanOrEqual(60_000)
+  })
+})
+
+/**
+ * The refresh policy for reference statuses — and specifically, that the cockpit no longer HAS
+ * one.
+ *
+ * Reference statuses are the one query family here that polls: everything else is told what
+ * changed by the run stream, and GitHub is outside that stream, so a chip reading "checks running"
+ * has no other way to ever stop saying it. But *when* to ask is forge semantics — a merged pull
+ * request can never change, a closed one can be reopened, a running check finishes in minutes —
+ * and those live server-side, next to the cache that decides whether asking would even reach
+ * GitHub. The cockpit obeys `recheckAfterMs` and holds no table of its own; a second copy here
+ * would be two sets of constants that must agree with nothing enforcing it.
+ */
+/**
+ * One project, one name.
+ *
+ * The bug this pins: the global Tasks page keys every chip by its run's real `projectId`, because
+ * its rows span the registry — while an unscoped surface (the sidebar, the run header, the
+ * per-project table) used the `'default'` alias the routes accept. The same pull request was then
+ * remembered under two names: a status learned on one surface never reached the other, and both
+ * fetched it separately. Reported as "the ref updated in All tasks but the sidebar still holds
+ * the old status".
+ */
+describe('useReferenceProjectId', () => {
+  /** `useProjectScope` reads React context — the module-level `setApiScope` is a different seam. */
+  const mounted = (scope: string | null, health?: unknown) => {
+    const client = createQueryClient()
+    if (health !== undefined) client.setQueryData(queryKeys.health, health)
+    return function Wrapper({ children }: { children: ReactNode }) {
+      return (
+        <QueryClientProvider client={client}>
+          <ProjectScopeContext.Provider value={{ projectId: scope, apiBase: '/api/v1' }}>
+            {children}
+          </ProjectScopeContext.Provider>
+        </QueryClientProvider>
+      )
+    }
+  }
+
+  it('uses the mounted scope when there is one', () => {
+    const { result } = renderHook(() => useReferenceProjectId(), {
+      wrapper: mounted('proj-a', { ...HEALTH, bootProject: 'boot-id' }),
+    })
+    expect(result.current).toBe('proj-a')
+  })
+
+  it('names the BOOT project when unscoped — never the `default` alias', () => {
+    // `default` would key the same reference differently from every cross-project surface.
+    const { result } = renderHook(() => useReferenceProjectId(), {
+      wrapper: mounted(null, { ...HEALTH, bootProject: 'boot-id' }),
+    })
+    expect(result.current).toBe('boot-id')
+  })
+
+  it('answers undefined until health says which project that is', () => {
+    // Better a neutral chip for a moment than an entry written under a name nothing else uses.
+    const { result } = renderHook(() => useReferenceProjectId(), { wrapper: mounted(null) })
+    expect(result.current).toBeUndefined()
+  })
+})
+
+describe('useProjectRepoBase', () => {
+  const mounted = (scope: string | null, health?: unknown, projects?: unknown) => {
+    const client = createQueryClient()
+    if (health !== undefined) client.setQueryData(queryKeys.health, health)
+    if (projects !== undefined) client.setQueryData(workspaceQueryKeys.projects, { projects })
+    return function Wrapper({ children }: { children: ReactNode }) {
+      return (
+        <QueryClientProvider client={client}>
+          <ProjectScopeContext.Provider value={{ projectId: scope, apiBase: '/api/v1' }}>
+            {children}
+          </ProjectScopeContext.Provider>
+        </QueryClientProvider>
+      )
+    }
+  }
+
+  const REGISTRY = [
+    { id: 'boot-id', name: 'boot', root: '/home/me/cezar', repoUrl: 'https://github.com/o/boot' },
+    { id: 'proj-a', name: 'a', root: '/home/me/a', repoUrl: 'https://github.com/o/a' },
+    { id: 'proj-b', name: 'b', root: '/home/me/b' },
+  ]
+
+  // The defect this was found through: the SAME task showed a linked chip on All tasks (which
+  // reads the registry) and inert text on its own page (which read health, and health only names
+  // the boot project's repo).
+  it('answers a NON-boot project from the registry, where All tasks reads it', () => {
+    const { result } = renderHook(() => useProjectRepoBase(), {
+      wrapper: mounted('proj-a', { ...HEALTH, bootProject: 'boot-id', repo: { remote: 'git@github.com:o/boot.git' } }, REGISTRY),
+    })
+    expect(result.current).toBe('https://github.com/o/a')
+  })
+
+  it('never hands a project the boot repo — #526', () => {
+    // `proj-b` has no forge remote of its own; health's is the boot project's and would be a link
+    // into a completely different repository.
+    const { result } = renderHook(() => useProjectRepoBase(), {
+      wrapper: mounted('proj-b', { ...HEALTH, bootProject: 'boot-id', repo: { remote: 'git@github.com:o/boot.git' } }, REGISTRY),
+    })
+    expect(result.current).toBeUndefined()
+  })
+
+  it('falls back to health for the boot project — an unregistered boot folder still links', () => {
+    const { result } = renderHook(() => useProjectRepoBase(), {
+      wrapper: mounted(null, { ...HEALTH, bootProject: 'boot-id', repo: { remote: 'git@github.com:o/boot.git' } }, []),
+    })
+    expect(result.current).toBe('https://github.com/o/boot')
+  })
+})
+
+describe('refStatusRecheckAfter', () => {
+  const answered = (recheckAfterMs: number | null): GithubRefStatusData =>
+    ({ available: true, prs: {}, issues: {}, recheckAfterMs }) as GithubRefStatusData
+
+  it('takes the cadence from the answer, whatever it says', () => {
+    expect(refStatusRecheckAfter(answered(60_000))).toBe(60_000)
+    expect(refStatusRecheckAfter(answered(24 * 60 * 60_000))).toBe(24 * 60 * 60_000)
+  })
+
+  it('passes null through — nothing here can change, so nothing is scheduled', () => {
+    // Becomes `refetchInterval: false` and an infinite staleTime, so a table of merged pull
+    // requests costs nothing on a loop and ignores window focus too.
+    expect(refStatusRecheckAfter(answered(null))).toBeNull()
+  })
+
+  it('obeys an unavailable answer as readily as a successful one', () => {
+    expect(
+      refStatusRecheckAfter({ available: false, reason: 'gh CLI not found', recheckAfterMs: 300_000 } as GithubRefStatusData),
+    ).toBe(300_000)
+  })
+
+  it('falls back only where there is no answer to obey', () => {
+    // Still loading, or errored out — `retry` owns the immediate attempt; this is the backstop
+    // that keeps the query from going silent forever.
+    expect(refStatusRecheckAfter(undefined)).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * The Git tab's Files sub-tab (#1279). `/repo/*` is not on the SSE stream, so these two queries
+ * deliberately opt out of the client-wide "the stream says when something changed" default — the
+ * data is a working tree an agent edits while the tab is in the background.
+ */
+describe('useRepoTree / useRepoFile', () => {
+  const TREE = { paths: ['a.ts'], truncated: false }
+
+  it('does not retry a 409 — it is the server’s answer, not an outage', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: 'not a git repository' }), {
+        status: 409,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const { result } = renderHook(() => useRepoTree(), { wrapper: wrapper() })
+
+    await waitFor(() => expect(result.current.isError).toBe(true))
+    expect(result.current.error).toBeInstanceOf(ApiError)
+    expect((result.current.error as ApiError).status).toBe(409)
+    // Exactly one attempt: a retry cannot turn "not a git repository" into a repository.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-reads the index on focus, which the shared 5-minute staleTime would otherwise swallow', async () => {
+    fetchMock.mockResolvedValue(json(TREE))
+    const client = createQueryClient()
+    const { result } = renderHook(() => useRepoTree(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    })
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const query = client.getQueryCache().find({ queryKey: queryKeys.repoTree })
+    if (!query) throw new Error('repo tree query was not created')
+    // `staleTime: 0` is the load-bearing half: without it this freshly-fetched entry would still
+    // be fresh and the focus event would do nothing.
+    expect(query.observers[0]?.options.staleTime).toBe(0)
+    expect(query.observers[0]?.options.refetchInterval).toBe(false)
+    window.dispatchEvent(new Event('visibilitychange'))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+  })
+
+  it('does not fetch a file until one is selected, and keys the cache per path', async () => {
+    fetchMock.mockResolvedValue(json({ type: 'file', path: 'a.ts', size: 1, binary: false, tooLarge: false, content: 'x' }))
+    const client = createQueryClient()
+    const wrap = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+
+    const idle = renderHook(() => useRepoFile(undefined), { wrapper: wrap })
+    expect(idle.result.current.fetchStatus).toBe('idle')
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    const { result } = renderHook(() => useRepoFile('a.ts'), { wrapper: wrap })
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+    expect(client.getQueryCache().find({ queryKey: queryKeys.repoFile('a.ts') })).toBeDefined()
+    expect(client.getQueryCache().find({ queryKey: queryKeys.repoFile('b.ts') })).toBeUndefined()
   })
 })

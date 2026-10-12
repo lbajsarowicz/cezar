@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomInt } from 'node:crypto';
+import { isRunnerId } from '../core/agent-runner.ts';
 import { detectEnvironment, type BackendCheck } from '../core/backend-detect.ts';
 import {
   CANCEL,
@@ -85,6 +86,12 @@ export class StepAborted extends Error {}
 /** Thrown from an optional step's `run()` to record it as `skipped` (e.g. certbot DNS not ready). */
 export class StepSkipped extends Error {}
 
+/** Extra context for a failed verification, when retrying cannot change the result. */
+export interface VerifyFailure {
+  message: string;
+  retryable: boolean;
+}
+
 export interface SudoStepOpts {
   /** One-line description of what/why (shown above the command). */
   description: string;
@@ -114,6 +121,8 @@ export interface SudoStepOpts {
   inputLabel?: string;
   /** Prove the command actually took effect. Runs after every attempt. */
   verify: (ctx: InstallContext) => Promise<boolean>;
+  /** Explain a failed verification and optionally classify it as terminal. */
+  verifyFailure?: (ctx: InstallContext) => Promise<VerifyFailure | undefined>;
 }
 
 /**
@@ -224,7 +233,13 @@ export async function sudoStep(ctx: InstallContext, opts: SudoStepOpts): Promise
       return;
     }
 
-    ui.error('That did not take effect — the verification check still fails.');
+    const failure = await opts.verifyFailure?.(ctx);
+    if (failure) {
+      ui.error(failure.message);
+      if (!failure.retryable) throw new StepAborted(failure.message);
+    } else {
+      ui.error('That did not take effect — the verification check still fails.');
+    }
     if (ctx.assumeYes) {
       throw opts.skippable
         ? new StepSkipped(`verification failed for: ${opts.command}`)
@@ -284,8 +299,11 @@ export function depCheckStep(opts: DepStepOpts = {}): InstallStep {
     async check(ctx) {
       if (ctx.dryRun) return false;
       const checks = await detect();
-      // Satisfied when at least one agent CLI is present and authed.
-      return checks.some((c) => ['claude', 'codex', 'opencode'].includes(c.name) && c.available);
+      // Satisfied when at least one agent CLI is present and authed. Derived from RUNNER_IDS,
+      // never a literal list: `BackendCheck['name']` also carries the non-agent tools (`gh`,
+      // `git`), so the gate has to filter — and a hand-written array silently under-counts the
+      // moment a runner is added (a pi-only host reporting "no agent CLI", #387 review).
+      return checks.some((c) => isRunnerId(c.name) && c.available);
     },
     async run(ctx) {
       const checks = await detect();

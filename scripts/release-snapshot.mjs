@@ -4,10 +4,14 @@
 // `publish-snapshot` job after `npm run build` (spec
 // .ai/specs/2026-07-18-npm-preview-publish.md, #482).
 //
+// Also the engine behind the nightly channel (.github/workflows/nightly.yml):
+// same stamping and same publish order, reached by setting CEZ_RELEASE_CHANNEL=nightly
+// rather than by the event — see resolveChannel in src/release/snapshot.ts.
+//
 // Reads the CI facts from GitHub Actions' env, decides via computeSnapshot,
 // stamps every manifest in the release set (intra-release dependencies pinned
 // exact), publishes the non-`private` ones in DEPENDENCY ORDER — api-client,
-// then the service, then the alias — always with an explicit --tag so a snapshot can never move
+// then the service, then the aliases — always with an explicit --tag so a snapshot can never move
 // `latest`, then emits a one-line JSON result to $GITHUB_OUTPUT for the
 // PR-comment and summary steps.
 //
@@ -50,6 +54,7 @@ const dirs = {
   apiClient: path.join(repoRoot, 'packages/api-client'),
   cezar: path.join(repoRoot, 'packages/cezar'),
   alias: path.join(repoRoot, 'alias-cezar'),
+  runAlias: path.join(repoRoot, 'alias-cezar-run'),
 };
 
 const readManifest = (dir) => JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8'));
@@ -73,12 +78,18 @@ const manifests = {
   apiClient: readManifest(dirs.apiClient),
   cezar: readManifest(dirs.cezar),
   alias: readManifest(dirs.alias),
+  runAlias: readManifest(dirs.runAlias),
 };
 
 const prNumberRaw = process.env.PR_NUMBER ?? '';
+// The nightly channel is named after the UTC day it was cut. Overridable via env so
+// the e2e suite can assert an exact version instead of the wall clock.
+const nightlyDate = process.env.NIGHTLY_DATE || new Date().toISOString().slice(0, 10).replaceAll('-', '');
 const plan = computeSnapshot({
   eventName: process.env.GITHUB_EVENT_NAME ?? '',
   refName: process.env.GITHUB_REF_NAME ?? '',
+  requestedChannel: process.env.CEZ_RELEASE_CHANNEL || undefined,
+  nightlyDate,
   prNumber: /^\d+$/.test(prNumberRaw) ? Number(prNumberRaw) : undefined,
   headRepo: process.env.PR_HEAD_REPO || undefined,
   repo: process.env.GITHUB_REPOSITORY || undefined,
@@ -102,7 +113,7 @@ if (!dryRun && !token) {
 }
 
 const stamped = stampManifests(manifests, plan.version);
-const order = ['contract', 'apiClient', 'cezar', 'alias'];
+const order = ['contract', 'apiClient', 'cezar', 'alias', 'runAlias'];
 for (const key of order) writeManifest(dirs[key], stamped[key]);
 console.log(
   `release-snapshot: stamped ${order.map((key) => stamped[key].name).join(' + ')} to ${plan.version} (dist-tag ${plan.distTag}${dryRun ? ', dry run' : ''})`,
@@ -153,8 +164,10 @@ emitOutput({
   rootName: stamped.cezar.name,
   apiClientName: stamped.apiClient.name,
   aliasName: stamped.alias.name,
+  // The documented npx spelling — every copy-paste command CI prints uses it.
+  runAliasName: stamped.runAlias.name,
   version: plan.version,
   distTag: plan.distTag,
   publishedNames: published.join(','),
-  installLines: buildInstallLines(stamped.alias.name, plan.version),
+  installLines: buildInstallLines(stamped.runAlias.name, plan.version),
 });

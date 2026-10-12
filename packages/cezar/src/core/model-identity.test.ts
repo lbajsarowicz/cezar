@@ -57,6 +57,16 @@ describe('resolveModelIdentity — empty / auto', () => {
       expect(resolveModelIdentity(backend, '   ')).toBeUndefined();
     }
   });
+
+  it('is undefined for the literal label "auto" on cursor only — its own settings sentinel', () => {
+    expect(resolveModelIdentity('cursor', 'auto')).toBeUndefined();
+    expect(resolveModelIdentity('cursor', 'Auto')).toBeUndefined();
+  });
+
+  it('does not swallow a model literally named "auto" on another backend', () => {
+    // claude has a default provider, so a bare id resolves rather than throwing.
+    expect(resolveModelIdentity('claude', 'auto')).toEqual({ provider: 'anthropic', model: 'auto' });
+  });
 });
 
 describe('resolveModelIdentity — bare ids per backend', () => {
@@ -88,6 +98,30 @@ describe('resolveModelIdentity — bare ids per backend', () => {
     } catch (err) {
       expect((err as Error).message).toContain('ambiguous');
       expect((err as Error).message).toContain('provider/model');
+    }
+  });
+
+  it('cursor bare catalog ids resolve to the cursor provider namespace', () => {
+    expect(resolveModelIdentity('cursor', 'kimi-k3-low')).toEqual({
+      provider: 'cursor',
+      model: 'kimi-k3-low',
+    });
+    expect(resolveModelIdentity('cursor', 'composer-2.5')).toEqual({
+      provider: 'cursor',
+      model: 'composer-2.5',
+    });
+    expect(toBackendModel('cursor', { provider: 'cursor', model: 'kimi-k3-low' })).toBe(
+      'kimi-k3-low',
+    );
+  });
+
+  it('pi rejects a bare id like opencode — same provider/model convention (#387)', () => {
+    expect(() => resolveModelIdentity('pi', 'sonnet')).toThrow(ModelIdentityError);
+    try {
+      resolveModelIdentity('pi', 'sonnet');
+    } catch (err) {
+      expect((err as Error).message).toContain('ambiguous');
+      expect((err as Error).message).toContain('pi');
     }
   });
 
@@ -161,8 +195,11 @@ describe('toBackendModel — wire form per backend', () => {
     );
   });
 
-  it('multi-provider backends (opencode) get the full provider/model', () => {
+  it('multi-provider backends (opencode, pi) get the full provider/model', () => {
     expect(toBackendModel('opencode', { provider: 'anthropic', model: 'claude-opus-4-8' })).toBe(
+      'anthropic/claude-opus-4-8',
+    );
+    expect(toBackendModel('pi', { provider: 'anthropic', model: 'claude-opus-4-8' })).toBe(
       'anthropic/claude-opus-4-8',
     );
   });
@@ -175,6 +212,11 @@ describe('round-trip: composer preset → resolve → render back to the wire st
     { backend: 'codex', presets: ['gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5-codex'] },
     {
       backend: 'opencode',
+      presets: ['anthropic/claude-opus-4-8', 'anthropic/claude-sonnet-5', 'openai/gpt-5.1'],
+    },
+    { backend: 'cursor', presets: ['kimi-k3-low', 'composer-2.5'] },
+    {
+      backend: 'pi',
       presets: ['anthropic/claude-opus-4-8', 'anthropic/claude-sonnet-5', 'openai/gpt-5.1'],
     },
   ];

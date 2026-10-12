@@ -6,10 +6,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createQueryClient } from '@/api/query-client'
 import type { ProjectListEntry, RunIndexEntry } from '@open-mercato/cezar-api-client'
 import { ListViewProvider, useListView } from '@/components/list-view'
-import { workspaceQueryKeys } from '@/api/queries'
+import { __clearRememberedStatusesForTests, workspaceQueryKeys } from '@/api/queries'
 import { Toaster, resetToasts } from '@/components/ui/toaster'
 
 import { GlobalTasksRoute } from './global-tasks'
+import { resolveConflictsPrompt } from './task-thread/run-actions'
 
 /**
  * The global Tasks page, wired to stubbed `/api/v1/projects` + `/api/v1/workspace/runs-index`.
@@ -23,6 +24,10 @@ afterEach(() => {
   act(() => resetToasts())
   cleanup()
   vi.unstubAllGlobals()
+  // Reference statuses are remembered for the LIFETIME OF THE TAB, deliberately (a re-keyed batch
+  // must not blank the chips) — which in vitest means one case's statuses would otherwise be
+  // remembered by the next one in this file.
+  __clearRememberedStatusesForTests()
 })
 
 const PROJECTS: ProjectListEntry[] = [
@@ -108,6 +113,8 @@ function stubFetch({
   indexStatus = 200,
   archiveStatus = 200,
   costMetrics = true,
+  refStatus,
+  indexStatuses,
 }: {
   runs?: RunIndexEntry[]
   projects?: ProjectListEntry[]
@@ -115,6 +122,14 @@ function stubFetch({
   indexStatus?: number
   archiveStatus?: number
   costMetrics?: boolean
+  /** Per-project chip status, as the forge would answer it. Absent = the forge is unreachable,
+   *  which is the only honest default here: no `gh`, no statuses, neutral chips. */
+  refStatus?: Record<
+    string,
+    { prs?: Record<number, string>; issues?: Record<number, string>; conflicts?: number[] }
+  >
+  /** What the runs-index itself already knew — the free, no-round-trip path. */
+  indexStatuses?: Record<string, { prs: Record<number, string>; issues: Record<number, string> }>
 } = {}) {
   sent = []
   seenAt = undefined
@@ -131,6 +146,20 @@ function stubFetch({
         path,
         body: init.body === undefined ? undefined : JSON.parse(String(init.body)),
       })
+      if (path === '/api/v1/providers/status') {
+        return jsonResponse({ providers: [{ provider: 'claude', status: 'connected', enabled: true }] })
+      }
+      // The FULL record, which this page's index row deliberately is not: the conflict panel's
+      // action fetches it (per project, on open) to learn whether the task can be spoken to.
+      const detail = /^\/api\/v1\/p\/([^/]+)\/runs\/([^/]+)$/.exec(path)
+      if (detail && method === 'GET') {
+        const [, projectId, id] = detail
+        const found = index.find((run) => run.projectId === projectId && run.id === id)
+        if (!found) return jsonResponse({ error: 'not found' }, 404)
+        return jsonResponse({ ...found, task: found.title, tokensUsed: 0, steps: [{ id: 'task', name: 'Do the task', kind: 'agent', status: 'done', iterations: 1, tokensUsed: 0, sessionId: 'sess-1' }] })
+      }
+      const message = /^\/api\/v1\/p\/([^/]+)\/runs\/([^/]+)\/(messages|continue)$/.exec(path)
+      if (message && method === 'POST') return jsonResponse({ ok: true })
       if (path === '/api/v1/health') {
         // Only the slice `usageMetricVisibility` reads — the host's cost/token gate.
         return jsonResponse({ capabilities: { costMetrics, tokenUsageMetrics: true } })
@@ -144,6 +173,22 @@ function stubFetch({
           runs: index.map((run) => (seenAt === undefined ? run : { ...run, seenAt })),
           perProjectLimit: 200,
           truncated,
+          // Statuses the server already had, riding along with the rows — see `indexedStatuses`.
+          referenceStatuses: indexStatuses ?? {},
+        })
+      }
+      const status = /^\/api\/v1\/p\/([^/]+)\/github\/ref-status/.exec(path)
+      if (status) {
+        const answer = refStatus?.[status[1]!]
+        // `recheckAfterMs` is the server's call on when to ask again — part of the shape, so the
+        // fixture carries it.
+        if (!answer) return jsonResponse({ available: false, reason: 'gh CLI not found', recheckAfterMs: 300_000 })
+        return jsonResponse({
+          available: true,
+          prs: answer.prs ?? {},
+          issues: answer.issues ?? {},
+          ...(answer.conflicts ? { conflicts: answer.conflicts } : {}),
+          recheckAfterMs: null,
         })
       }
       const receipt = /^\/api\/v1\/p\/([^/]+)\/runs\/([^/]+)\/(read|unread)$/.exec(path)
@@ -205,7 +250,7 @@ function SharedViewProbe() {
 /** Set by the receipt test: what the index answers as `seenAt` on its NEXT read. */
 let seenAt: string | undefined
 
-const unreadMarkers = () => [...document.querySelectorAll('[aria-label="unread"]')]
+const unreadMarkers = () => [...document.querySelectorAll('[data-slot="unread-marker"]')]
 
 const rowIds = () =>
   [...document.querySelectorAll('[data-slot="global-task-row"]')].map(
@@ -309,6 +354,59 @@ describe('global tasks page', () => {
         row.getAttribute('data-run-id'),
       ),
     ).toEqual(['a1', 'w1'])
+  })
+
+  // The subtask accordion (#1110), same contract as the per-project table: a dispatched child
+  // folds behind its parent's chip, collapsed by default, and a live search overrides the fold
+  // so a match can never hide under a collapsed parent.
+  describe('dispatched subtasks fold behind their parent', () => {
+    const DISPATCHED: RunIndexEntry = {
+      projectId: 'api',
+      id: 'a2',
+      title: 'Review the checkout endpoint',
+      status: 'running',
+      createdAt: '2026-07-14T10:30:00Z',
+      archived: false,
+      workflow: 'quick-task',
+      dispatch: { rootRunId: 'a1', parentRunId: 'a1', kind: 'review' },
+    }
+    const toggle = () =>
+      document.querySelector<HTMLButtonElement>('[data-run-id="a1"] [data-slot="subtask-toggle"]')
+
+    it('hides the child until the parent’s chip is clicked, and folds it back on the next click', async () => {
+      stubFetch({ runs: [...RUNS, DISPATCHED] })
+      renderPage()
+      await screen.findByText('Add checkout endpoint')
+
+      // Collapsed on arrival: the child is not a row, the parent wears the count.
+      expect(rowIds()).toEqual(['a1', 'w1', 'i1'])
+      expect(toggle()?.textContent).toBe('1 subtask')
+      expect(toggle()?.getAttribute('aria-expanded')).toBe('false')
+
+      fireEvent.click(toggle()!)
+      expect(rowIds()).toEqual(['a1', 'a2', 'w1', 'i1'])
+      expect(
+        document.querySelector('[data-run-id="a2"]')?.getAttribute('data-depth'),
+      ).toBe('1')
+      expect(toggle()?.getAttribute('aria-expanded')).toBe('true')
+
+      fireEvent.click(toggle()!)
+      expect(rowIds()).toEqual(['a1', 'w1', 'i1'])
+    })
+
+    it('a live search overrides the fold so a nested match stays visible', async () => {
+      stubFetch({ runs: [...RUNS, DISPATCHED] })
+      renderPage()
+      await screen.findByText('Add checkout endpoint')
+
+      const input = screen.getAllByLabelText('Search tasks across projects')[0]!
+      fireEvent.change(input, { target: { value: 'checkout endpoint' } })
+      await waitFor(() => expect(rowIds()).toEqual(['a1', 'a2']))
+
+      // Clearing the search folds the untouched accordion back to its default.
+      fireEvent.change(input, { target: { value: '' } })
+      await waitFor(() => expect(rowIds()).toEqual(['a1', 'w1', 'i1']))
+    })
   })
 
   describe('filters live in the URL', () => {
@@ -657,6 +755,116 @@ describe('global tasks page', () => {
     expect(document.querySelector('[data-slot="pr-chip"]')!.tagName).toBe('SPAN')
   })
 
+  it('paints chips from the INDEX, without waiting on a ref-status answer', async () => {
+    // The statuses ride along with the rows that carry the references, so the chips are coloured
+    // in the same paint as the table rather than a round trip later. `refStatus` is deliberately
+    // left unset: the lazy route answers "gh CLI not found" here, so a coloured chip can ONLY
+    // have come from the index. (The refresh request still goes out — this removes the wait
+    // before first paint, not the cadence that keeps a status current.)
+    stubFetch({ indexStatuses: { api: { prs: { 42: 'merged' }, issues: {} } } })
+    renderPage()
+    await screen.findByText('Add checkout endpoint')
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-slot="pr-chip"]')?.getAttribute('data-status')).toBe('merged'),
+    )
+  })
+
+  it('still asks about references the index had nothing warm for', async () => {
+    // Cache-only on the server means a cold reference is simply absent — the lazy route stays the
+    // thing that actually goes and looks.
+    stubFetch({
+      indexStatuses: { api: { prs: { 42: 'merged' }, issues: {} } },
+      refStatus: { web: { issues: { 7: 'open' } } },
+    })
+    renderPage()
+    await screen.findByText('Checkout page')
+
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-run-id="w1"] [data-slot="issue-chip"]')?.getAttribute('data-status'),
+      ).toBe('open'),
+    )
+  })
+
+  it('paints each chip with the state of the thing it points at', async () => {
+    // The whole point of the feature: a row's `#42` says whether that PR is merged, red, or
+    // waiting on a human — without opening it.
+    stubFetch({
+      refStatus: {
+        api: { prs: { 42: 'merged', 40: 'checks-failing' }, issues: { 12: 'completed' } },
+        web: { issues: { 7: 'open' } },
+      },
+    })
+    renderPage()
+    await screen.findByText('Add checkout endpoint')
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-slot="pr-chip"]')?.getAttribute('data-status')).toBe('merged')
+    })
+    // The web row's issue belongs to ANOTHER project — its status must come from that project's
+    // answer, not from whichever one the page happens to be standing in.
+    const webRow = document.querySelector('[data-run-id="w1"]')
+    expect(webRow?.querySelector('[data-slot="issue-chip"]')?.getAttribute('data-status')).toBe('open')
+  })
+
+  it('asks each project once, for both kinds at a time', async () => {
+    stubFetch({ refStatus: { api: { prs: { 42: 'ready' } } } })
+    renderPage()
+    await screen.findByText('Add checkout endpoint')
+
+    await waitFor(() => {
+      expect(sent.filter((request) => request.path.includes('/github/ref-status')).length).toBeGreaterThan(0)
+    })
+    const asked = sent.filter((request) => request.path.includes('/github/ref-status'))
+    // Two projects hold references (api, web); infra's row has none, so it is never asked.
+    expect(asked.length).toBe(2)
+    const api = asked.find((request) => request.path.includes('/p/api/'))!
+    // Sorted, so re-sorting or re-filtering the table hits the same cache entry.
+    expect(api.path).toContain('prs=40%2C42')
+    expect(api.path).toContain('issues=12')
+  })
+
+  it('paints a conflict here exactly as the task’s own page does, and offers the same fix', async () => {
+    // The inconsistency this closes: the chip was already the shared component, but the ACTION
+    // was the task page's alone — so the same pull request offered a way out on one screen and
+    // not on the other. The record the delivery needs is fetched here, per project, and only once
+    // the panel is open: this page's index row is deliberately too slim to answer it.
+    stubFetch({ refStatus: { api: { prs: { 42: 'ready', 40: 'ready' }, conflicts: [42] } } })
+    renderPage()
+    await screen.findByText('Add checkout endpoint')
+
+    const chip = await waitFor(() => {
+      const found = document.querySelector('[data-slot="pr-chip"][data-conflicting="true"]')
+      if (!found) throw new Error('the chip has not learned about the conflict yet')
+      return found as HTMLElement
+    })
+    // Its own colour, not the green its `ready` status would have painted.
+    expect(chip.className).toContain('text-conflict')
+
+    fireEvent.focus(chip)
+    const button = await waitFor(() => screen.getByRole('button', { name: 'Resolve conflicts' }))
+    await waitFor(() => expect(button.hasAttribute('disabled')).toBe(false))
+    fireEvent.click(button)
+
+    // Into the RUN'S OWN project — `queryScope()` would have named the boot project here, which
+    // is the whole reason this page sends through the project-explicit seam.
+    await waitFor(() => {
+      const posted = sent.find((request) => request.method === 'POST' && request.path.includes('/messages'))
+      expect(posted?.path).toBe('/api/v1/p/api/runs/a1/messages')
+      expect(posted?.body).toMatchObject({ text: resolveConflictsPrompt(42) })
+    })
+  })
+
+  it('leaves every chip neutral when the forge cannot be reached', async () => {
+    // "We could not ask" must never be paintable as "nothing is wrong".
+    stubFetch()
+    renderPage()
+    await screen.findByText('Add checkout endpoint')
+
+    expect(document.querySelector('[data-slot="pr-chip"]')?.getAttribute('data-status')).toBeNull()
+  })
+
   describe('the +N reference list', () => {
     const manyRefs = () => [
       {
@@ -802,7 +1010,7 @@ describe('global tasks page', () => {
       stubFetch({ runs: unreadRun() })
       renderPage()
       await screen.findByText('Bump the runner')
-      expect(document.querySelectorAll('[aria-label="unread"]')).toHaveLength(1)
+      expect(document.querySelectorAll('[data-slot="unread-marker"]')).toHaveLength(1)
 
       fireEvent.click(screen.getByRole('button', { name: /Mark Bump the runner read/ }))
 
@@ -811,7 +1019,7 @@ describe('global tasks page', () => {
           '/api/v1/p/infra/runs/i1/read',
         ),
       )
-      await waitFor(() => expect(document.querySelectorAll('[aria-label="unread"]')).toHaveLength(0))
+      await waitFor(() => expect(document.querySelectorAll('[data-slot="unread-marker"]')).toHaveLength(0))
     })
 
     it('takes the receipt back again', async () => {
@@ -820,7 +1028,7 @@ describe('global tasks page', () => {
       })
       renderPage()
       await screen.findByText('Bump the runner')
-      expect(document.querySelectorAll('[aria-label="unread"]')).toHaveLength(0)
+      expect(document.querySelectorAll('[data-slot="unread-marker"]')).toHaveLength(0)
 
       fireEvent.click(screen.getByRole('button', { name: /Mark Bump the runner unread/ }))
 
@@ -829,7 +1037,7 @@ describe('global tasks page', () => {
           '/api/v1/p/infra/runs/i1/unread',
         ),
       )
-      await waitFor(() => expect(document.querySelectorAll('[aria-label="unread"]')).toHaveLength(1))
+      await waitFor(() => expect(document.querySelectorAll('[data-slot="unread-marker"]')).toHaveLength(1))
     })
 
     it('is absent where there is no read state to change', async () => {
@@ -975,3 +1183,78 @@ describe('global tasks page', () => {
     ).toBeTruthy()
   })
 })
+
+describe('global tasks page — who started a task', () => {
+  const AUTOMATED: RunIndexEntry[] = [
+    ...RUNS,
+    {
+      projectId: 'api',
+      id: 'a2',
+      title: 'Nightly dependency sweep',
+      status: 'done',
+      createdAt: '2026-07-14T07:00:00Z',
+      archived: false,
+      workflow: 'quick-task',
+      automationId: 'auto-nightly',
+    },
+    {
+      // Dispatched by the nightly run: no provenance of its own, filed with its root.
+      projectId: 'api',
+      id: 'a3',
+      title: 'Sweep: bump lodash',
+      status: 'done',
+      createdAt: '2026-07-14T07:05:00Z',
+      archived: false,
+      workflow: 'quick-task',
+      dispatch: { rootRunId: 'a2', parentRunId: 'a2' },
+    },
+  ]
+
+  afterEach(() => localStorage.clear())
+
+  it('hides automation tasks by default, and shows them on request', async () => {
+    stubFetch({ runs: AUTOMATED })
+    renderPage()
+    await screen.findByText('Add checkout endpoint')
+    expect(rowIds()).toEqual(['a1', 'w1', 'i1'])
+    const origin = document.querySelector('[data-slot="task-origin"]') as HTMLElement
+    expect(within(origin).getByRole('button', { name: /Regular/ }).getAttribute('aria-pressed')).toBe('true')
+
+    fireEvent.click(within(origin).getByRole('button', { name: /Automations/ }))
+    await waitFor(() => expect(rowIds()).toEqual(['a2']))
+    // The dispatched child rides with its root, folded under it like any subtask.
+    expect(document.querySelector('[data-run-id="a2"]')?.textContent).toMatch(/1 subtask/)
+
+    fireEvent.click(within(origin).getByRole('button', { name: /All/ }))
+    await waitFor(() => expect(rowIds()).toEqual(['a1', 'w1', 'i1', 'a2']))
+  })
+
+  it('remembers the choice across visits', async () => {
+    stubFetch({ runs: AUTOMATED })
+    const first = renderPage()
+    await screen.findByText('Add checkout endpoint')
+    fireEvent.click(
+      within(document.querySelector('[data-slot="task-origin"]') as HTMLElement).getByRole('button', {
+        name: /Automations/,
+      }),
+    )
+    await waitFor(() => expect(rowIds()).toEqual(['a2']))
+    first.unmount()
+
+    stubFetch({ runs: AUTOMATED })
+    renderPage()
+    await screen.findByText('Nightly dependency sweep')
+    expect(rowIds()).toEqual(['a2'])
+    // A preference, not a narrowing: it stays out of the shareable URL.
+    expect(search()).toBe('')
+  })
+
+  it('says why a view is empty when only the origin split hides its rows', async () => {
+    stubFetch({ runs: AUTOMATED.filter((run) => run.projectId === 'api' && run.id !== 'a1') })
+    renderPage()
+    await screen.findByText('No regular tasks here')
+    fireEvent.click(screen.getByRole('button', { name: 'Show all tasks' }))
+    await waitFor(() => expect(rowIds()).toEqual(['a2']))
+  })
+})
+

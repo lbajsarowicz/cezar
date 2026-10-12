@@ -14,6 +14,7 @@ import type {
   finishResponseSchema,
   gitCommitResponseSchema,
   gitPushResponseSchema,
+  gitStatusResponseSchema,
   messageResponseSchema,
   openInCliResponseSchema,
   removeQueuedMessageResponseSchema,
@@ -52,6 +53,7 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
   type RunGet200 = InferResponseType<Run['$get'], 200>;
   type RunCreate201 = InferResponseType<Runs['$post'], 201>;
   type RunArchive200 = InferResponseType<Run['archive']['$post'], 200>;
+  type RunPin200 = InferResponseType<Run['pin']['$post'], 200>;
   type RunRead200 = InferResponseType<Run['read']['$post'], 200>;
   type RunUnread200 = InferResponseType<Run['unread']['$post'], 200>;
   type RunPatch200 = InferResponseType<Run['$patch'], 200>;
@@ -66,6 +68,7 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
   type Commits200 = InferResponseType<Run['commits']['$get'], 200>;
   type GitCommit200 = InferResponseType<Run['git']['commit']['$post'], 200>;
   type GitPush200 = InferResponseType<Run['git']['push']['$post'], 200>;
+  type GitStatus200 = InferResponseType<Run['git']['status']['$get'], 200>;
   type CreatePr201 = InferResponseType<Run['pr']['$post'], 201>;
   type RemoveWorktree200 = InferResponseType<Run['remove-worktree']['$post'], 200>;
   type DeleteRun200 = InferResponseType<Run['$delete'], 200>;
@@ -75,6 +78,9 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
     Assert<Exact<z.infer<typeof apiRunSchema>[], RunsList200[number][]>>,
     Assert<Exact<z.infer<typeof apiRunSchema>, RunGet200>>,
     Assert<Exact<z.infer<typeof runRecordSchema>, RunArchive200>>,
+    // the pin (#935) answers the record too — pinned here is what stops it drifting into a
+    // bespoke `{pinned: true}` payload the moment someone finds that shorter to write
+    Assert<Exact<z.infer<typeof runRecordSchema>, RunPin200>>,
     Assert<Exact<z.infer<typeof runRecordSchema>, RunPatch200>>,
     // the read receipt and its inverse (#unread-done-items, #775) — both answer the record, and
     // pinning them here is what stops either drifting into a bespoke payload
@@ -104,6 +110,7 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
     Assert<Exact<z.infer<typeof runCommitsResponseSchema>, Commits200>>,
     Assert<Exact<z.infer<typeof gitCommitResponseSchema>, GitCommit200>>,
     Assert<Exact<z.infer<typeof gitPushResponseSchema>, GitPush200>>,
+    Assert<Exact<z.infer<typeof gitStatusResponseSchema>, GitStatus200>>,
     Assert<Exact<z.infer<typeof removeWorktreeResponseSchema>, RemoveWorktree200>>,
   ];
 

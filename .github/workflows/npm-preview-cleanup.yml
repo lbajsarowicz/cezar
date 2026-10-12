@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The PR's merge ref may already be gone for a closed PR, and package
           # names should come from the trunk anyway — not from the PR's code.
@@ -32,7 +32,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: lts/*
           registry-url: https://registry.npmjs.org
 
       - name: Remove dist-tags
@@ -49,7 +49,8 @@ jobs:
           ROOT_PKG=$(node -p "require('./packages/cezar/package.json').name")
           CLIENT_PKG=$(node -p "require('./packages/api-client/package.json').name")
           ALIAS_PKG=$(node -p "require('./alias-cezar/package.json').name")
-          for pkg in "$ROOT_PKG" "$CLIENT_PKG" "$ALIAS_PKG"; do
+          RUN_ALIAS_PKG=$(node -p "require('./alias-cezar-run/package.json').name")
+          for pkg in "$ROOT_PKG" "$CLIENT_PKG" "$ALIAS_PKG" "$RUN_ALIAS_PKG"; do
             # Best effort: the tag may never have existed (PR predating the
             # pipeline, or closed before its first green run).
             npm dist-tag rm "$pkg" "$TAG" || echo "no $TAG tag on $pkg (ok)"

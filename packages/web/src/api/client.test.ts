@@ -12,6 +12,7 @@ import {
   finishRun,
   getGithub,
   getGithubChecks,
+  getGithubRefStatus,
   getGroup,
   getHealth,
   getProviderStatus,
@@ -20,11 +21,16 @@ import {
   getRun,
   getRunDiff,
   getRunHandoff,
+  getRunHistory,
+  getRunHistoryContext,
   getRuns,
   getSkills,
   getSkillsWhenReady,
   getTodos,
   getUiState,
+  getWorkspaceConfig,
+  uploadWorkspaceBrandingLogo,
+  deleteWorkspaceBrandingLogo,
   getWorkflows,
   openRunInCli,
   patchRun,
@@ -38,7 +44,7 @@ import {
   startTodo,
   retryProviderAuth,
 } from './client'
-import { setApiScope } from '@open-mercato/cezar-api-client'
+import { setApiBaseUrl, setApiScope } from '@open-mercato/cezar-api-client'
 
 /** The one seam under test: every call must go through `fetch` and nothing else. */
 const fetchMock = vi.fn<typeof fetch>()
@@ -50,6 +56,8 @@ beforeEach(() => {
 afterEach(() => {
   fetchMock.mockReset()
   vi.unstubAllGlobals()
+  setApiBaseUrl('')
+  setApiScope(null)
 })
 
 function reply(body: unknown, init: ResponseInit = {}): void {
@@ -67,7 +75,8 @@ const VALID_PROVIDER_STATUS = {
     { provider: 'claude', status: 'connected', enabled: true },
     { provider: 'codex', status: 'disconnected', enabled: true },
     { provider: 'opencode', status: 'not-installed', enabled: true },
-  ],
+    { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
 }
 
 /** The (path, init) the client actually asked for. */
@@ -127,7 +136,9 @@ describe('request shapes', () => {
       body: { authFailureId: 'incident-1' },
     },
     { name: 'getRunnerModels', call: () => getRunnerModels('codex'), path: '/api/v1/models?runner=codex', method: 'GET' },
+    { name: 'getRunnerModels(claude)', call: () => getRunnerModels('claude'), path: '/api/v1/models?runner=claude', method: 'GET' },
     { name: 'getRunnerModels(opencode)', call: () => getRunnerModels('opencode'), path: '/api/v1/models?runner=opencode', method: 'GET' },
+    { name: 'getRunnerModels(cursor)', call: () => getRunnerModels('cursor'), path: '/api/v1/models?runner=cursor', method: 'GET' },
     { name: 'getRuns', call: () => getRuns(), path: '/api/v1/runs', method: 'GET' },
     { name: 'getRun', call: () => getRun('run-1'), path: '/api/v1/runs/run-1', method: 'GET' },
     { name: 'getRunDiff', call: () => getRunDiff('run-1'), path: '/api/v1/runs/run-1/diff', method: 'GET' },
@@ -159,6 +170,12 @@ describe('request shapes', () => {
       path: '/api/v1/github?limit=5&refresh=1',
       method: 'GET',
     },
+    {
+      name: 'getGithub (cursor page)',
+      call: () => getGithub({ limit: 50, issuesCursor: 'i-cursor', prsCursor: 'p-cursor' }),
+      path: '/api/v1/github?limit=50&issuesCursor=i-cursor&prsCursor=p-cursor',
+      method: 'GET',
+    },
     // `refresh: false` must not become `refresh=0` — the server tests `=== '1'`, but sending a
     // parameter we do not mean is how a "false" ends up read as truthy somewhere downstream.
     { name: 'getGithub (refresh false)', call: () => getGithub({ refresh: false }), path: '/api/v1/github', method: 'GET' },
@@ -166,6 +183,22 @@ describe('request shapes', () => {
       name: 'getGithubChecks (#664)',
       call: () => getGithubChecks([7, 12]),
       path: '/api/v1/github/checks?prs=7%2C12',
+      method: 'GET',
+    },
+    {
+      name: 'getGithubRefStatus (both kinds)',
+      call: () => getGithubRefStatus('api', { prs: [7, 12], issues: [3] }),
+      // The project is EXPLICIT, not the active scope: the global Tasks page asks about rows
+      // belonging to projects it is not standing in.
+      path: '/api/v1/p/api/github/ref-status?prs=7%2C12&issues=3',
+      method: 'GET',
+    },
+    {
+      name: 'getGithubRefStatus (one kind — the empty list is not sent)',
+      // An empty `prs=` is a malformed list to the route (a 400), where an ABSENT key means
+      // "not asked for". The difference has to survive the client.
+      call: () => getGithubRefStatus('api', { issues: [3] }),
+      path: '/api/v1/p/api/github/ref-status?issues=3',
       method: 'GET',
     },
     {
@@ -318,6 +351,48 @@ describe('request shapes', () => {
   })
 })
 
+describe('workspace branding logo client', () => {
+  it('uploads through the configured API base with credentials and resolves the returned asset URL', async () => {
+    setApiBaseUrl('https://api.example.test/gateway')
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ logoUrl: '/api/v1/workspace/branding-logo?v=abc' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+
+    const file = new File(['logo'], 'logo.png', { type: 'image/png' })
+    const logoUrl = await uploadWorkspaceBrandingLogo(file)
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://api.example.test/gateway/api/v1/workspace/branding-logo')
+    expect(init.credentials).toBe('include')
+    expect(init.method).toBe('POST')
+    expect(init.body).toBeInstanceOf(FormData)
+    expect(logoUrl).toBe('https://api.example.test/gateway/api/v1/workspace/branding-logo?v=abc')
+  })
+
+  it('deletes through the configured API base and includes credentials', async () => {
+    setApiBaseUrl('https://api.example.test/gateway')
+    reply({ logoUrl: null })
+    await deleteWorkspaceBrandingLogo()
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('https://api.example.test/gateway/api/v1/workspace/branding-logo')
+    expect(init).toMatchObject({ method: 'DELETE', credentials: 'include' })
+  })
+
+  it('normalizes logo URLs in workspace configuration', async () => {
+    setApiBaseUrl('https://api.example.test/gateway')
+    reply({
+      branding: { name: 'Acme', logoUrl: '/api/v1/workspace/branding-logo?v=abc' },
+      browseRoot: '~/source', projectsDir: '~/projects', skillsAutoUpdate: null,
+      effectiveSkillsAutoUpdate: true,
+      composerDefaults: { autonomous: null, worktree: null, inheritedAutonomous: 'source-dependent', inheritedWorktree: true },
+      resources: { maxParallel: 2, maxMonitoringSessions: 2, idleTimeoutMinutes: 15, monitoringWakeIntervalMinutes: 5, autoResumeOnUsageLimit: true, memoryLimitMb: null, worktreeRetentionDefault: 10 },
+      agentDefaults: {},
+    })
+    const config = await getWorkspaceConfig()
+    expect(config.branding.logoUrl).toBe('https://api.example.test/gateway/api/v1/workspace/branding-logo?v=abc')
+  })
+})
+
 describe('project scope (multi-project spec, step 3.1)', () => {
   // NB the WHOLE unscoped table above is this feature's other half: the critical assertion is
   // that with no scope set, every path stays byte-identical — those cases prove it by never
@@ -355,6 +430,42 @@ describe('project scope (multi-project spec, step 3.1)', () => {
 })
 
 describe('response parsing', () => {
+  const workspaceConfig = (resources: Record<string, unknown>) => ({
+    branding: { name: 'cezar', logoUrl: null },
+    browseRoot: '~/',
+    projectsDir: '~/cezar/projects',
+    skillsAutoUpdate: null,
+    effectiveSkillsAutoUpdate: true,
+    composerDefaults: {
+      autonomous: null,
+      worktree: null,
+      inheritedAutonomous: 'source-dependent',
+      inheritedWorktree: true,
+    },
+    resources: {
+      maxParallel: 2,
+      maxMonitoringSessions: 2,
+      monitoringWakeIntervalMinutes: 5,
+      autoResumeOnUsageLimit: true,
+      memoryLimitMb: null,
+      worktreeRetentionDefault: 10,
+      ...resources,
+    },
+    agentDefaults: {},
+  })
+
+  it.each([
+    ['absent defaults to 15', {}, 15],
+    ['null stays disabled', { idleTimeoutMinutes: null }, null],
+    ['zero stays disabled', { idleTimeoutMinutes: 0 }, 0],
+    ['positive values pass through', { idleTimeoutMinutes: 30 }, 30],
+  ])('normalizes idle timeout: %s', async (_label, resources, expected) => {
+    reply(workspaceConfig(resources))
+    await expect(getWorkspaceConfig()).resolves.toMatchObject({
+      resources: { idleTimeoutMinutes: expected },
+    })
+  })
+
   it('normalizes provider status into canonical order without unexpected fields', async () => {
     reply({
       ignored: 'top-level raw value',
@@ -362,7 +473,8 @@ describe('response parsing', () => {
         { provider: 'opencode', status: 'unknown', hint: 'Try again.', enabled: true, raw: 'private' },
         { provider: 'claude', status: 'connected', enabled: false, account: 'private@example.test' },
         { provider: 'codex', status: 'disconnected', enabled: true, authFailureId: 'incident-1', raw: 'private' },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     })
 
     await expect(getProviderStatus()).resolves.toEqual({
@@ -370,7 +482,8 @@ describe('response parsing', () => {
         { provider: 'claude', status: 'connected', enabled: false },
         { provider: 'codex', status: 'disconnected', enabled: true, authFailureId: 'incident-1' },
         { provider: 'opencode', status: 'unknown', hint: 'Try again.', enabled: true },
-      ],
+        { provider: 'cursor', status: 'not-installed', enabled: true },
+        ],
     })
   })
 
@@ -385,6 +498,7 @@ describe('response parsing', () => {
           { provider: 'claude', status: 'connected' },
           { provider: 'codex', status: 'future-state' },
           { provider: 'opencode', status: 'connected' },
+          { provider: 'cursor', status: 'not-installed', enabled: true },
         ],
       },
     ],
@@ -395,6 +509,7 @@ describe('response parsing', () => {
           { provider: 'claude', status: 'connected' },
           { provider: 'claude', status: 'disconnected' },
           { provider: 'opencode', status: 'connected' },
+          { provider: 'cursor', status: 'not-installed', enabled: true },
         ],
       },
     ],
@@ -404,6 +519,7 @@ describe('response parsing', () => {
         providers: [
           { provider: 'claude', status: 'connected' },
           { provider: 'codex', status: 'connected' },
+          { provider: 'cursor', status: 'not-installed', enabled: true },
         ],
       },
     ],
@@ -551,5 +667,81 @@ describe('errors', () => {
     const error = (await getRunDiff('nope').catch((e: unknown) => e)) as ApiError
     expect(error.status).toBe(404)
     expect(error.message).toBe('not found')
+  })
+})
+
+/**
+ * The history routes are the two whose 200 is VALIDATED, not merely cast (#827).
+ *
+ * `useRunHistory` iterates `page.events`, so a body that is not a page would throw a `TypeError`
+ * mid-render instead of rejecting the query — and the hook's full-replay fallback only triggers
+ * on a rejection. These pin that a malformed 200 becomes an `ApiError`, which is what routes it
+ * into that fallback.
+ */
+describe('history responses are validated at the boundary (#827)', () => {
+  const PAGE = {
+    events: [{ seq: 1, ts: '2026-01-01T00:00:00.000Z', type: 'assistant', text: 'hi' }],
+    itemCount: 1,
+    liveCursor: 'cursor-live',
+    asOfSeq: 1,
+    hasOlder: false,
+  }
+  const CONTEXT = {
+    contextEvents: [{ seq: 1, ts: '2026-01-01T00:00:00.000Z', type: 'assistant' }],
+    asOfSeq: 1,
+  }
+
+  it('passes a well-formed page through unchanged, additive event keys included', async () => {
+    reply({ ...PAGE, olderCursor: 'cursor-older' })
+    const page = await getRunHistory('run-1')
+    expect(page.itemCount).toBe(1)
+    expect(page.olderCursor).toBe('cursor-older')
+    expect(page.newerCursor).toBeUndefined()
+    // The event schema is open (append-only vocabulary) — payload keys must survive validation.
+    expect(page.events[0]).toMatchObject({ seq: 1, type: 'assistant', text: 'hi' })
+  })
+
+  it('passes a well-formed context through unchanged', async () => {
+    reply(CONTEXT)
+    const context = await getRunHistoryContext('run-1')
+    expect(context.asOfSeq).toBe(1)
+    expect(context.contextEvents).toHaveLength(1)
+  })
+
+  it('rejects a 200 whose page body is the catch-all empty object', async () => {
+    reply({})
+    const error = (await getRunHistory('run-1').catch((e: unknown) => e)) as ApiError
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error.status).toBe(200)
+    expect(error.message).toBe('the cezar server answered /runs/run-1/history with an unexpected body')
+  })
+
+  it('rejects a 200 whose page carries a non-array `events`', async () => {
+    reply({ ...PAGE, events: 'nope' })
+    const error = (await getRunHistory('run-1').catch((e: unknown) => e)) as ApiError
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error.message).toContain('unexpected body')
+  })
+
+  it('rejects a 200 whose context body is the catch-all empty object', async () => {
+    reply({})
+    const error = (await getRunHistoryContext('run-1').catch((e: unknown) => e)) as ApiError
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error.status).toBe(200)
+    expect(error.message).toBe(
+      'the cezar server answered /runs/run-1/history-context with an unexpected body',
+    )
+  })
+
+  it('still reports a real HTTP failure with the server\'s own words', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: 'run not found' }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const error = (await getRunHistory('nope').catch((e: unknown) => e)) as ApiError
+    expect(error.status).toBe(404)
+    expect(error.message).toBe('run not found')
   })
 })

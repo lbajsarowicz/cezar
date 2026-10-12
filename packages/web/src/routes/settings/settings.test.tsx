@@ -53,9 +53,13 @@ function serve(uiState: Record<string, unknown> = {}) {
             { provider: 'claude', status: 'connected', enabled: true },
             { provider: 'codex', status: 'connected', enabled: true },
             { provider: 'opencode', status: 'connected', enabled: true },
-          ],
+            { provider: 'cursor', status: 'connected', enabled: true },
+        ],
         })
-      if (url === '/api/v1/models?runner=codex') return json({ runner: 'codex', models: [], source: 'unavailable', stale: false })
+      if (url.startsWith('/api/v1/models?runner=')) {
+        const runner = url.includes('cursor') ? 'cursor' : 'codex'
+        return json({ runner, models: [], source: 'unavailable', stale: false })
+      }
       return new Promise<never>(() => {})
     }),
   )
@@ -117,7 +121,7 @@ afterEach(() => {
   document.documentElement.classList.remove('light')
 })
 
-const PROJECT_SECTIONS = ['agents', 'agent-config', 'worktrees', 'bookmarklets', 'prompt-templates']
+const PROJECT_SECTIONS = ['tracker', 'secrets', 'integrations', 'agents', 'agent-config', 'worktrees', 'bookmarklets', 'prompt-templates']
 const GLOBAL_SECTIONS = [
   'appearance',
   'notifications',
@@ -125,6 +129,7 @@ const GLOBAL_SECTIONS = [
   'skills',
   // Agent accounts (spec 2026-07-29-agent-profiles) sit beside Projects: both describe the
   // machine and the person at it, not any one repo.
+  'workspace-secrets',
   'accounts',
   'projects',
 ]
@@ -153,7 +158,7 @@ describe('the section registry', () => {
     // Accounts survives: a single-project cockpit still runs on ONE of possibly several logins,
     // so "which account" is orthogonal to "how many projects".
     expect(visibleSettingsSections('global', { singleProject: true }).map((s) => s.id)).toEqual([
-      'appearance', 'notifications', 'resources', 'skills', 'accounts',
+      'appearance', 'notifications', 'resources', 'skills', 'workspace-secrets', 'accounts',
     ])
     expect(visibleSettingsSections('global', { singleProject: false }).map((s) => s.id)).toEqual(GLOBAL_SECTIONS)
     expect(visibleSettingsSections('global').map((s) => s.id)).toEqual(GLOBAL_SECTIONS)
