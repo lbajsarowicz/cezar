@@ -30,6 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod disclaim;
+pub use disclaim::disclaim_exec_if_asked;
+
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 
@@ -339,12 +342,24 @@ fn installed_versions() -> Vec<InstalledVersion> {
             let version = manifest.get("version").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
             let source = manifest.get("source").and_then(|v| v.as_str()).unwrap_or("registry");
             let installed_at = manifest.get("installedAt").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let label = if source == "local" { format!("{version} (local build)") } else { version };
+            let label = version_label(&version, source, manifest.get("branch").and_then(|v| v.as_str()));
             rows.push((installed_at, InstalledVersion { active: active.as_deref() == Some(id.as_str()), id, label }));
         }
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// How the Versions submenu names an install: a local build says so, and a linked checkout
+/// (`cezar link`, a worktree run in place) reads as its branch — that is what a developer
+/// switching between task worktrees is looking for.
+fn version_label(version: &str, source: &str, branch: Option<&str>) -> String {
+    match (source, branch) {
+        ("local", _) => format!("{version} (local build)"),
+        ("link", Some(branch)) => format!("{branch} — {version} (worktree)"),
+        ("link", None) => format!("{version} (worktree)"),
+        _ => version.to_string(),
+    }
 }
 
 /// Rebuild the Versions submenu from disk: a check item per install, the active one checked.
@@ -370,6 +385,32 @@ fn refresh_versions_menu(app: &AppHandle, shell: &Shell) {
     }
 }
 
+/// How long a stopping sidecar gets to run its own shutdown before it is killed. cezar's SIGTERM
+/// handler flushes run state and sends its `app_stop` telemetry, bounded at 1.5 s.
+#[cfg(target_os = "macos")]
+const SIDECAR_STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Stop the sidecar the way Ctrl-C in a terminal would: SIGTERM first, so cezar's own shutdown
+/// runs (`store.flush()`, the `app_stop` event), then SIGKILL if it is still there after
+/// `SIDECAR_STOP_GRACE`. A bare `kill()` is SIGKILL — it skipped all of that. Only macOS links
+/// `libc` (Cargo.toml); elsewhere this keeps the hard kill.
+fn stop_sidecar(child: &mut Child) {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `kill(2)` on our own child's pid; a pid that already exited is a harmless ESRCH.
+        if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == 0 {
+            let deadline = Instant::now() + SIDECAR_STOP_GRACE;
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
 /// Point `current` at an installed id (atomic rename over the old link) and relaunch.
 fn switch_version(shell: &Shell, id: &str) -> bool {
     let dir = cezar_home().join("versions");
@@ -382,7 +423,7 @@ fn switch_version(shell: &Shell, id: &str) -> bool {
     let mut guard = shell.child.lock().unwrap();
     if let Some(child) = guard.as_mut() {
         shell.restart_requested.store(true, Ordering::SeqCst);
-        let _ = child.kill();
+        stop_sidecar(child);
     }
     true
 }
@@ -442,7 +483,7 @@ fn version_newer(candidate: &str, current: &str) -> bool {
 fn check_cezar_update(app: &AppHandle, shell: &Shell) {
     let running = shell.running_version.lock().unwrap().clone();
     let Some(running) = running else { return };
-    let tag = release_tag();
+    let Some(tag) = release_tag() else { return };
     let mut command = tool_command(npm_program(), &["view", &format!("{PACKAGE}@{tag}"), "version", "--json"]);
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let Ok(output) = command.output() else { return };
@@ -524,7 +565,7 @@ pub fn run() {
     let shell_for_signal = shell.clone();
     let _ = ctrlc::set_handler(move || {
         if let Some(mut child) = shell_for_signal.child.lock().unwrap().take() {
-            let _ = child.kill();
+            stop_sidecar(&mut child);
             let _ = child.wait();
         }
         std::process::exit(0);
@@ -610,6 +651,13 @@ pub fn run() {
                     }
                     shell_for_events.geometry_dirty.store(true, Ordering::SeqCst);
                 }
+                // `cezar link` / `cezar use` in a terminal change what is installed behind the
+                // app's back; coming back to the window is the moment the list must be true.
+                WindowEvent::Focused(true) => {
+                    let app = window.app_handle().clone();
+                    let shell = shell_for_events.clone();
+                    let _ = window.app_handle().run_on_main_thread(move || refresh_versions_menu(&app, &shell));
+                }
                 WindowEvent::CloseRequested { .. } => {
                     if let Some(webview) = window.get_webview_window("main") {
                         save_geometry(&webview);
@@ -640,7 +688,7 @@ pub fn run() {
                     save_geometry(&window);
                 }
                 if let Some(mut child) = shell_for_run.child.lock().unwrap().take() {
-                    let _ = child.kill();
+                    stop_sidecar(&mut child);
                     let _ = child.wait();
                 }
             }
@@ -858,6 +906,13 @@ fn require_node(window: &WebviewWindow) -> bool {
 /// npm's output to the splash. On success with a sidecar running, asks the supervisor loop to
 /// relaunch. Returns whether the install succeeded.
 fn update_cezar(app: &AppHandle, shell: &Shell, title: &str) -> bool {
+    // The development channel never replaces the build picked by hand; only a machine with no
+    // cezar at all gets the newest release, so the app can start.
+    let tag = match release_tag() {
+        Some(tag) => tag,
+        None if resolve_entry().is_none() => "latest",
+        None => return false,
+    };
     if shell.updating.swap(true, Ordering::SeqCst) {
         return false;
     }
@@ -865,7 +920,6 @@ fn update_cezar(app: &AppHandle, shell: &Shell, title: &str) -> bool {
         shell.updating.store(false, Ordering::SeqCst);
         return false;
     };
-    let tag = release_tag();
     let versions = cezar_home().join("versions");
     splash_reset(&window, title, &format!("{PACKAGE}@{tag} → {}", versions.display()));
 
@@ -914,22 +968,29 @@ fn update_cezar(app: &AppHandle, shell: &Shell, title: &str) -> bool {
         let mut guard = shell.child.lock().unwrap();
         if let Some(child) = guard.as_mut() {
             shell.restart_requested.store(true, Ordering::SeqCst);
-            let _ = child.kill();
+            stop_sidecar(child);
         }
     }
     ok
 }
 
-/// `updateChannel` from `~/.cezar/config.json` → the npm dist-tag; `latest` when unset.
-fn release_tag() -> &'static str {
+/// `updateChannel` from `~/.cezar/config.json` → the npm dist-tag; `latest` when unset. `None`
+/// for `development`: a worktree or PR build picked by hand follows no tag, so nothing is ever
+/// offered or installed over it.
+fn release_tag() -> Option<&'static str> {
     let config = cezar_home().join("config.json");
     let channel = std::fs::read_to_string(config)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|json| json.get("updateChannel").and_then(|value| value.as_str()).map(str::to_owned));
-    match channel.as_deref() {
-        Some("nightly") => "nightly",
-        _ => "latest",
+    channel_tag(channel.as_deref())
+}
+
+fn channel_tag(channel: Option<&str>) -> Option<&'static str> {
+    match channel {
+        Some("nightly") => Some("nightly"),
+        Some("development") => None,
+        _ => Some("latest"),
     }
 }
 
@@ -947,6 +1008,13 @@ fn spawn_sidecar(entry: &Path, port: u16, cwd: &Path, log: Arc<Mutex<VecDeque<St
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // cezar starts agents through this binary so macOS privacy prompts name the agent, not the
+    // app (`disclaim.rs`). The cockpit server itself stays the app's own.
+    if cfg!(target_os = "macos") {
+        if let Ok(exe) = std::env::current_exe() {
+            command.env("CEZ_DISCLAIM_EXEC", exe);
+        }
+    }
     let mut child = command.spawn().map_err(|error| format!("could not start node: {error}"))?;
     for reader in [
         child.stdout.take().map(|out| Box::new(out) as Box<dyn Read + Send>),
@@ -1476,6 +1544,22 @@ mod tests {
     /// The legacy inset rule matches `div`s under the app shell, and the strip and the row this
     /// script adds ARE `div`s under the app shell. Inset too, the row pushed the version chip
     /// onto the brand row (shell 0.1.1).
+    #[test]
+    fn the_development_channel_follows_no_dist_tag() {
+        assert_eq!(channel_tag(Some("development")), None);
+        assert_eq!(channel_tag(Some("nightly")), Some("nightly"));
+        assert_eq!(channel_tag(Some("stable")), Some("latest"));
+        assert_eq!(channel_tag(None), Some("latest"));
+    }
+
+    #[test]
+    fn a_linked_worktree_reads_as_its_branch() {
+        assert_eq!(version_label("0.13.0", "link", Some("cez/cb28888e")), "cez/cb28888e — 0.13.0 (worktree)");
+        assert_eq!(version_label("0.13.0", "link", None), "0.13.0 (worktree)");
+        assert_eq!(version_label("0.13.0", "local", None), "0.13.0 (local build)");
+        assert_eq!(version_label("0.13.0", "registry", None), "0.13.0");
+    }
+
     #[test]
     fn the_version_switcher_needs_something_to_switch_to() {
         assert!(!switcher_has_choices(0));
