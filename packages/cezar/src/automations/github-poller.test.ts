@@ -5,6 +5,7 @@ import {
   lastPageOfLinkHeader,
   matchesFilters,
   onePerPullRequest,
+  POLL_RECORD_CEILING,
   reconstructLabelEvents,
   reconstructReviewEvents,
 } from './github-poller.ts';
@@ -91,6 +92,61 @@ describe('GithubPoller', () => {
     ]));
   });
 
+  it('keeps polling when the timeline carries entries other than labeled/unlabeled', async () => {
+    // Every issue anyone has commented on has such an entry, so validating the
+    // whole `/timeline` array against `timelineEventSchema` made label triggers
+    // unusable: the throw escaped `poll()` and no candidate on the page was
+    // evaluated — not even from issues whose own history is all labels (#914).
+    const run = vi.fn(async (_executable: string, args: readonly string[]) => {
+      if (args.some((arg) => arg.includes('/timeline'))) {
+        return JSON.stringify([
+          { id: 1, event: 'labeled', created_at: '2026-07-26T02:00:00.000Z', label: { name: 'other' } },
+          { id: 2, event: 'commented', created_at: '2026-07-26T02:01:00.000Z' },
+          { id: 3, event: 'cross-referenced', created_at: '2026-07-26T02:02:00.000Z' },
+          { id: 4, event: 'labeled', created_at: '2026-07-26T02:03:00.000Z', label: { name: 'triage' } },
+        ]);
+      }
+      return JSON.stringify({ items: [item] });
+    });
+
+    const result = await new GithubPoller({ run }).poll('acme', 'demo', {
+      ...definition,
+      events: ['issue.labeled'],
+      filters: { ...definition.filters, changedLabels: ['triage'] },
+    }, { since: '2026-07-26T01:00:00.000Z' });
+
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]).toMatchObject({
+      event: 'issue.labeled',
+      number: 7,
+      changedLabel: 'triage',
+      timestamp: '2026-07-26T02:03:00.000Z',
+    });
+  });
+
+  it('drops a labeled entry whose label is malformed instead of failing the poll', async () => {
+    // The filter is `safeParse`, not a widened schema: `timelineEventSchema`
+    // still defines what an entry must look like to be reconstructed from.
+    const run = vi.fn(async (_executable: string, args: readonly string[]) => {
+      if (args.some((arg) => arg.includes('/timeline'))) {
+        return JSON.stringify([
+          { id: 1, event: 'labeled', created_at: '2026-07-26T02:00:00.000Z' },
+          { id: 2, event: 'labeled', created_at: '2026-07-26T02:01:00.000Z', label: { name: 'triage' } },
+        ]);
+      }
+      return JSON.stringify({ items: [item] });
+    });
+
+    const result = await new GithubPoller({ run }).poll('acme', 'demo', {
+      ...definition,
+      events: ['issue.labeled'],
+      filters: { ...definition.filters, changedLabels: ['triage'] },
+    }, { since: '2026-07-26T01:00:00.000Z' });
+
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]).toMatchObject({ changedLabel: 'triage' });
+  });
+
   it('builds activity-specific queries for opened and label-event drains', () => {
     expect(buildSearchQuery('acme', 'demo', definition, 'issues', 'created', '2026-07-25T00:00:00.000Z'))
       .toContain('created:>=2026-07-25T00:00:00.000Z');
@@ -109,6 +165,40 @@ describe('GithubPoller', () => {
       timestamp: item.created_at,
       tieBreaker: item.node_id,
     });
+  });
+
+  it('spends a wider one-call budget without touching the definition (#982)', async () => {
+    const items = Array.from({ length: 12 }, (_, index) => ({
+      ...item,
+      id: index + 1,
+      node_id: `I_${String(index).padStart(2, '0')}`,
+      number: index + 1,
+      created_at: `2026-07-26T01:00:${String(index).padStart(2, '0')}.000Z`,
+    }));
+    const narrow: GithubAutomationDefinition = { ...definition, filters: { ...definition.filters, maxRecords: 5 } };
+    const run = vi.fn(async (_executable: string, args: readonly string[]) => {
+      const perPage = Number(args.find((arg) => arg.startsWith('per_page='))?.slice('per_page='.length));
+      return JSON.stringify({ items: items.slice(0, perPage) });
+    });
+    const poller = new GithubPoller({ run });
+
+    const budgeted = await poller.poll('acme', 'demo', narrow);
+    expect(run).toHaveBeenLastCalledWith('gh', expect.arrayContaining(['per_page=5']));
+    expect(budgeted.candidates).toHaveLength(5);
+    expect(budgeted.truncated).toBe(true);
+    expect(budgeted.cursor).toEqual({ timestamp: items[4]!.created_at, tieBreaker: items[4]!.node_id });
+
+    const widened = await poller.poll('acme', 'demo', narrow, { maxRecords: 10 });
+    expect(run).toHaveBeenLastCalledWith('gh', expect.arrayContaining(['per_page=10']));
+    expect(widened.candidates).toHaveLength(10);
+    expect(widened.cursor).toEqual({ timestamp: items[9]!.created_at, tieBreaker: items[9]!.node_id });
+    expect(narrow.filters.maxRecords).toBe(5);
+  });
+
+  it('clamps an over-wide budget to the 100-record search ceiling (#982)', async () => {
+    const run = vi.fn(async () => JSON.stringify({ items: [item] }));
+    await new GithubPoller({ run }).poll('acme', 'demo', definition, { maxRecords: POLL_RECORD_CEILING * 4 });
+    expect(run).toHaveBeenCalledWith('gh', expect.arrayContaining([`per_page=${POLL_RECORD_CEILING}`]));
   });
 
   it('repeats all/any/exclude/author/assignee filters locally', () => {

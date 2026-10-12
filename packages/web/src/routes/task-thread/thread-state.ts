@@ -64,13 +64,15 @@ export interface ThreadAsk {
   questions: UiAskQuestion[]
   resolved: boolean
   answer?: string
+  /** A workflow gate/question rather than the agent (spec 2026-09-30-workflow-node-editor). */
+  fromWorkflow?: boolean
 }
 
 /** A persisted, cezar-owned recovery marker for a provider's runtime authentication failure. */
 export interface ThreadProviderAuthRequired {
   kind: 'provider-auth-required'
   id: string
-  provider: 'claude' | 'codex' | 'opencode' | 'pi'
+  provider: 'claude' | 'codex' | 'junie' | 'opencode' | 'cursor' | 'pi' | 'copilot'
   authFailureId: string
 }
 
@@ -101,6 +103,9 @@ export interface ThreadState {
   turns: ThreadTurn[]
   /** v2 `session.ended` — the last one wins (each step runs its own session). */
   sessionEnded?: { reason: StopReason; message?: string }
+  /** Wall clock of the newest stamped event — any kind, deltas included. The live Working…
+   *  indicator reads it as "last activity", so a quiet session is told apart from a busy one. */
+  lastEventAt?: string
 }
 
 export interface ThreadReduceOptions {
@@ -153,11 +158,16 @@ export function threadFilePaths(state: ThreadState): string[] {
   return deduped
 }
 
-export function threadFooter(status: RunStatus, error?: string): ThreadFooter {
+export function threadFooter(status: RunStatus, error?: string, awaitingAnswer = false): ThreadFooter {
   switch (status) {
     case 'waiting':
       return { state: 'waiting' }
     case 'failed':
+      // The session closed on an unanswered question: the header says "needs you", so the footer
+      // must not announce a failure — the answer is the way forward, not a retry.
+      if (awaitingAnswer) {
+        return { state: 'closed', tone: 'dim', label: 'Session closed — waiting for your answer, which reopens it' }
+      }
       return { state: 'closed', tone: 'danger', label: error ? `Session failed — ${error}` : 'Session failed' }
     case 'review':
       return { state: 'closed', tone: 'dim', label: 'Session closed — waiting for your review' }
@@ -214,7 +224,15 @@ function stamp(value: unknown): string | undefined {
 }
 
 function providerId(value: unknown): ThreadProviderAuthRequired['provider'] | undefined {
-  return value === 'claude' || value === 'codex' || value === 'opencode' || value === 'pi'
+  return (
+    value === 'claude' ||
+    value === 'codex' ||
+    value === 'junie' ||
+    value === 'opencode' ||
+    value === 'cursor' ||
+    value === 'pi' ||
+    value === 'copilot'
+  )
     ? value
     : undefined
 }
@@ -349,6 +367,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
    *  it client-side (only one ask is ever pending — the agent asks once, then
    *  parks `waiting` until the user answers). */
   let pendingAsk: ThreadAsk | undefined
+  let lastEventAt: string | undefined
 
   const newTurn = (sourceSeq?: number): DraftTurn => {
     turnSeq += 1
@@ -398,6 +417,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
   }
 
   for (const event of events) {
+    lastEventAt = stamp(event.ts) ?? lastEventAt
     switch (event.type) {
       // ---- turn boundaries ------------------------------------------------------------
       case 'user-message': {
@@ -658,7 +678,13 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
           ? rawQuestions as UiAskQuestion[]
           : rawQuestions.filter(isAskQuestion)
         if (questions.length === 0) break
-        const ask: ThreadAsk = { kind: 'ask', id: requestId, questions, resolved: false }
+        const ask: ThreadAsk = {
+          kind: 'ask',
+          id: requestId,
+          questions,
+          resolved: false,
+          ...(event.source === 'workflow' ? { fromWorkflow: true } : {}),
+        }
         currentTurn().entries.push({ origin: 'meta', entry: ask })
         pendingAsk = ask
         break
@@ -738,6 +764,7 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
       }
     }),
     ...(sessionEnded !== undefined ? { sessionEnded } : {}),
+    ...(lastEventAt !== undefined ? { lastEventAt } : {}),
   }
 }
 

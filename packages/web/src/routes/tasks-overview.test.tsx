@@ -769,7 +769,7 @@ describe('TasksOverview — header', () => {
   // Read/unread (#unread-done-items). The rule itself is table-tested in lib/read-state.test.ts;
   // what these cover is the PAINT — that the table actually wears the marker the rule decides,
   // and that the sweep control is offered exactly when there is unread history to sweep.
-  it('marks an unread done row with a violet dot and leaves read history unmarked', () => {
+  it('marks an unread done row by weight, says so to a screen reader, and paints no violet dot', () => {
     const FINISHED = ago(60_000)
     renderOverview({
       runs: [
@@ -779,15 +779,16 @@ describe('TasksOverview — header', () => {
         run({ id: 'cancelled', status: 'cancelled', finishedAt: FINISHED }),
       ],
     })
-    // Keyed on the aria-label, not on the violet tone alone: the attention pill's OWN dot is
-    // violet for the live states (running/waiting/review), so a tone-only selector would be
-    // matching two different signals and would quietly stop meaning what it says.
-    const unreadDot = (id: string) =>
-      tableRow(id)?.querySelector('[data-slot="status-dot"][aria-label="unread"]')
-    expect(unreadDot('unread')).not.toBeNull()
-    expect(unreadDot('unread')?.getAttribute('data-tone')).toBe('violet')
-    expect(unreadDot('read')).toBeNull()
-    expect(unreadDot('cancelled')).toBeNull()
+    const marker = (id: string) => tableRow(id)?.querySelector('[data-slot="unread-marker"]')
+    expect(marker('unread')?.className).toContain('sr-only')
+    // Inside the title link, so the link's accessible name carries "unread".
+    expect(marker('unread')?.closest('a')).not.toBeNull()
+    expect(marker('unread')?.closest('a')?.className).toContain('font-semibold')
+    expect(marker('read')).toBeNull()
+    expect(marker('cancelled')).toBeNull()
+    // The retired trailing dot: violet is the status dot's colour for running / needs review, so a
+    // second violet dot meaning "unread" read as the same signal.
+    expect(tableRow('unread')?.querySelector('[data-slot="status-dot"][aria-label="unread"]')).toBeNull()
   })
 
   it('offers Mark all read only while something is unread, and calls back on click', () => {
@@ -1063,6 +1064,38 @@ describe('TasksOverviewRoute — wired to the app', () => {
     document.querySelector(`[data-slot="overview-tab"][data-view="${view}"]`) as HTMLElement
   const sidebarRow = (id: string) => document.querySelector(`[data-slot="task-row"][data-run-id="${id}"]`)
 
+  it('hides automation tasks from the table AND the sidebar by default, and remembers All', async () => {
+    const automated = run({
+      id: 'auto',
+      status: 'running',
+      automationTrigger: {
+        automationId: 'auto-nightly',
+        automationRevision: 1,
+        receiptId: 'rc',
+        trigger: 'schedule',
+        occurrenceAt: '2026-07-14T00:00:00.000Z',
+      },
+    })
+    try {
+      const first = renderApp([run({ id: 'mine', status: 'running' }), automated])
+      await waitFor(() => expect(tableRow('mine')).not.toBeNull())
+      expect(tableRow('auto')).toBeNull()
+      expect(sidebarRow('auto')).toBeNull()
+
+      fireEvent.click(
+        within(document.querySelector('[data-slot="task-origin"]') as HTMLElement).getByRole('button', { name: /All/ }),
+      )
+      await waitFor(() => expect(tableRow('auto')).not.toBeNull())
+      expect(sidebarRow('auto')).not.toBeNull()
+      first.unmount()
+
+      renderApp([run({ id: 'mine', status: 'running' }), automated])
+      await waitFor(() => expect(tableRow('auto')).not.toBeNull())
+    } finally {
+      localStorage.clear()
+    }
+  })
+
   it('shares the Active/Archived state with the sidebar — either set of tabs flips both', async () => {
     renderApp([run({ id: 'act', status: 'running' }), run({ id: 'arc', status: 'done', archived: true })])
     await waitFor(() => expect(tableRow('act')).not.toBeNull())
@@ -1184,8 +1217,10 @@ describe('TasksOverviewRoute — wired to the app', () => {
 /**
  * Task dispatch in the list (spec `.ai/specs/2026-09-10-dispatch.md`): a child task renders
  * NESTED under the task that dispatched it, in that task's own place in the ordering — never as
- * a second top-level row. The nesting rule itself is table-tested in `lib/task-tree.test.ts`;
- * what is worth a DOM test is that both layouts of this page actually paint it.
+ * a second top-level row — and FOLDED by default behind the parent's subtask chip (#1110). The
+ * nesting and folding rules themselves are table-tested in `lib/task-tree.test.ts`; what is
+ * worth a DOM test is that both layouts of this page actually paint them, and that the chip
+ * actually toggles.
  */
 describe('dispatched subtasks nest under their parent', () => {
   const rowIds = () =>
@@ -1193,8 +1228,10 @@ describe('dispatched subtasks nest under their parent', () => {
       row.getAttribute('data-run-id'),
     )
   const depthOf = (id: string) => tableRow(id)?.getAttribute('data-depth')
+  const toggleOf = (el: Element | null) =>
+    el?.querySelector<HTMLButtonElement>('[data-slot="subtask-toggle"]') ?? null
 
-  it('puts a child directly under its parent, indented, wherever the parent sorted', () => {
+  it('folds a child behind its parent by default; the chip unfolds it in the parent’s place', () => {
     renderOverview({
       runs: [
         run({ id: 'newer', createdAt: ago(1_000) }),
@@ -1202,13 +1239,24 @@ describe('dispatched subtasks nest under their parent', () => {
         run({ id: 'child', createdAt: ago(10_000), dispatch: { rootRunId: 'parent', parentRunId: 'parent' } }),
       ],
     })
+    // Collapsed on arrival: the parent's row stands alone, wearing the count.
+    expect(rowIds()).toEqual(['newer', 'parent'])
+    const toggle = toggleOf(tableRow('parent'))
+    expect(toggle?.getAttribute('aria-expanded')).toBe('false')
+
+    fireEvent.click(toggle as HTMLButtonElement)
     // `child` is newer than `parent` and would sort above it on its own — it follows its parent.
     expect(rowIds()).toEqual(['newer', 'parent', 'child'])
     expect(depthOf('parent')).toBe('0')
     expect(depthOf('child')).toBe('1')
+    expect(toggleOf(tableRow('parent'))?.getAttribute('aria-expanded')).toBe('true')
+
+    // The accordion closes the same way it opened.
+    fireEvent.click(toggleOf(tableRow('parent')) as HTMLButtonElement)
+    expect(rowIds()).toEqual(['newer', 'parent'])
   })
 
-  it('counts the subtasks on the parent row and nothing on a childless one', () => {
+  it('counts the subtasks on the parent row and offers no toggle on a childless one', () => {
     renderOverview({
       runs: [
         run({ id: 'p' }),
@@ -1217,9 +1265,10 @@ describe('dispatched subtasks nest under their parent', () => {
         run({ id: 'alone' }),
       ],
     })
-    expect(tableRow('p')?.querySelector('[data-slot="subtask-count"]')?.textContent).toBe('2 subtasks')
-    expect(tableRow('alone')?.querySelector('[data-slot="subtask-count"]')).toBeNull()
-    expect(tableRow('c1')?.querySelector('[data-slot="subtask-count"]')).toBeNull()
+    expect(toggleOf(tableRow('p'))?.textContent).toBe('2 subtasks')
+    expect(toggleOf(tableRow('alone'))).toBeNull()
+    fireEvent.click(toggleOf(tableRow('p')) as HTMLButtonElement)
+    expect(toggleOf(tableRow('c1'))).toBeNull()
   })
 
   // The rule that keeps a filtered list honest — a row must never vanish because the search
@@ -1232,19 +1281,46 @@ describe('dispatched subtasks nest under their parent', () => {
     expect(depthOf('orphan')).toBe('0')
   })
 
-  it('nests the card view identically — the two layouts are one list at two widths', () => {
+  // A search must never hide its own answer: while a query is live, every fold is open, so a
+  // matching child under a matching parent is on screen rather than behind a collapsed chip.
+  it('a live search overrides the fold so a nested match stays visible', () => {
+    renderOverview({
+      runs: [
+        run({ id: 'p', title: 'shared needle parent' }),
+        run({ id: 'c', title: 'shared needle child', dispatch: { rootRunId: 'p', parentRunId: 'p' } }),
+      ],
+    })
+    expect(rowIds()).toEqual(['p'])
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search tasks' }), {
+      target: { value: 'needle' },
+    })
+    expect(rowIds()).toEqual(['p', 'c'])
+    // Clearing the search folds the untouched accordion back to its default.
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search tasks' }), {
+      target: { value: '' },
+    })
+    expect(rowIds()).toEqual(['p'])
+  })
+
+  it('nests and folds the card view identically — the two layouts are one list at two widths', () => {
     renderOverview({
       runs: [
         run({ id: 'p' }),
         run({ id: 'c', dispatch: { rootRunId: 'p', parentRunId: 'p' } }),
       ],
     })
-    const ids = [...document.querySelectorAll('[data-slot="task-card"]')].map((el) =>
-      el.getAttribute('data-run-id'),
-    )
-    expect(ids).toEqual(['p', 'c'])
+    const ids = () =>
+      [...document.querySelectorAll('[data-slot="task-card"]')].map((el) =>
+        el.getAttribute('data-run-id'),
+      )
+    expect(ids()).toEqual(['p'])
+    const toggle = toggleOf(card('p'))
+    expect(toggle?.textContent).toBe('1 subtask')
+    fireEvent.click(toggle as HTMLButtonElement)
+    expect(ids()).toEqual(['p', 'c'])
     expect(card('c')?.getAttribute('data-depth')).toBe('1')
-    expect(card('p')?.querySelector('[data-slot="subtask-count"]')?.textContent).toBe('1 subtask')
+    // One state, two layouts: the same click opened the table's fold too.
+    expect(tableRow('c')).not.toBeNull()
   })
 
   // The chip that tells a dispatched row from a typed one: its kind, next to the title, in both
@@ -1257,6 +1333,7 @@ describe('dispatched subtasks nest under their parent', () => {
         run({ id: 'imp', dispatch: { rootRunId: 'p', parentRunId: 'p' } }),
       ],
     })
+    fireEvent.click(toggleOf(tableRow('p')) as HTMLButtonElement)
     const kindOf = (el: Element | null | undefined) =>
       el?.querySelector('[data-slot="dispatch-kind"]')?.textContent ?? null
     expect(kindOf(tableRow('rev'))).toBe('review')
@@ -1267,3 +1344,91 @@ describe('dispatched subtasks nest under their parent', () => {
     expect(kindOf(card('p'))).toBeNull()
   })
 })
+
+describe('TasksOverview — origin and facet filters', () => {
+  // The facet popovers are `cmdk`, which measures its list; jsdom has no ResizeObserver.
+  const scrollIntoView = Element.prototype.scrollIntoView
+  beforeEach(() => {
+    vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} })
+    Element.prototype.scrollIntoView = vi.fn()
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    Element.prototype.scrollIntoView = scrollIntoView
+  })
+  const trigger = {
+    automationId: 'auto-nightly',
+    automationRevision: 1,
+    receiptId: 'rc-1',
+    trigger: 'schedule' as const,
+    occurrenceAt: '2026-07-14T00:00:00.000Z',
+  }
+  const fixture = () => {
+    const mine = run({ id: 'mine', title: 'Fix the login bug', status: 'running' })
+    const theirs = run({ id: 'nightly', title: 'Nightly sweep', automationTrigger: trigger })
+    const ticket = run({
+      id: 'ticket',
+      title: 'JIRA-12 triage',
+      status: 'failed',
+      automationTracker: {
+        automationId: 'auto-jira',
+        automationRevision: 2,
+        receiptId: 'rc-2',
+        provider: 'jira',
+        key: 'JIRA-12',
+        url: 'https://acme.atlassian.net/browse/JIRA-12',
+      },
+    })
+    return [mine, theirs, ticket]
+  }
+  const shownIds = () =>
+    [...document.querySelectorAll('[data-slot="task-table-row"]')].map((row) => row.getAttribute('data-run-id'))
+  const originButton = (name: RegExp) =>
+    within(document.querySelector('[data-slot="task-origin"]') as HTMLElement).getByRole('button', { name })
+
+  it('shows only regular tasks under Regular, and counts every origin', () => {
+    const onOriginChange = vi.fn()
+    renderOverview({ runs: fixture(), origin: 'regular', onOriginChange })
+    expect(shownIds()).toEqual(['mine'])
+    expect(originButton(/Regular/).textContent).toBe('Regular1')
+    expect(originButton(/Automations/).textContent).toBe('Automations2')
+    // The Active tab counts the list the table actually shows.
+    expect(document.querySelector('[data-slot="overview-tab"][data-view="active"]')?.textContent).toBe('Active1')
+
+    fireEvent.click(originButton(/Automations/))
+    expect(onOriginChange).toHaveBeenCalledWith('automation')
+  })
+
+  it('narrows by status, and offers an Automation facet once automation tasks are shown', async () => {
+    renderOverview({
+      runs: fixture(),
+      origin: 'all',
+      automationNames: new Map([['auto-nightly', 'Nightly sweep job']]),
+    })
+    expect(shownIds()).toHaveLength(3)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by status' }))
+    fireEvent.click(await screen.findByRole('option', { name: /failed/ }))
+    expect(shownIds()).toEqual(['ticket'])
+    fireEvent.click(screen.getByRole('button', { name: /Clear \(1\)/ }))
+    expect(shownIds()).toHaveLength(3)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Filter by automation' }))
+    fireEvent.click(await screen.findByRole('option', { name: /Nightly sweep job/ }))
+    expect(shownIds()).toEqual(['nightly'])
+  })
+
+  it('hides the Automation facet under Regular, where it could only empty the table', () => {
+    renderOverview({ runs: fixture(), origin: 'regular' })
+    expect(screen.queryByRole('button', { name: 'Filter by automation' })).toBeNull()
+  })
+
+  it('says the origin split is why the list is empty, with the way out', () => {
+    const onOriginChange = vi.fn()
+    renderOverview({ runs: fixture().slice(1), origin: 'regular', onOriginChange })
+    expect(document.querySelector('[data-slot="tasks-empty"]')?.getAttribute('data-empty-kind')).toBe('origin-hidden')
+    fireEvent.click(screen.getByRole('button', { name: 'Show all tasks' }))
+    expect(onOriginChange).toHaveBeenCalledWith('all')
+  })
+})
+

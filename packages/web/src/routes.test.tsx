@@ -1,7 +1,7 @@
 import { QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, useLocation, useNavigate } from 'react-router'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createQueryClient } from './api/query-client'
 import { queryKeys, workspaceQueryKeys } from './api/queries'
@@ -331,6 +331,12 @@ describe('scoped route map (/p/:projectId)', () => {
  * project-scoped URLs alive as redirects, so pre-split bookmarks still land.
  */
 describe('the global settings area (/settings/global)', () => {
+  // These assertions cover routing and the capability gate, not Vite's cold module transform.
+  // Await the real lazy module before starting RTL's 1s DOM deadline; keep production lazy.
+  beforeAll(async () => {
+    await import('./routes/automations/automations-route')
+  }, 30_000)
+
   const GLOBAL_CASES: Array<[string, string, string]> = [
     ['/settings/global', 'settings-global', 'Global settings'],
     ['/settings/global/appearance', 'settings-global-appearance', 'Appearance'],
@@ -357,8 +363,8 @@ describe('the global settings area (/settings/global)', () => {
       renderAt(`/p/${BOOT}/${path}`)
       expect(currentPathname()).toBe(`/p/${BOOT}/${path}`)
       expect(routeName()).toBe('automations')
-      expect(await screen.findByText('Automations are off')).not.toBeNull()
-      expect(screen.getByText(/CEZ_AUTOMATIONS=0/)).not.toBeNull()
+      expect(await screen.findByText('Automations are off', {}, { timeout: 5_000 })).not.toBeNull()
+      expect(await screen.findByText(/CEZ_AUTOMATIONS=0/, {}, { timeout: 5_000 })).not.toBeNull()
     })
   }
 
@@ -517,6 +523,47 @@ describe('legacy flat URLs redirect to the boot project', () => {
     await waitFor(() => expect(currentPathname()).toBe(expected), { timeout: 4_000 })
   })
 
+  /** The launch folder stopped being a project once the user has some (#774 follow-up):
+   *  `/api/v1/projects` no longer lists `bootProject`, so a bare launch must open a project the
+   *  sidebar actually shows — while every explicit URL still reaches the served folder. */
+  describe('with the boot folder served but not listed', () => {
+    const UNLISTED: ProjectsResponse = {
+      ...REGISTRY,
+      projects: [
+        {
+          ...REGISTRY.projects[1]!,
+          id: 'older',
+          name: 'older',
+          root: '/home/u/older',
+          lastOpenedAt: '2026-01-01T00:00:00.000Z',
+        },
+        { ...REGISTRY.projects[1]!, lastOpenedAt: '2026-02-01T00:00:00.000Z' },
+      ],
+    }
+
+    it('opens the most recently opened registered project from the bare root', () => {
+      renderAt('/', { registry: UNLISTED })
+
+      expect(currentPathname()).toBe('/p/other/')
+      expect(routeName()).toBe('tasks')
+    })
+
+    it('still restores a remembered location', () => {
+      rememberLocation({ projectId: 'older', pathname: '/p/older/tasks/run-1' })
+      renderAt('/', { registry: UNLISTED })
+
+      expect(currentPathname()).toBe('/p/older/tasks/run-1')
+    })
+
+    it('still resolves an explicit legacy deep link to the served folder', () => {
+      renderAt('/tasks/run-2?file=y#L3', { registry: UNLISTED })
+
+      expect(currentPathname()).toBe('/p/boot/tasks/run-2')
+      expect(currentSearch()).toBe('?file=y')
+      expect(currentHash()).toBe('#L3')
+    })
+  })
+
   it('keeps the quiet resolving surface while bare-root inputs are pending', () => {
     renderAt('/', { seed: false })
 
@@ -601,6 +648,14 @@ describe('legacy flat URLs redirect to the boot project', () => {
     expect(currentSearch()).toBe('?skill=om-code-review')
     expect(currentHash()).toBe('#usage')
     expect(routeName()).toBe('skills')
+  })
+
+  it('keeps the old bookmarklet pseudo-skill deep link on the project bookmarklets page', () => {
+    renderAt('/settings/skills?skill=__bm#saved')
+    expect(currentPathname()).toBe(`/p/${BOOT}/settings/bookmarklets`)
+    expect(currentSearch()).toBe('')
+    expect(currentHash()).toBe('#saved')
+    expect(routeName()).toBe('settings-bookmarklets')
   })
 
   it('delivers the full bookmarklet grammar into the composer (spec 011 contract)', () => {

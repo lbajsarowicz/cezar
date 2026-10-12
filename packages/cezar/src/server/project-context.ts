@@ -10,6 +10,7 @@ import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { RunManager } from '../workflows/run.ts';
 import { ensureLaunchKey } from './launch-key.ts';
 import { getRepoInfo } from './git.ts';
+import { resolveTrackerAgentEnv } from './tracker/agent-credentials.ts';
 
 /**
  * Per-project server context (spec 2026-07-20-multi-project-workspace,
@@ -214,7 +215,7 @@ export class ProjectContexts {
       ?? AutomationStore.open(dataDir);
     reconcileAutomationReceipts(automationStore, store);
     this.notifyStoreCreated(store);
-    const manager = new RunManager(store, project.root, { semaphore: this.semaphore, projectId: project.id });
+    const manager = new RunManager(store, project.root, { semaphore: this.semaphore, projectId: project.id, resolveTrackerEnv: resolveTrackerAgentEnv });
     try {
       const launchKey = ensureLaunchKey(dataDir);
       // Startup reconcile (spec 006) + count-based retention (#483) — the same
@@ -251,6 +252,6 @@ export class ProjectContexts {
 /** Shared teardown for built and half-built contexts. */
 function teardown(ctx: { store: RunStore; manager: RunManager }): void {
   ctx.manager.dispose();
-  ctx.store.flush();
+  ctx.store.flush({ pretty: true });
   ctx.store.removeAllListeners();
 }

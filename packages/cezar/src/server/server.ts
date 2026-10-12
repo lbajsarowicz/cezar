@@ -1,25 +1,39 @@
+import {
+  trackerWatchInputSchema, trackerWatchParamsSchema, trackerWatchQuerySchema,
+  trackerCandidatesQuerySchema, trackerListQuerySchema, trackerSearchQuerySchema, trackerItemQuerySchema, trackerReadScope,
+  trackerCredentialsSchema, trackerItemParamsSchema, trackerAssociationInputSchema, type TrackerChangedEvent,
+  secretParamsSchema, secretValueInputSchema, type SecretsList, type SecretValueInput,
+  e2eSetupInputSchema, type E2eStatus,
+} from '@open-mercato/cezar-contract';
+import { SecretStore, SecretsError, type SecretScopeRef } from '../workspace/secrets.ts';
+import { E2E_SETUP_TASK, e2eCredentialsAmong, e2eSetupWorkflow, latestE2eSetupRun, readE2eStatus, setupInFlight } from '../e2e-setup.ts';
+import { createTrackerService } from './tracker/index.ts';
+import { TrackerWatches } from './tracker/watch.ts';
+import { readTrackerAssociation, writeTrackerAssociation, clearTrackerAssociation } from '../tracker-association.ts';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { AutomationStore } from '../automations/store.ts';
 import { AutomationCoordinator } from '../automations/coordinator.ts';
 import { GithubPoller } from '../automations/github-poller.ts';
-import { ProjectAutomationScheduler, WorkspaceAutomationScheduler, type ProjectAutomationHandle } from '../automations/scheduler.ts';
+import { TrackerPoller } from '../automations/tracker-poller.ts';
+import { ProjectAutomationScheduler, ProjectTrackerAutomationScheduler, WorkspaceAutomationScheduler, type ProjectAutomationHandle } from '../automations/scheduler.ts';
 import { ScheduleRunner } from '../automations/schedule-runner.ts';
 import { automationStats } from '../automations/stats.ts';
 import { automationTemplatesOf } from '../automations/templates.ts';
-import { launchAutomationRun, launchScheduledRun, rebaselineIdleAutomations, reconcileAutomationReceipts, validateAutomationPrompt } from '../automations/task-template.ts';
+import { AutomationLaunchOutcome, launchAutomationRun, launchScheduledRun, launchTrackerAutomationRun, rebaselineIdleAutomations, reconcileAutomationReceipts, validateAutomationPrompt } from '../automations/task-template.ts';
 import {
   automationEventSchema,
   automationFiltersSchema,
   automationLogResultSchema,
   automationTaskSchema,
   isGithubAutomation,
+  isTrackerAutomation,
   isScheduleAutomation,
   type AutomationDefinition,
 } from '../automations/types.ts';
-import { automationScheduleSchema, localTimeZone, nextOccurrence } from '@open-mercato/cezar-contract';
+import { trackerTriggerSchema, trackerAutomationOptionsSchema, trackerAutomationOptionsQuerySchema, automationScheduleSchema, localTimeZone, nextOccurrence } from '@open-mercato/cezar-contract';
 import type { IncomingMessage } from 'node:http';
-import { access, constants as fsConstants, mkdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
+import { access, constants as fsConstants, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -27,17 +41,24 @@ import { Hono, type Context } from 'hono';
 import type { Next } from 'hono';
 import { serve, type ServerType } from '@hono/node-server';
 import { bodyLimit } from 'hono/body-limit';
+import { HTTPException } from 'hono/http-exception';
 import { streamSSE } from 'hono/streaming';
-import { jsonZodValidator, paramZodValidator, queryZodValidator } from './validators.ts';
+import { jsonZodValidator, multipartZodValidator, paramZodValidator, queryZodValidator } from './validators.ts';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { z } from 'zod';
 import {
+  PROMPT_TEMPLATE_TEXT_MAX,
   setWorkspaceUiStateInputSchema,
+  setWorkspaceConfigInputSchema,
   type GroupResponse,
   type GroupVariant,
   type PickVariantResponse,
   type RunIndexEntry,
   type RunsIndexResponse,
+  type StarCountPayload,
+  type WorkspaceConfigResponse,
+  workspaceBrandingLogoResponseSchema,
+  githubListQuerySchema,
 } from '@open-mercato/cezar-contract';
 // A contract VALUE, like `workspaceUiStateSchema` in workspace/migrations.ts — the request
 // schema this route validates with is the same one the client compiles against.
@@ -49,12 +70,15 @@ import {
 } from '@open-mercato/cezar-contract';
 import { dispatchInputSchema, dispatchIntentSchema, dispatchReportSchema } from '@open-mercato/cezar-contract';
 import { detectEnvironment } from '../core/backend-detect.ts';
+import { hostUsageSampler, type HostSampler } from '../core/host-usage.ts';
 import { RUNNER_IDS } from '../core/agent-runner.ts';
 import type { ContentBlock } from '../core/agent-runner.ts';
 import { AGENT_MODELS_LOCKED_ERROR, agentModelsLocked } from '../core/agent-model-policy.ts';
 import { discoverClaudeModels } from '../core/claude-model-catalog.ts';
 import { discoverCodexModels } from '../core/codex-model-catalog.ts';
+import { discoverCursorModels } from '../core/cursor-model-catalog.ts';
 import { discoverOpencodeModels } from '../core/opencode-model-catalog.ts';
+import { discoverJunieModels } from '../core/junie-model-catalog.ts';
 import {
   PROVIDER_IDS,
   ProviderAuthService,
@@ -64,8 +88,17 @@ import {
 } from '../core/provider-auth.ts';
 import { applyProviderEnablement } from '../core/provider-availability.ts';
 import { RunnerModelCatalog } from '../core/runner-model-catalog.ts';
-import { currentUsage, onUsage } from '../core/process-usage.ts';
+import { currentUsage, currentTimedUsage, onUsage } from '../core/process-usage.ts';
+import { DashboardReader } from '../workspace/dashboard.ts';
+import { dashboardRoutes } from './dashboard.ts';
 import { WORKFLOWS_DIR, loadWorkflows } from '../workflows/load.ts';
+import {
+  NODE_CATALOG,
+  graphIssues,
+  graphToSteps,
+  workflowGraphFileSchema,
+  workflowGraphSchema,
+} from '../workflows/graph.ts';
 import {
   QUICK_TASK_WORKFLOW,
   normalizeWorkflowDoc,
@@ -79,6 +112,9 @@ import {
 import { planChain, slugify } from '../planner.ts';
 import { discoverSkills } from '../skills.ts';
 import { SkillsUpdateConflictError, SkillsUpdateCoordinator, SkillsUpdateService, type SkillsUpdateState } from '../skills-update.ts';
+import { selfUpdateApplyRequestSchema, selfUpdateChannelRequestSchema, selfUpdateDevelopmentQuerySchema } from '@open-mercato/cezar-contract';
+import { SelfUpdateBusyError, SelfUpdateService } from '../self-update/service.ts';
+import { StarCountReader } from './star-count.ts';
 import { getTeamSkillsCached, refreshTeamSkills, waitForTeamSkills } from '../skills-remote.ts';
 import { appendHandoffHeartbeat, handoffProgressExcerpt, readHandoff } from '../handoff.ts';
 import { markStarted, onTodosChanged, readTodos, removeTodo, todoTaskText, type TodoItem } from '../todos.ts';
@@ -88,10 +124,12 @@ import {
   deriveRunContextEvents,
   readEventsAfterLiveCursor,
   readRunHistoryPage,
+  streamRunEvents,
   validateLiveCursor,
 } from '../runs/event-history.ts';
 import { readRunIndexFromDisk } from '../runs/run-index.ts';
 import { isV2WireEventType } from '../runs/ui-event-sink.ts';
+import { onRunDeleted, onRunEvent } from './sse-subscriptions.ts';
 import {
   countRunDraftImages,
   deleteRunDraftImage,
@@ -110,6 +148,7 @@ import {
   runHistoryQuerySchema,
   runIdParamSchema,
   setRunDraftInputSchema,
+  repoFileQuerySchema,
   type DeleteDraftResponse,
 } from '@open-mercato/cezar-contract';
 import { toPastedContent, type PastedContent, type RunManager } from '../workflows/run.ts';
@@ -124,13 +163,16 @@ import {
   createOrSwitchBranch,
   imageMimeType,
   isOsOpenableImage,
+  listRepoPaths,
   pushCurrentBranch,
+  worktreeGitStatus,
   readWorktreePath,
+  repoIndexContains,
 } from './git-changes.ts';
 import { gatedSkillsRepos, loadConfig, resolveWorktreeRetention, type CezConfig } from '../config.ts';
 import { findConfigFile } from '../agent-config/catalog.ts';
 import { readConfigFile, statConfigPath, writeConfigFile } from '../agent-config/files.ts';
-import { readAgentModelDefaults } from '../agent-config/models.ts';
+import { type AgentModelDefaults, readAgentModelDefaults } from '../agent-config/models.ts';
 import { listAgentConfig } from '../agent-config/service.ts';
 import { listConfigFiles, type AgentHomePaths } from '../agent-config/catalog.ts';
 import { readAccountIdentity } from '../agent-config/account-identity.ts';
@@ -167,6 +209,7 @@ import { PROFILE_CAPABLE_PROVIDERS, profileEnv, supportsProfiles } from '../core
 import { withEnvPrefix } from '../core/shell-env.ts';
 import {
   allocateProjectSlug,
+  clearProjectProbeCache,
   listProjects,
   normalizeProjectTags,
   probeProjectStatus,
@@ -181,7 +224,7 @@ import { checkoutRepo, type CloneRunner } from './checkout.ts';
 import { ProjectContextError, ProjectContexts, type ProjectContext } from './project-context.ts';
 import { reviewGateEnabled } from '../runs/review-gate.ts';
 import { readUiState, uiStatePath } from '../ui-state.ts';
-import { agentHomePaths, expandTilde } from '../paths.ts';
+import { agentHomePaths, cezarHomeDir, expandTilde, isAbsolutePath } from '../paths.ts';
 import { isLoopbackHostHeader, normalizeHostname, resolveCapabilities } from './capabilities.ts';
 import { createSocketHub, type SocketHub, type WsUpgradeVerdict } from './ws.ts';
 import { browseDirectory, isInsideBrowseRoot, isLexicallyInsideBrowseRoot, resolveBrowseRoot } from './fs-browse.ts';
@@ -189,8 +232,31 @@ import { parseRemote, resolveForge, type ForgeAvailability } from './forge/index
 import { fetchGithub, fetchGithubChecks, fetchGithubComments, fetchGithubPrDiff, fetchGithubRefStatus, forgetRefStatus, readCachedRefStatuses, refNumberFromUrl, searchGithubItems, GithubPrNotFoundError, GH_CHECKS_MAX, GH_SEARCH_MAX, GH_REF_STATUS_MAX } from './github.ts';
 import { ensureLaunchKey } from './launch-key.ts';
 import { openInTerminal } from './open-in-terminal.ts';
-import { agentCliRunner, detectOpenTargets, openFileInDefaultApp, openInApp } from './open-in-app.ts';
+import {
+  agentCliRunner,
+  detectOpenTargets,
+  openFileInDefaultApp,
+  openInApp,
+  withResolvedClaudeBin,
+} from './open-in-app.ts';
 import { createDraftPr } from './pr.ts';
+import {
+  DEFAULT_TELEMETRY_URL,
+  TELEMETRY_POLICY_VERSION,
+  deviceSid,
+  loadTelemetryConsent,
+  reportError,
+  setTelemetryConsent,
+  telemetryBlockedBy,
+  track,
+} from '../telemetry.ts';
+import {
+  setTelemetryConsentInputSchema,
+  telemetryErrorInputSchema,
+  telemetryEventInputSchema,
+  telemetryPageInputSchema,
+  type TelemetryConsentPayload,
+} from '@open-mercato/cezar-contract';
 import { ProviderRuntimeAuthObserver } from './provider-auth-runtime.ts';
 import {
   providerForActiveRun,
@@ -208,6 +274,8 @@ import {
 } from './static-ui.ts';
 
 export interface ServerDeps {
+  /** Register app-owned cleanup for the hosting server lifecycle. */
+  onDispose?: (cleanup: () => void) => void;
   repoRoot: string;
   store: RunStore;
   manager: RunManager;
@@ -277,11 +345,26 @@ export interface ServerDeps {
   /** Process-wide Open Mercato skills update detector. Injected in tests and
    * shared by every workspace route/project; createApp owns the default. */
   skillsUpdate?: SkillsUpdateService;
+  /** The project/workspace secret store (spec 2026-10-10-project-secrets-vault-options). Tests
+   *  inject one with a fake keychain; the default reads the OS keychain or a key file. */
+  secrets?: SecretStore;
+  /** The cockpit's own updater (`/api/v1/workspace/self-update`, src/self-update/). Built by
+   *  the CLI, which knows the entry file, the port and how to restart; absent in tests and for
+   *  bare `createApp` callers, where the family answers a read-only "not available" status. */
+  selfUpdate?: SelfUpdateService;
+  /** cezar's own GitHub star count behind `GET /api/v1/star-count` (the cockpit's ⭐ ask).
+   *  Defaults to a reader that asks github.com at most once per ten seconds, paced to GitHub's rate limit, and caches the answer
+   *  under `~/.cache/cez/`; tests inject their own so no suite ever reaches the network. */
+  starCount?: { read(): Promise<StarCountPayload> };
   /** WebSocket subscription hub (`/api/v1/ws`, src/server/ws.ts). `createApp`
    *  only registers topics on it — `startServer` builds one and attaches it
    *  to the HTTP server it binds. Optional so legacy callers/tests change
    *  nothing: no hub, no topics, and the HTTP surface is byte-identical. */
   socketHub?: SocketHub;
+  /** The host-telemetry sampler behind the `host` topic and the `/workspace/host-usage` route.
+   *  Defaults to the process-wide singleton; injectable so tests can drive a frame shape (a
+   *  container object, for instance) that CI machines do not have. */
+  hostSampler?: HostSampler;
   /** Re-arm the workspace automation timer after definition mutations. */
   automationsChanged?: () => void;
 }
@@ -368,10 +451,11 @@ const automationEditableSchema = z
     description: z.string().max(2_000).optional(),
     enabled: z.boolean().optional(),
     /** Omitted on create = `github`; omitted on update = the stored kind (spec 2026-09-14). */
-    kind: z.enum(['github', 'schedule']).optional(),
+    kind: z.enum(['github', 'schedule', 'tracker']).optional(),
     events: z.array(automationEventSchema).min(1).max(7).optional(),
     intervalSeconds: z.number().int().min(60).max(86_400).optional(),
     filters: automationFiltersSchema.optional(),
+    trackerTrigger: trackerTriggerSchema.optional(),
     schedule: automationScheduleSchema.optional(),
     task: automationTaskSchema,
   })
@@ -383,7 +467,11 @@ type AutomationEditableBody = z.infer<typeof automationEditableSchema>;
  * issue path (spec 2026-09-14 § Data Model): a poll needs its three keys; a schedule needs its
  * schedule and carries no GitHub filter.
  */
-function automationKindIssue(body: AutomationEditableBody, kind: 'github' | 'schedule'): string | null {
+function automationKindIssue(body: AutomationEditableBody, kind: 'github' | 'schedule' | 'tracker'): string | null {
+  // Tracker automations have no create/edit route yet (2026-09-19): hand-authored into
+  // `automations.json` only. Refuse explicitly rather than misapplying the GitHub filter rules
+  // below to one that reaches this far (e.g. a PUT that omits `kind` on an existing tracker row).
+  if (kind === 'tracker') return body.trackerTrigger ? null : 'Choose an event to finish configuring this automation';
   if (kind === 'schedule') {
     if (!body.schedule) return 'a scheduled automation needs a schedule';
     if (body.events || body.filters || body.intervalSeconds !== undefined) return 'a scheduled automation has no GitHub filter';
@@ -421,6 +509,7 @@ function editableAutomation(definition: AutomationDefinition) {
     events: definition.events,
     intervalSeconds: definition.intervalSeconds,
     filters: definition.filters,
+    trackerTrigger: definition.trackerTrigger,
     schedule: definition.schedule,
     task: definition.task,
   };
@@ -522,39 +611,6 @@ export interface UpdateProjectResponse {
   project: ProjectListEntry;
 }
 
-/** `GET/PUT /api/workspace/config` (multi-project spec, step 2.7) — the
- *  settings slice of `~/.cezar/config.json`: global knobs ONLY, never the
- *  project registry (that is `GET /api/projects`' job). */
-export interface WorkspaceConfigResponse {
-  /** Root exposed by the Add project directory browser (`~` kept). */
-  browseRoot: string;
-  /** Checkout root for GUI-cloned projects — stored as written (`~` kept). */
-  projectsDir: string;
-  /** Stored override; null means inherit CEZ_SKILLS_AUTO_UPDATE, then true. */
-  skillsAutoUpdate: boolean | null;
-  effectiveSkillsAutoUpdate: boolean;
-  composerDefaults: {
-    autonomous: boolean | null;
-    worktree: boolean | null;
-    inheritedAutonomous: boolean | 'source-dependent';
-    inheritedWorktree: boolean;
-  };
-  resources: {
-    maxParallel: number;
-    maxMonitoringSessions: number;
-    monitoringWakeIntervalMinutes: number | null;
-    autoResumeOnUsageLimit: boolean;
-    memoryLimitMb: number | null;
-    worktreeRetentionDefault: number;
-  };
-  /** What a repo that has set none of its own runs (spec 2026-07-29-agent-profiles). Both keys
-   *  optional: absent means "no opinion", which must stay distinguishable from a chosen value. */
-  agentDefaults: {
-    runner?: ProviderId;
-    models?: { claude?: string; codex?: string; opencode?: string };
-  };
-}
-
 // ---- workspace SSE (multi-project spec, step 2.8) --------------------------
 
 /** Workspace-level event names carried ONLY on `GET /api/workspace/events`
@@ -565,7 +621,8 @@ export type WorkspaceEventName =
   | 'project-removed'
   | 'checkout-progress'
   | 'provider-status'
-  | 'automation-change';
+  | 'automation-change'
+  | 'tracker-changed';
 
 /**
  * The in-process bus for workspace-level SSE events. The registry-mutating
@@ -690,6 +747,14 @@ const saveWorkflowSchema = z
     message: 'provide either "steps" or "skills", not both',
   });
 
+const validateGraphSchema = z.object({ graph: workflowGraphSchema });
+const saveGraphSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  description: z.string().max(2_000, 'must be at most 2000 characters').optional(),
+  graph: workflowGraphSchema,
+  overwrite: z.boolean().optional(),
+});
+
 const parseWorkflowSchema = z.object({
   yaml: z.string().min(1).max(100_000),
 });
@@ -755,6 +820,8 @@ const uiStateSchema = z
     lastWorktree: z.boolean().optional(),
     lastAutonomous: z.boolean().optional(),
     lastGenerateFollowups: z.boolean().optional(),
+    // Default team-skill curation belongs to this repo's ui-state, never the workspace state.
+    importedSkills: z.array(z.string().min(1).max(200)).max(UI_STATE_MAX_KEYS).optional(),
     // Skill selection frequency (#408): name → times chosen, incremented on a successful run
     // start from EITHER composer (`/new`'s SourcePill and the follow-up `SkillsPicker`). Drives
     // the shared `orderSkillsByUsage` sort (web/app/src/lib/skills.ts) so both pickers float the
@@ -779,6 +846,11 @@ const uiStateSchema = z
     // The GitHub tab's last-selected sub-tab (#417): issues or PRs. ADDITIVE — an old
     // ui-state.json without the key behaves as the default (issues).
     githubView: z.enum(['issues', 'prs']).optional(),
+    // The GitHub tab's list order: newest first (what `gh` returns) or oldest first, for working
+    // the backlog from the long-waiting end. ADDITIVE, like `githubView` above — an old
+    // ui-state.json without the key behaves as the default (newest), and the sort is applied
+    // client-side, so this key changes presentation only, never what `GET /github` fetches.
+    githubSort: z.enum(['newest', 'oldest']).optional(),
     // Settings → Appearance (redesign R6): accent + density. ADDITIVE — the theme itself
     // stays in the browser (`cez-theme` localStorage, pre-paint). The cockpit always PUTs
     // the whole object because the top-level merge below is shallow.
@@ -792,7 +864,7 @@ const uiStateSchema = z
         z.object({
           id: z.string().min(1).max(64),
           label: z.string().trim().min(1).max(80),
-          text: z.string().trim().min(1).max(2000),
+          text: z.string().trim().min(1).max(PROMPT_TEMPLATE_TEXT_MAX),
           // Skill names this template auto-applies for. Optional and additive: templates
           // written before this key existed keep validating, and stay manual-only.
           skills: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
@@ -802,8 +874,7 @@ const uiStateSchema = z
       .optional(),
     // Skills promo banner (#391): set once the cockpit banner is dismissed, never unset.
     // Server-persisted (not a cookie) so the "shown once" promise holds across browsers.
-    // Retained for backward compatibility — the banner is gone, replaced by the workspace-level
-    // `importedSkills` curation (see `workspaceUiStateSchema`); `.passthrough()` would preserve
+    // Retained for backward compatibility — the banner is gone; `.passthrough()` would preserve
     // the key regardless, but keep it typed.
     dismissedSkillsBanner: z.boolean().optional(),
   })
@@ -815,6 +886,11 @@ const patchRunSchema = z.object({
   title: z.string().trim().min(1).max(300).optional(),
   task: z.string().trim().min(1).max(100_000).optional(),
 });
+
+// `POST /runs/:id/pr`: `draft` defaults to true — a bodyless POST still opens the draft PR every
+// caller got before the flag existed (the review gate's Draft PR); the run header's Create PR asks
+// for a ready-for-review one with `draft: false`.
+const createPrSchema = z.object({ draft: z.boolean().optional() });
 
 // Session commit (redesign R5 — §"Git/session API additions").
 const gitCommitSchema = z.object({
@@ -931,6 +1007,80 @@ const pinSchema = z.object({
 // it only ever carries small GUI prefs.
 const GLOBAL_BODY_LIMIT = 32 * 1024 * 1024; // 32 MiB
 const UI_STATE_BODY_LIMIT = 128 * 1024; // 128 KiB
+const BRANDING_LOGO_MAX_BYTES = 2 * 1024 * 1024;
+const BRANDING_LOGO_TYPES = {
+  'image/png': { ext: '.png', signature: (b: Buffer) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  'image/jpeg': { ext: '.jpg', signature: (b: Buffer) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  'image/webp': { ext: '.webp', signature: (b: Buffer) => b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP' },
+  'image/gif': { ext: '.gif', signature: (b: Buffer) => ['GIF87a', 'GIF89a'].includes(b.toString('ascii', 0, 6)) },
+  'image/avif': { ext: '.avif', signature: (b: Buffer) => b.toString('ascii', 4, 8) === 'ftyp' && /avif|avis/.test(b.toString('ascii', 8, 16)) },
+  'image/svg+xml': { ext: '.svg', signature: (b: Buffer) => isSafeBrandSvg(b.toString('utf8')) },
+} as const;
+const BRANDING_LOGO_EXTENSIONS = Object.values(BRANDING_LOGO_TYPES).map(({ ext }) => ext);
+const BRANDING_LOGO_FILE = 'branding-logo';
+
+function brandingLogoType(bytes: Buffer): [string, (typeof BRANDING_LOGO_TYPES)[keyof typeof BRANDING_LOGO_TYPES]] | null {
+  for (const [mime, type] of Object.entries(BRANDING_LOGO_TYPES)) {
+    if (type.signature(bytes)) return [mime, type];
+  }
+  return null;
+}
+
+function isSafeBrandSvg(svg: string): boolean {
+  const checked = svg.replace(/xmlns=(['"])http:\/\/www\.w3\.org\/2000\/svg\1/i, '');
+  if (checked.length === 0 || /<!DOCTYPE|<!ENTITY|<script\b|<foreignObject\b|<image\b|<use\b|<iframe\b|<style\b|\bon\w+\s*=|(?:href|src)\s*=|url\s*\(/i.test(checked)) return false;
+  return /^\s*<svg\b[\s\S]*<\/svg>\s*$/i.test(checked) && !/javascript:|data:|https?:|file:/i.test(checked);
+}
+
+/**
+ * `POST /workspace/branding-logo`'s request boundary — presence, size, declared type and (since
+ * those three are only what the browser CLAIMS about the file) the real content-sniffed format,
+ * all as one schema so the route type records a `File` field rather than the handler trusting
+ * whatever `parseBody()` handed it.
+ *
+ * EVERY check in the chain runs — zod does not stop at the first failure — so each one has to
+ * stand on its own against input the one before it would have rejected. A request can therefore
+ * collect more than one message, which is the honest trade for never letting a later check
+ * dereference something an earlier one only *meant* to have filtered out.
+ */
+export const brandingLogoUploadSchema = z.object({
+  file: z
+    .instanceof(File, { message: 'Choose an image file' })
+    .refine((f) => f.size >= 1 && f.size <= BRANDING_LOGO_MAX_BYTES, { message: 'Logo must be smaller than 2 MB' })
+    // `Object.hasOwn`, not `in`: `in` walks the prototype chain, so a part declaring
+    // `Content-Type: constructor` (or `toString`, `valueOf`, `hasOwnProperty`, `__proto__`)
+    // passed this gate, and the sniff below then read `.signature` off `Object` — undefined —
+    // and threw. A throw inside an async refine is NOT caught by `safeParseAsync`, so the
+    // request answered 500 instead of this message.
+    .refine((f) => Object.hasOwn(BRANDING_LOGO_TYPES, f.type), { message: 'Use PNG, JPEG, WebP, GIF, AVIF, or a safe SVG image' })
+    .refine(
+      async (f) => {
+        // Looked up defensively even though the refine above already rejected an unsupported
+        // type: zod runs EVERY check in a chain, it does not stop at the first failure, so this
+        // still executes for a type that is not in the table. Reading `.signature` off whatever
+        // the chain handed back then threw, and a throw inside an async refine escapes
+        // `safeParseAsync` — the route answered 500 instead of a validation error.
+        if (!Object.hasOwn(BRANDING_LOGO_TYPES, f.type)) return false;
+        const imageType = BRANDING_LOGO_TYPES[f.type as keyof typeof BRANDING_LOGO_TYPES];
+        return imageType.signature(Buffer.from(await f.arrayBuffer()));
+      },
+      { message: 'File contents do not match a supported image format' },
+    ),
+});
+
+function logoAssetUrl(): string | null {
+  for (const filename of [BRANDING_LOGO_FILE, ...BRANDING_LOGO_EXTENSIONS.map((ext) => `${BRANDING_LOGO_FILE}${ext}`)]) {
+    const path = join(cezarHomeDir(), filename);
+    if (!existsSync(path)) continue;
+    try {
+      const bytes = readFileSync(path);
+      if (!brandingLogoType(bytes)) continue;
+      const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+      return `/api/v1/workspace/branding-logo?v=${digest}`;
+    } catch { /* unreadable logo degrades to no logo */ }
+  }
+  return null;
+}
 
 /** The name half of a Host header — `localhost:4321` → `localhost`,
  *  `[::1]:4321` → `[::1]`. A bracketed IPv6 literal keeps its brackets
@@ -1102,9 +1252,11 @@ export function createApp(deps: ServerDeps) {
       claude: { discover: () => discoverClaudeModels({ cwd: bootRoot }) },
       codex: { discover: () => discoverCodexModels({ cwd: bootRoot }) },
       opencode: { discover: () => discoverOpencodeModels({ cwd: bootRoot }) },
+      junie: { discover: () => discoverJunieModels({ cwd: bootRoot }) },
+      cursor: { discover: () => discoverCursorModels() },
     },
   });
-  const providerAuth = deps.providerAuth ?? new ProviderAuthService();
+  const providerAuth = deps.providerAuth ?? new ProviderAuthService({ cwd: bootRoot });
   const workspaceConfig = deps.workspaceConfig ?? {
     load: loadWorkspaceConfig,
     mergeWrite: mergeWriteWorkspaceConfig,
@@ -1157,6 +1309,20 @@ export function createApp(deps: ServerDeps) {
   const openFile = deps.openFile ?? openFileInDefaultApp;
   const openApp = deps.openApp ?? openInApp;
   const skillsUpdate = deps.skillsUpdate ?? new SkillsUpdateService();
+  // No injected updater (tests, embedded callers): a READ-ONLY service over the running entry.
+  // It has no way to restart the process, so it must not install either — an install that
+  // flips `current` under a process that keeps running the old code is the worst of both.
+  const selfUpdate =
+    deps.selfUpdate ??
+    new SelfUpdateService({
+      pkgName: '@open-mercato/cezar',
+      version: deps.version,
+      entry: process.argv[1] ?? '',
+      restart: () => {},
+      readOnly: true,
+      trimPaths: () => !capabilities().localHandoff,
+    });
+  const starCount = deps.starCount ?? new StarCountReader();
 
   // ---- workspace boot-project identity (multi-project spec) ----------------
   // The boot flow (`initWorkspace` in src/index.ts) registers the boot repo
@@ -1236,6 +1402,8 @@ export function createApp(deps: ServerDeps) {
   };
   // Hosted-mode gate (spec §"Deployment modes") — read per request so
   // CEZ_REMOTE flips take effect live (and tests can toggle it).
+  const trackers = createTrackerService();
+  const trackerWatches = new TrackerWatches(trackers, deps.socketHub);
   const capabilities = () => resolveCapabilities(process.env, bindHost);
   const singleProjectRefusal = (
     action: 'adding projects' | 'editing projects' | 'removing projects' | 'folder browsing',
@@ -1301,6 +1469,19 @@ export function createApp(deps: ServerDeps) {
   contexts.onContextBuilt((ctx) => providerRuntimeAuth.watch(ctx.store));
 
   const app = new Hono();
+
+  // Hono's default 500, plus an error report (a no-op until the user opted in).
+  app.onError((err, c) => {
+    if (err instanceof HTTPException) return err.getResponse();
+    console.error(err);
+    reportError(err, {
+      source: 'server',
+      'http.method': c.req.method,
+      'http.route': c.req.routePath,
+      'http.project_scoped': c.req.path.startsWith('/api/v1/p/'),
+    }, { code: 'http_handler_failed', sid: deviceSid(c.req.header('x-cezar-sid')) });
+    return c.text('Internal Server Error', 500);
+  });
 
   // Reject oversized request bodies before they reach any handler (#429). GETs
   // and SSE carry no body, so this only ever gates the mutating routes.
@@ -1455,7 +1636,7 @@ export function createApp(deps: ServerDeps) {
     //
     // Served out of the Vite build: the file is a `public/` asset of the web package, which the
     // build copies verbatim into `web/dist`. One home, one URL — the same bytes this route
-    // hands out are what the bundle's own `<img src="/open-mercato.svg">` asks for.
+    // hands out are what the bundle's own `<img src="/icon.svg">` asks for.
     // Without a build there is nothing to serve, which is a 404 rather than a crash (the shell
     // route answers the same dev-only state with its build hint).
     const path = join(distDir, name);
@@ -1511,8 +1692,10 @@ export function createApp(deps: ServerDeps) {
     });
   });
 
-  // The favicon packages/web/index.html points at (`/open-mercato.svg`).
-  app.get('/open-mercato.svg', staticFile('open-mercato.svg', 'image/svg+xml'));
+  // The favicon packages/web/index.html points at (`/icon.svg`).
+  app.get('/icon.svg', staticFile('icon.svg', 'image/svg+xml'));
+  // Compatibility alias for the pre-rename public URL (BACKWARD_COMPATIBILITY.md §2).
+  app.get('/open-mercato.svg', staticFile('icon.svg', 'image/svg+xml'));
 
   // ---- meta ----------------------------------------------------------------
   // CORS — deliberately for /api/health ONLY (spec 011): the bookmarklets
@@ -1581,6 +1764,7 @@ export function createApp(deps: ServerDeps) {
       // unreadable workspace degrades to `projects: []`.
       projects: workspace.projects,
       bootProject: workspace.bootProject,
+      ...(process.env.CEZ_INSTANCE_ID ? { instanceId: process.env.CEZ_INSTANCE_ID } : {}),
     };
   };
   // ---- server-side health cache (stale-while-revalidate) -------------------
@@ -1686,6 +1870,16 @@ export function createApp(deps: ServerDeps) {
   // fills while the browser is still downloading the bundle, so its first
   // `GET /api/health` reads a warm value instead of the cold ~1 s compute.
   if (deps.socketHub) void refreshHealth();
+  // The Machine card's live channel (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`):
+  // demand-driven like every topic — the sampler's timer starts on 0→1 and stops on 1→0, so an
+  // idle workspace pays nothing — and trusted-only by the DEFAULT options, deliberately: unlike
+  // health this is not a discovery payload, so a foreign local page admitted by the loopback
+  // fallback must not be able to read which machine it is sitting on.
+  const hostSampler = deps.hostSampler ?? hostUsageSampler;
+  deps.socketHub?.registerTopic('host', {
+    snapshot: async () => hostSampler.sampleHostUsage(),
+    start: (publish) => hostSampler.onHostUsage(publish),
+  });
   /**
    * Warm the whole of cezar's agent knowledge — the three discovered defaults AND every extra
    * account — so no reader ever pays the first shell-out.
@@ -1724,7 +1918,7 @@ export function createApp(deps: ServerDeps) {
     // `modelDiscoveryRunnerSchema` is the contract's own list of the runners with an
     // authoritative host-local catalog (#794, #784), so the client compiles against exactly what
     // this validates. A runner absent from it has no discovery path and this 400s.
-    .get('/models', queryZodValidator(z.object({ runner: z.union([z.string(), z.array(z.string()).transform((v) => v[0] as string)]).pipe(modelDiscoveryRunnerSchema) }), { message: 'runner must be claude, codex or opencode' }), async (c) => {
+    .get('/models', queryZodValidator(z.object({ runner: z.union([z.string(), z.array(z.string()).transform((v) => v[0] as string)]).pipe(modelDiscoveryRunnerSchema) }), { message: 'runner must be claude, codex, opencode, cursor, or junie' }), async (c) => {
       const query = { data: c.req.valid('query') };
       return c.json(await modelCatalog.get(query.data.runner));
     });
@@ -1848,7 +2042,7 @@ export function createApp(deps: ServerDeps) {
       },
     )
 
-    .post('/providers/connect', jsonZodValidator(providerConnectSchema, { message: 'provider must be claude, codex, opencode, or pi' }), async (c) => {
+    .post('/providers/connect', jsonZodValidator(providerConnectSchema, { message: 'provider must be claude, codex, opencode, cursor, pi, or copilot' }), async (c) => {
       const body = { data: c.req.valid('json') };
 
       const provider = body.data.provider as ProviderId;
@@ -1945,6 +2139,7 @@ export function createApp(deps: ServerDeps) {
       ...(profile.provider === 'claude' ? { claude: profile.path } : {}),
       ...(profile.provider === 'codex' ? { codex: profile.path } : {}),
       ...(profile.provider === 'opencode' ? { opencodeConfig: profile.path } : {}),
+      ...(profile.provider === 'cursor' ? { cursor: profile.path } : {}),
     };
     const defs = listConfigFiles().filter(
       (def) => def.scope === 'user' && def.runners.includes(profile.provider),
@@ -2432,19 +2627,26 @@ export function createApp(deps: ServerDeps) {
       }
       const bootProject = await resolveBootProject(projects);
       // The folder this server was started in, when the registry does not hold
-      // it — the ordinary state since boot registration became seed-once, and
-      // before that the task-worktree/`$HOME` case. The server serves it (the
-      // boot context answers `/p/<bootProject>/…` and the unscoped alias), so
-      // leaving it out of this list made it unreachable: no sidebar row, no
-      // `lastLocation` (the cockpit only saves registry-known ids), and the
-      // repo chip naming a folder the navigation could not open. It is marked
-      // `unregistered` rather than merged in silently, so Settings offers to
-      // add it instead of offering Remove/Max parallel it cannot honour.
+      // it — listed ONLY while the registry is empty, which is the same "seed
+      // once" rule `shouldAutoRegisterProject` applies to the registry write
+      // (#774 follow-up). With no projects the launch folder IS the cockpit's
+      // project, and a cockpit showing the one folder it can definitely serve
+      // beats an empty sidebar — that also covers the unreadable workspace,
+      // where nothing is registered as far as this process can tell.
       //
-      // Also the honest answer when the workspace is unreadable: nothing IS
-      // registered as far as this process can tell, and a cockpit showing the
-      // one folder it can definitely serve beats an empty sidebar.
-      if (!projects.some((project) => project.id === bootProject)) {
+      // Once the user HAS projects, starting cezar somewhere else is opening
+      // the cockpit from a folder, not adding it: listing that folder put a row
+      // in the sidebar, the ⌘K palette and Settings that the user never asked
+      // for and has to clean up. The folder is still served — the boot context
+      // answers `/p/<bootProject>/…` and the unscoped alias, and the scope gate
+      // treats `bootProject` as known — so a legacy bookmark still resolves; it
+      // simply is not a project. Saving it stays the explicit gesture it is
+      // everywhere else: Settings → Add project, or `cezar projects add`.
+      //
+      // It is marked `unregistered` rather than merged in silently, so Settings
+      // offers to add it instead of offering Remove/Max parallel it cannot
+      // honour.
+      if (projects.length === 0) {
         const root = await realpath(bootRoot).catch(() => bootRoot);
         projects = [
           {
@@ -2470,6 +2672,8 @@ export function createApp(deps: ServerDeps) {
       const parsed = { data: c.req.valid('json') };
       const registered = await registerFolder(parsed.data.root, 'local');
       if (registered.status !== 200) return c.json(registered.body, registered.status);
+      // Only a genuinely new project: a re-add answers 409 above and is not an event.
+      track('project_added', { label: 'local' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json(registered.body, 200);
     })
 
@@ -2535,6 +2739,7 @@ export function createApp(deps: ServerDeps) {
       if (!removed) return c.json({ error: `unknown project: ${id}` }, 404);
       // In-process handles for a project no route can reach any more: store
       // closed (index flushed), manager's timers and usage subscription dropped.
+      trackerWatches.invalidateProject(entry.root);
       contexts.dispose(id);
       workspaceEvents.emit('project-removed', { id });
       const body: RemoveProjectResponse = { removed: true, id };
@@ -2658,6 +2863,8 @@ export function createApp(deps: ServerDeps) {
         const error = 'error' in body && body.error ? body.error : 'could not register the checkout';
         return c.json({ error: `${error} (the clone is at ${result.target})` }, registered.status);
       }
+      // The checkout dialog only clones GitHub repositories (`checkoutSchema`).
+      track('project_added', { label: 'github' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json(registered.body, 200);
     });
 
@@ -2694,7 +2901,7 @@ export function createApp(deps: ServerDeps) {
     // dialog hands back absolute paths, but a hand-written body (curl, a
     // future CLI) spells home the way a shell does.
     const requested = expandTilde(spelled);
-    if (!requested.startsWith('/')) {
+    if (!isAbsolutePath(requested)) {
       return {
         status: 400,
         body: { error: `not a folder: ${spelled} is not an absolute path` },
@@ -2887,6 +3094,61 @@ export function createApp(deps: ServerDeps) {
       }
     });
 
+  // ---- chained family: cezar self-update (workspace-level, PoC) ----
+  // The browser supplies a version STRING (validated shape, never a URL, a path or a tarball)
+  // and a channel; the server resolves both against the npm registry and its own managed
+  // layout. Allowed in hosted mode on purpose: an update pulls a published package from the
+  // registry, so the request cannot inject code, and a VPS behind the installer's Basic auth
+  // is exactly where "update from the cockpit" replaces `cezar server-deploy` — but hosted
+  // applies are FORWARD-ONLY (see the guard on /apply below).
+  // ---- chained family: the star ask (workspace-level) ----------------------
+  // cezar's own star count, for the cockpit's ⭐ button. Workspace-level and single-mount, like
+  // `/health`: it says nothing about any project, and there is nothing for a project scope to
+  // change about it. Never fails — `{ available: false }` is the ordinary offline answer, so the
+  // cockpit's chip simply is not there rather than showing an error nobody asked for.
+  const starCountRoutes = new Hono().get('/star-count', async (c) => c.json(await starCount.read()));
+
+  const selfUpdateRoutes = new Hono()
+    .get('/workspace/self-update', async (c) => c.json(await selfUpdate.status()))
+
+    .post('/workspace/self-update/refresh', async (c) => c.json(await selfUpdate.status({ refresh: true })))
+
+    // The development channel's pickers: cezar's own worktrees and its open PRs' preview builds.
+    // A separate read because it costs a git call per worktree and a GitHub round trip.
+    .get('/workspace/self-update/development', queryZodValidator(selfUpdateDevelopmentQuerySchema), async (c) =>
+      c.json(await selfUpdate.development({ refresh: c.req.valid('query').refresh === '1' })),
+    )
+
+    .put('/workspace/self-update/channel', jsonZodValidator(selfUpdateChannelRequestSchema, { message: 'body must be { channel: "stable" | "nightly" | "development" }' }), async (c) => {
+      const { channel } = c.req.valid('json');
+      await selfUpdate.setChannel(channel);
+      return c.json(await selfUpdate.status());
+    })
+
+    .post('/workspace/self-update/apply', jsonZodValidator(selfUpdateApplyRequestSchema, { message: 'body must be { version }' }), async (c) => {
+      const { version: target } = c.req.valid('json');
+      // SECURITY: a hosted cockpit may only move FORWARD. Installing a published package cannot
+      // inject code, but installing an OLDER one can: every hosted-mode guard — the `/api/*`
+      // request-origin check (#426), the `localHandoff` 409 that closes the agent-config hooks
+      // RCE path — lives in the running version, so a downgrade to a release that predates them
+      // re-opens exactly what they close, through a route those guards never get to see. A
+      // local cockpit keeps the full picker, downgrades included: there is no boundary left to
+      // escalate across when the caller already owns the machine. `forwardOnlyRefusal` decides
+      // what "forward" means — publish time, not just semver order, because a nightly for the
+      // next minor outranks every later patch of the current one.
+      if (!capabilities().localHandoff) {
+        const refusal = await selfUpdate.forwardOnlyRefusal(target);
+        if (refusal) return c.json({ error: refusal }, 409);
+      }
+      try {
+        selfUpdate.apply(target);
+      } catch (error) {
+        if (error instanceof SelfUpdateBusyError) return c.json({ error: error.message }, 409);
+        return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+      }
+      return c.json(await selfUpdate.status());
+    });
+
   // ---- GUI clone (multi-project spec, step 4.3) ----------------------------
   // "Add project → Clone from GitHub": clone into the checkout root, then
   // register the result through `registerFolder` above (same guards, same
@@ -2910,6 +3172,10 @@ export function createApp(deps: ServerDeps) {
   // /api/projects above, and schemaVersion (a migration cursor, not a
   // setting) is deliberately omitted.
   const workspaceConfigBody = (config: WorkspaceConfig): WorkspaceConfigResponse => ({
+    branding: {
+      name: config.branding.name ?? 'cezar',
+      logoUrl: logoAssetUrl(),
+    },
     browseRoot: config.browseRoot,
     projectsDir: config.projectsDir,
     skillsAutoUpdate: config.skillsAutoUpdate ?? null,
@@ -2932,6 +3198,7 @@ export function createApp(deps: ServerDeps) {
     resources: {
       maxParallel: config.resources.maxParallel,
       maxMonitoringSessions: config.resources.maxMonitoringSessions,
+      idleTimeoutMinutes: config.resources.idleTimeoutMinutes,
       monitoringWakeIntervalMinutes: config.resources.monitoringWakeIntervalMinutes,
       autoResumeOnUsageLimit: config.resources.autoResumeOnUsageLimit,
       memoryLimitMb: config.resources.memoryLimitMb,
@@ -2949,9 +3216,21 @@ export function createApp(deps: ServerDeps) {
   const workspaceConfigRoutes = new Hono<ProjectApiEnv>()
     .get('/workspace/config', async (c) => c.json(workspaceConfigBody(await loadWorkspaceConfig())))
 
-    .put('/workspace/config', jsonZodValidator(() => workspaceConfigUpdateSchema), async (c) => {
+    // Live host totals for a REMOTE cockpit (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`):
+    // the local cockpit gets them pushed over the `host` topic, but a remote one opens no
+    // WebSocket, so this is its snapshot + reconcile target. Same staleness-ruled sampler read as
+    // the topic — never a second compute path — and `cpuPct` is absent until a bounded delta
+    // window exists (the card renders `sampling…` and follows up once ~2.5 s later). The read
+    // keeps the sampler warm, so a cockpit polling this route gets a fresh delta each time.
+    .get('/workspace/host-usage', async (c) => {
+      const usage = hostSampler.sampleHostUsage();
+      hostSampler.keepWarm();
+      return c.json(usage);
+    })
+
+    .put('/workspace/config', jsonZodValidator(() => setWorkspaceConfigInputSchema), async (c) => {
       const parsed = { data: c.req.valid('json') };
-      const { browseRoot, projectsDir, skillsAutoUpdate, composerDefaults, resources, agentDefaults } = parsed.data;
+      const { browseRoot, projectsDir, skillsAutoUpdate, composerDefaults, resources, agentDefaults, branding } = parsed.data;
       for (const [configuredRoot, create] of [
         [browseRoot, false],
         [projectsDir, true],
@@ -2961,7 +3240,7 @@ export function createApp(deps: ServerDeps) {
         // exist; checkout roots use `mkdir -p`. Both get a real write probe.
         // Any failure → 400 and NO change persisted.
         const expanded = expandTilde(configuredRoot);
-        if (!expanded.startsWith('/')) {
+        if (!isAbsolutePath(expanded)) {
           return c.json({ error: `not writable: ${configuredRoot} is not an absolute path` }, 400);
         }
         if (!create) {
@@ -2982,6 +3261,8 @@ export function createApp(deps: ServerDeps) {
       let written: WorkspaceConfig;
       try {
         written = await mergeWriteWorkspaceConfig((config) => {
+          if (branding?.name === null) delete config.branding.name;
+          else if (branding?.name !== undefined) config.branding.name = branding.name;
           // Roots are stored as written (`~` kept); only the probe expands them.
           if (browseRoot !== undefined) config.browseRoot = browseRoot;
           if (projectsDir !== undefined) config.projectsDir = projectsDir;
@@ -2998,6 +3279,9 @@ export function createApp(deps: ServerDeps) {
           if (resources?.maxParallel !== undefined) config.resources.maxParallel = resources.maxParallel;
           if (resources?.maxMonitoringSessions !== undefined) {
             config.resources.maxMonitoringSessions = resources.maxMonitoringSessions;
+          }
+          if (resources?.idleTimeoutMinutes !== undefined) {
+            config.resources.idleTimeoutMinutes = resources.idleTimeoutMinutes;
           }
           if (resources?.monitoringWakeIntervalMinutes !== undefined) {
             config.resources.monitoringWakeIntervalMinutes = resources.monitoringWakeIntervalMinutes;
@@ -3034,6 +3318,41 @@ export function createApp(deps: ServerDeps) {
       return c.json(workspaceConfigBody(written));
     })
 
+    .use('/workspace/branding-logo', bodyLimit({ maxSize: BRANDING_LOGO_MAX_BYTES + 64 * 1024 }))
+
+    .get('/workspace/branding-logo', async (c) => {
+      for (const filename of [BRANDING_LOGO_FILE, ...BRANDING_LOGO_EXTENSIONS.map((ext) => `${BRANDING_LOGO_FILE}${ext}`)]) {
+        try {
+          const bytes = await readFile(join(cezarHomeDir(), filename));
+          const imageType = brandingLogoType(bytes);
+          if (!imageType) continue;
+          const [mime] = imageType;
+          return c.body(new Uint8Array(bytes), 200, { 'content-type': mime, 'cache-control': 'public, max-age=31536000, immutable', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox" });
+        } catch { /* check the next supported image */ }
+      }
+      return c.json({ error: 'Brand logo not found' }, 404);
+    })
+    .post('/workspace/branding-logo', multipartZodValidator(() => brandingLogoUploadSchema), async (c) => {
+      const { file } = c.req.valid('form');
+      const bytes = Buffer.from(await file.arrayBuffer());
+      await mkdir(cezarHomeDir(), { recursive: true, mode: 0o700 });
+      const path = join(cezarHomeDir(), BRANDING_LOGO_FILE);
+      const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(tmp, bytes, { mode: 0o600, flag: 'wx' });
+        await rename(tmp, path);
+      } catch (error) {
+        await unlink(tmp).catch(() => {});
+        throw error;
+      }
+      return c.json(workspaceBrandingLogoResponseSchema.parse({ logoUrl: logoAssetUrl() }));
+    })
+    .delete('/workspace/branding-logo', async (c) => {
+      await Promise.all([BRANDING_LOGO_FILE, ...BRANDING_LOGO_EXTENSIONS.map((ext) => `${BRANDING_LOGO_FILE}${ext}`)]
+        .map((filename) => unlink(join(cezarHomeDir(), filename)).catch(() => {})));
+      return c.json(workspaceBrandingLogoResponseSchema.parse({ logoUrl: null }));
+    })
+
     // Global GUI state (`~/.cezar/ui-state.json`) — same parse/key-cap/shallow-
     // merge semantics as the per-repo /api/v1/ui-state route below (the shared half
     // is `uiStateBodySchema`), but backed by the workspace file.
@@ -3064,42 +3383,6 @@ export function createApp(deps: ServerDeps) {
   // Partial updates only — absent keys stay untouched. Bounds mirror the
   // workspace schema (src/workspace/config.ts, step 1.2) exactly, so a value
   // this route accepts can never be degraded away by the next load's `.catch`.
-  const workspaceConfigUpdateSchema = z.object({
-    browseRoot: z.string().trim().min(1).max(4096).optional(),
-    projectsDir: z.string().trim().min(1).max(4096).optional(),
-    skillsAutoUpdate: z.boolean().nullable().optional(),
-    composerDefaults: z
-      .object({
-        autonomous: z.boolean().nullable().optional(),
-        worktree: z.boolean().nullable().optional(),
-      })
-      .optional(),
-    resources: z
-      .object({
-        maxParallel: z.number().int().min(1).max(16).optional(),
-        maxMonitoringSessions: z.number().int().min(0).max(16).optional(),
-        monitoringWakeIntervalMinutes: z.number().int().min(1).max(60).nullable().optional(),
-        autoResumeOnUsageLimit: z.boolean().optional(),
-        memoryLimitMb: z.number().int().min(0).max(1_048_576).nullable().optional(),
-        worktreeRetentionDefault: z.number().int().min(0).max(1000).optional(),
-      })
-      .optional(),
-    // Bounds mirror `src/workspace/config.ts`, so a value this accepts is never degraded away by
-    // the next load's `.catch`. `null` clears a key back to "no opinion".
-    agentDefaults: z
-      .object({
-        runner: z.enum(PROVIDER_IDS).nullable().optional(),
-        models: z
-          .object({
-            claude: z.string().trim().min(1).max(200).nullable().optional(),
-            codex: z.string().trim().min(1).max(200).nullable().optional(),
-            opencode: z.string().trim().min(1).max(200).nullable().optional(),
-            pi: z.string().trim().min(1).max(200).nullable().optional(),
-          })
-          .optional(),
-      })
-      .optional(),
-  });
   // ---- chained family: filesystem browse (workspace-level) ----
   const fsBrowseRoutes = new Hono<ProjectApiEnv>()
     .get(
@@ -3136,26 +3419,16 @@ export function createApp(deps: ServerDeps) {
       return c.json(await discoverSkills(repoRoot));
     })
 
-    // The opt-in catalog for the "Import skills" panel: every skill a default
-    // (vendor) repo offers — `open-mercato/skills` — regardless of import state,
-    // so the panel can present them all with a per-skill toggle. Empty once a repo
-    // configures its own `skillsRepos` (nothing is gated then). `wait=1` lets the
-    // panel wait out a cold team-skill cache, same as `GET /skills` (spec 005).
+    // Every skill a default (vendor) repo offers — `open-mercato/skills` — regardless of
+    // enabled state, so the Skills catalog can list and preview disabled entries. Empty once a
+    // repo configures its own `skillsRepos` (nothing is gated then). `wait=1` lets the page wait
+    // out a cold team-skill cache, same as `GET /skills` (spec 005).
     .get('/skills/importable', queryZodValidator(waitQuery), async (c) => {
       const repoRoot = c.get('project').root;
       const gated = await gatedSkillsRepos(repoRoot);
       if (gated.size === 0) return c.json([]);
       if (c.req.valid('query').wait === '1') await waitForTeamSkills(repoRoot);
-      const importable = getTeamSkillsCached(repoRoot)
-        .filter((skill) => skill.team && gated.has(skill.team.repo))
-        // Spread `description` rather than writing it unconditionally: an undefined VALUE is
-        // dropped by JSON.stringify, so the key is absent on the wire, and writing it always
-        // typed the route as sending a key it does not. contract/skills.ts says `.optional()`,
-        // which is what the client actually receives.
-        .map((skill) => ({
-          name: skill.name,
-          ...(skill.description !== undefined ? { description: skill.description } : {}),
-        }));
+      const importable = getTeamSkillsCached(repoRoot).filter((skill) => skill.team && gated.has(skill.team.repo));
       return c.json(importable);
     })
 
@@ -3259,6 +3532,41 @@ export function createApp(deps: ServerDeps) {
       return c.json({ ok: true, path: target });
     })
 
+    // Graph workflows (spec 2026-09-30-workflow-node-editor): the palette's node catalog, a
+    // structural validator the editor calls as you edit, and the `version: 2` save.
+    .get('/workflows/nodes', (c) => c.json({ nodes: NODE_CATALOG }))
+    .post('/workflows/validate', jsonZodValidator(validateGraphSchema), (c) =>
+      c.json({ issues: graphIssues(c.req.valid('json').graph) }),
+    )
+    .post('/workflows/graph', jsonZodValidator(saveGraphSchema), async (c) => {
+      const { root: repoRoot } = c.get('project');
+      const body = c.req.valid('json');
+      const issues = graphIssues(body.graph);
+      if (issues.length) return c.json({ error: issues.join('; ') }, 400);
+      const slug = slugify(body.name) || 'workflow';
+      const dir = join(repoRoot, WORKFLOWS_DIR);
+      const path = join(dir, `${slug}.yaml`);
+      const { nodes, edges, layout } = body.graph;
+      const doc = {
+        version: 2,
+        name: body.name,
+        ...(body.description ? { description: body.description } : {}),
+        nodes,
+        edges,
+        ...(layout ? { layout } : {}),
+      };
+      try {
+        await mkdir(dir, { recursive: true });
+        await writeFile(path, stringifyYaml(doc), { encoding: 'utf8', flag: body.overwrite ? 'w' : 'wx' });
+      } catch (err) {
+        if (err instanceof Error && 'code' in err && err.code === 'EEXIST') {
+          return c.json({ error: `workflow file already exists: ${path}`, exists: true }, 409);
+        }
+        return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
+      }
+      return c.json({ path, name: body.name }, 201);
+    })
+
     // Import support for the builder (spec 012): parse + validate a pasted
     // workflow YAML (either form) and hand back the normalized definition. The
     // server owns YAML parsing — the GUI stays dependency-free.
@@ -3270,6 +3578,25 @@ export function createApp(deps: ServerDeps) {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return c.json({ error: `not valid YAML: ${message}` }, 400);
+      }
+      const rawVersion = raw && typeof raw === 'object' ? (raw as { version?: unknown }).version : undefined;
+      // Accept a quoted `version: "2"` as the same intent as the numeric literal — a hand-edited
+      // YAML easily picks up the quotes, and without this it falls through to the v1 parser below
+      // with a confusing "missing steps" error instead of a graph validation message.
+      if (raw && typeof raw === 'object' && (rawVersion === 2 || rawVersion === '2')) {
+        const graphDoc = workflowGraphFileSchema.safeParse({ ...(raw as object), version: 2 });
+        if (!graphDoc.success) {
+          return c.json({ error: graphDoc.error.issues.map((i) => i.message).join('; ') }, 400);
+        }
+        const problems = graphIssues(graphDoc.data);
+        if (problems.length) return c.json({ error: problems.join('; ') }, 400);
+        const { name, description, nodes, edges, layout } = graphDoc.data;
+        return c.json({
+          name,
+          ...(description ? { description } : {}),
+          steps: graphToSteps(graphDoc.data),
+          graph: { nodes, edges, ...(layout ? { layout } : {}) },
+        });
       }
       const doc = workflowFileSchema.safeParse(raw);
       if (!doc.success) {
@@ -3333,6 +3660,21 @@ export function createApp(deps: ServerDeps) {
    * (existing records never launch); a schedule gets its next occurrence. Shared by create-with-
    * enable and the enable route.
    */
+  const trackerTriggerIssue = async (project: ProjectContext, trigger: AutomationEditableBody['trackerTrigger']): Promise<string | null> => {
+    if (!trigger) return 'Choose an event to finish configuring this automation';
+    const driver = await trackers.driver(project.root, project.dataDir);
+    if ('available' in driver) return driver.reason;
+    if (JSON.stringify(driver.association) !== JSON.stringify(trigger.association)) return 'Tracker connection or scope changed; reload the event options';
+    if (!driver.automationOptions) return 'This tracker does not support automation events';
+    let options: Awaited<ReturnType<NonNullable<typeof driver.automationOptions>>>;
+    try { options = await driver.automationOptions(); }
+    catch { return 'Could not verify tracker event options. Check the connection and try again.'; }
+    if (trigger.events.some(event => !options.events.includes(event))) return 'This tracker does not support the selected event';
+    if (trigger.targetStatusIds?.some(id => !options.statuses.some(status => status.id === id))) return 'Unknown status in this tracker project';
+    if (trigger.changedLabelIds?.some(id => !options.labels.some(label => label.id === id))) return 'Unknown label in this tracker project';
+    return null;
+  };
+
   const armAutomation = (store: AutomationStore, automation: AutomationDefinition): void => {
     const now = Date.now();
     if (isScheduleAutomation(automation)) {
@@ -3349,6 +3691,7 @@ export function createApp(deps: ServerDeps) {
       ...current,
       revision: automation.revision,
       baselineAt,
+      checkpoint: undefined,
       cursor: { timestamp: baselineAt },
       nextCheckAt: new Date(now + (automation.intervalSeconds ?? 300) * 1_000).toISOString(),
     }));
@@ -3491,14 +3834,21 @@ export function createApp(deps: ServerDeps) {
       const kind = parsed.data.kind ?? 'github';
       const kindIssue = automationKindIssue(parsed.data, kind);
       if (kindIssue) return c.json({ error: kindIssue }, 400);
+      if (kind === 'tracker') {
+        const issue = await trackerTriggerIssue(c.get('project'), parsed.data.trackerTrigger);
+        if (issue) return c.json({ error: issue }, 400);
+      }
       const promptIssue = validateAutomationPrompt(parsed.data.task.prompt, kind);
       if (promptIssue) return c.json({ error: promptIssue }, 400);
       const accountIssue = await automationAccountIssue(c.get('project').root, parsed.data.task);
       if (accountIssue) return c.json({ error: accountIssue }, 400);
       const { enable, ...input } = parsed.data;
       try {
-        const automation = automationStore.create({ ...input, kind, enabled: enable === true });
-        if (enable) armAutomation(automationStore, automation);
+        const automation = automationStore.create(
+          { ...input, kind, enabled: enable === true },
+          undefined,
+          enable ? definition => armAutomation(automationStore, definition) : undefined,
+        );
         emitAutomationChange(c.get('project'), automation.id, automation.revision);
         automationsChanged();
         return c.json({ automation }, 201);
@@ -3531,13 +3881,40 @@ export function createApp(deps: ServerDeps) {
       if (kind !== current.kind) return c.json({ error: 'change the kind by creating a new automation' }, 409);
       const kindIssue = automationKindIssue(parsed.data, kind);
       if (kindIssue) return c.json({ error: kindIssue }, 400);
+      if (kind === 'tracker') {
+        const issue = await trackerTriggerIssue(c.get('project'), parsed.data.trackerTrigger);
+        if (issue) return c.json({ error: issue }, 400);
+      }
       const promptIssue = validateAutomationPrompt(parsed.data.task.prompt, kind);
       if (promptIssue) return c.json({ error: promptIssue }, 400);
       const accountIssue = await automationAccountIssue(c.get('project').root, parsed.data.task);
       if (accountIssue) return c.json({ error: accountIssue }, 400);
       const { expectedRevision, ...input } = parsed.data;
       try {
-        const automation = automationStore.update(c.req.param('id'), expectedRevision, { ...input, kind, enabled: input.enabled ?? false });
+        // Match the scanner's checkpoint identity: association and effective event selection.
+        // Prompt and eligibility-filter edits keep progress so events since the last poll survive.
+        const trackerScanIdentity = (trigger: AutomationEditableBody['trackerTrigger']) => JSON.stringify([
+          trigger?.association,
+          trigger?.events.length === 1 ? trigger.events[0] : undefined,
+        ]);
+        const trackerSourceChanged = kind === 'tracker'
+          && trackerScanIdentity(current.trackerTrigger) !== trackerScanIdentity(input.trackerTrigger);
+        const automation = automationStore.update(
+          c.req.param('id'), expectedRevision,
+          { ...input, kind, enabled: input.enabled ?? false },
+          definition => {
+            // Publish the new baseline and definition under the same mutation lease.
+            if (kind === 'tracker' && definition.enabled && (!current.enabled || trackerSourceChanged)) armAutomation(automationStore, definition);
+            else if (trackerSourceChanged) {
+              // A paused definition still needs a compatible read-only preview. Clear source-bound
+              // progress without arming a timer; Enable will establish its own current-time baseline.
+              automationStore.setState(definition.id, state => ({
+                ...state, revision: definition.revision, baselineAt: undefined, checkpoint: undefined,
+                cursor: undefined, nextCheckAt: undefined, backoffUntil: undefined, consecutiveFailures: 0,
+              }));
+            }
+          },
+        );
         // An edited schedule recomputes its next occurrence; `store.update` carried the old
         // `nextRunAt` forward, so clear it and let the timer's `dueAt` persist the new one.
         if (kind === 'schedule' && JSON.stringify(current.schedule) !== JSON.stringify(automation.schedule)) {
@@ -3545,9 +3922,7 @@ export function createApp(deps: ServerDeps) {
             automationStore.setState(automation.id, (state) => ({ ...state, nextRunAt: undefined }));
           }
         }
-        // Switched on from the editor: the same current-time baseline the Enable button sets, or
-        // the first poll would launch the whole lookback window's backlog.
-        if (automation.enabled && !current.enabled) armAutomation(automationStore, automation);
+        if (kind !== 'tracker' && automation.enabled && !current.enabled) armAutomation(automationStore, automation);
         emitAutomationChange(c.get('project'), automation.id, automation.revision);
         automationsChanged();
         return c.json({ automation });
@@ -3567,12 +3942,23 @@ export function createApp(deps: ServerDeps) {
       return c.body(null, 204);
     })
 
-    .post('/automations/:id/enable', (c) => {
+    .post('/automations/:id/enable', async (c) => {
       const store = c.get('project').automationStore;
       const current = store.get(c.req.param('id'));
       if (!current) return c.json({ error: 'not found' }, 404);
-      const automation = store.update(current.id, current.revision, { ...editableAutomation(current), enabled: true });
-      armAutomation(store, automation);
+      if (current.kind === 'tracker') {
+        const issue = await trackerTriggerIssue(c.get('project'), current.trackerTrigger);
+        if (issue) return c.json({ error: issue }, 400);
+      }
+      let automation: AutomationDefinition;
+      try {
+        automation = store.update(
+          current.id, current.revision,
+          { ...editableAutomation(current), enabled: true },
+          definition => armAutomation(store, definition),
+        );
+      }
+      catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
       emitAutomationChange(c.get('project'), automation.id, automation.revision);
       automationsChanged();
       return c.json({ automation });
@@ -3582,7 +3968,9 @@ export function createApp(deps: ServerDeps) {
       const store = c.get('project').automationStore;
       const current = store.get(c.req.param('id'));
       if (!current) return c.json({ error: 'not found' }, 404);
-      const automation = store.update(current.id, current.revision, { ...editableAutomation(current), enabled: false });
+      let automation: AutomationDefinition;
+      try { automation = store.update(current.id, current.revision, { ...editableAutomation(current), enabled: false }); }
+      catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
       emitAutomationChange(c.get('project'), automation.id, automation.revision);
       automationsChanged();
       return c.json({ automation });
@@ -3596,7 +3984,7 @@ export function createApp(deps: ServerDeps) {
       const store = project.automationStore;
       const automation = store.get(c.req.param('id'));
       if (!automation) return c.json({ error: 'not found' }, 404);
-      if (!isGithubAutomation(automation)) return c.json({ error: 'a schedule has nothing to preview; use run' }, 409);
+      if (!isGithubAutomation(automation) && !isTrackerAutomation(automation)) return c.json({ error: 'Choose an event to preview, or use run for a schedule' }, 409);
       const parsed = { data: c.req.valid('json') };
       // `string`, not `randomUUID`'s template-literal type: the wire carries an opaque id, and
       // leaking `${string}-${string}-…` into the route type would make the contract describe the
@@ -3608,6 +3996,16 @@ export function createApp(deps: ServerDeps) {
       void (async () => {
         check.status = 'running';
         try {
+          if (isTrackerAutomation(automation)) {
+            const scheduler = new ProjectTrackerAutomationScheduler({ projectId: project.id, store, timeZone: localTimeZone(),
+              tracker: { getDriver: () => trackers.driver(project.root, project.dataDir), poller: new TrackerPoller() },
+              launchTracker: (definition, candidate, receiptId) => launchTrackerAutomationRun({ root: project.root, manager: project.manager, store: project.store, definition, candidate, receiptId, dispatchEnabled: capabilities().dispatch }),
+              onChange: (id, revision) => emitAutomationChange(project, id, revision),
+            });
+            const result = await scheduler.check(automation, parsed.data.mode);
+            Object.assign(check, { status: 'complete', completedAt: new Date().toISOString(), matches: result.candidates.length, truncated: result.truncated });
+            return;
+          }
           const remote = parseRemote((await getRepoInfo(project.root))?.remote ?? '');
           if (!remote || remote.host !== 'github.com') throw new Error('No GitHub remote is configured');
           const scheduler = new ProjectAutomationScheduler({
@@ -3655,6 +4053,8 @@ export function createApp(deps: ServerDeps) {
     .post('/automation-log/:receiptId/retry', async (c) => {
       const project = c.get('project');
       const store = project.automationStore;
+      try { reconcileAutomationReceipts(store, project.store, { strict: true }); }
+      catch { return c.json({ error: 'Cannot safely reconcile automation receipts; try again.' }, 409); }
       const receipt = [...store.latestReceipts().values()].find((row) => row.receiptId === c.req.param('receiptId'));
       if (!receipt) return c.json({ error: 'not found' }, 404);
       if (receipt.status !== 'launch-error' || receipt.runId) return c.json({ error: 'receipt is not retryable' }, 409);
@@ -3668,21 +4068,62 @@ export function createApp(deps: ServerDeps) {
         if (!('runId' in outcome)) return c.json({ error: 'the launch failed — see the execution log' }, 409);
         return c.json({ receiptId: receipt.receiptId, runId: outcome.runId }, 202);
       }
+      if (isTrackerAutomation(definition)) {
+        const candidate = receipt.trackerCandidate;
+        if (!candidate?.association || !candidate.event || !candidate.issueId || !candidate.change) return c.json({ error: 'Receipt predates event context and cannot be retried safely' }, 409);
+        if (receipt.revision !== definition.revision) return c.json({ error: 'Automation changed since this event; retry is no longer safe' }, 409);
+        const issue = await trackerTriggerIssue(project, definition.trackerTrigger);
+        if (issue) return c.json({ error: issue }, 409);
+        const lease = store.acquireLease();
+        if (!lease) return c.json({ error: 'automation polling lease is held by another process' }, 409);
+        const mutation = store.acquireMutationLease();
+        if (!mutation) { lease.release(); return c.json({ error: 'automation mutation conflict' }, 409); }
+        try {
+          if (store.get(definition.id)?.revision !== definition.revision) return c.json({ error: 'automation revision conflict' }, 409);
+          try { reconcileAutomationReceipts(store, project.store, { strict: true }); }
+          catch { return c.json({ error: 'Cannot safely reconcile automation receipts; try again.' }, 409); }
+          if (!store.reserveRetry(receipt.receiptId)) return c.json({ error: 'receipt is not retryable' }, 409);
+          const launched = await launchTrackerAutomationRun({ root: project.root, manager: project.manager, store: project.store, definition,
+            candidate: { ...candidate, association: candidate.association, event: candidate.event, issueId: candidate.issueId, change: candidate.change }, receiptId: receipt.receiptId, dispatchEnabled: capabilities().dispatch });
+          store.appendReceipt({ ...receipt, status: 'launched', runId: launched.runId, updatedAt: new Date().toISOString() });
+          return c.json({ receiptId: receipt.receiptId, runId: launched.runId }, 202);
+        } catch (error) {
+          store.appendReceipt({ ...receipt, status: 'launch-error', error: error instanceof Error ? error.message : String(error), updatedAt: new Date().toISOString() });
+          return c.json({ error: 'Tracker launch failed; see the execution log' }, 409);
+        } finally { mutation.release(); lease.release(); }
+      }
       if (!isGithubAutomation(definition)) return c.json({ error: 'automation kind cannot be retried' }, 409);
       if (!receipt.candidate) return c.json({ error: 'receipt predates retry context and cannot be retried safely' }, 409);
       const lease = store.acquireLease();
       if (!lease) return c.json({ error: 'automation polling lease is held by another process' }, 409);
-      const reserved = { ...receipt, status: 'reserved' as const, error: undefined, updatedAt: new Date().toISOString() };
-      store.appendReceipt(reserved);
+      const mutation = store.acquireMutationLease();
+      if (!mutation) { lease.release(); return c.json({ error: 'automation mutation conflict' }, 409); }
+      try { reconcileAutomationReceipts(store, project.store, { strict: true }); }
+      catch {
+        mutation.release();
+        lease.release();
+        return c.json({ error: 'Cannot safely reconcile automation receipts; try again.' }, 409);
+      }
+      const reserved = store.reserveRetry(receipt.receiptId);
+      if (!reserved) { mutation.release(); lease.release(); return c.json({ error: 'receipt is not retryable' }, 409); }
       try {
         const launched = await launchAutomationRun({ root: project.root, manager: project.manager, store: project.store, definition, candidate: receipt.candidate, receiptId: receipt.receiptId, dispatchEnabled: capabilities().dispatch });
         store.appendReceipt({ ...reserved, status: 'launched', runId: launched.runId, updatedAt: new Date().toISOString() });
         emitAutomationChange(project, definition.id, definition.revision);
         return c.json({ receiptId: receipt.receiptId, runId: launched.runId }, 202);
       } catch (error) {
-        store.appendReceipt({ ...reserved, status: 'launch-error', error: error instanceof Error ? error.message : String(error), updatedAt: new Date().toISOString() });
+        // A `pr-head` retry whose PR has since closed (or turned out a fork) is handled, not
+        // broken: a terminal `skipped` receipt, so Retry stops being offered for it.
+        const skipped = error instanceof AutomationLaunchOutcome && error.result === 'skipped';
+        store.appendReceipt({
+          ...reserved,
+          status: skipped ? 'skipped' : 'launch-error',
+          ...(skipped ? {} : { error: (error instanceof Error ? error.message : String(error)).slice(0, 2_000) }),
+          updatedAt: new Date().toISOString(),
+        });
         return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
       } finally {
+        mutation.release();
         lease.release();
       }
     });
@@ -3782,14 +4223,19 @@ export function createApp(deps: ServerDeps) {
 
     // Registered before the `/:id/...` routes so "archive-finished" and "read-all"
     // never match as a run id.
-    .post('/runs/archive-finished', (c) => c.json({ archived: c.get('project').store.archiveFinished() }))
+    .post('/runs/archive-finished', (c) => {
+      const archived = c.get('project').store.archiveFinished();
+      // One event for the sweep, `value` = how many it archived (summed on the dashboard).
+      if (archived > 0) track('task_archived', { label: 'bulk', value: archived }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
+      return c.json({ archived });
+    })
 
     // The read-receipt sweep (#unread-done-items) — the mark-read twin of the archive
     // sweep above, and under the same registration-order guard.
     .post('/runs/read-all', (c) => c.json({ read: c.get('project').store.markAllRead() }))
 
     .post('/runs/:id/archive', jsonZodValidator(archiveSchema, { absent: ({}) }), async (c) => {
-      const { store } = c.get('project');
+      const { store, manager } = c.get('project');
       const id = c.req.param('id');
       // An empty/absent body archives (the common case); a malformed body degrades
       // to `{}` just as before, but a wrong-typed `archived` is now a 400 (#429).
@@ -3797,7 +4243,11 @@ export function createApp(deps: ServerDeps) {
       // `setArchived` itself — the bulk sweep must obey it too (spec
       // 2026-08-03-auto-resume-after-usage-limit).
       const parsed = { data: c.req.valid('json') };
+      const retiresQuestion = parsed.data.archived !== false && store.getRun(id)?.awaitingAnswerSince !== undefined;
       const run = store.setArchived(id, parsed.data.archived !== false);
+      if (run && retiresQuestion) manager.notifyQuestionRetired?.(id);
+      // Labelled with the task's outcome: which results get kept, which get put away.
+      if (run) track(parsed.data.archived !== false ? 'task_archived' : 'task_unarchived', { label: run.status }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return run ? c.json(run) : c.json({ error: 'not found' }, 404);
     })
 
@@ -3807,7 +4257,9 @@ export function createApp(deps: ServerDeps) {
     // event and no new response shape.
     .post('/runs/:id/pin', jsonZodValidator(pinSchema, { absent: ({}) }), (c) => {
       const { store } = c.get('project');
-      const run = store.setPinned(c.req.param('id'), c.req.valid('json').pinned !== false);
+      const pinned = c.req.valid('json').pinned !== false;
+      const run = store.setPinned(c.req.param('id'), pinned);
+      if (run) track(pinned ? 'task_pinned' : 'task_unpinned', { label: run.status }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return run ? c.json(run) : c.json({ error: 'not found' }, 404);
     })
 
@@ -3900,6 +4352,7 @@ export function createApp(deps: ServerDeps) {
         // CEZ_TODOS_FILE alike (RunManager.agentEnv).
         generateFollowups: capabilities().followups ? parsed.data.generateFollowups : false,
         ...(parsed.data.dispatch && capabilities().dispatch ? { dispatchIntent: parsed.data.dispatch } : {}),
+        deviceSid: deviceSid(c.req.header('x-cezar-sid')),
       };
       if (variants > 1) {
         const runs = manager.startVariants(workflow, input, variants);
@@ -4198,6 +4651,7 @@ export function createApp(deps: ServerDeps) {
       if (!opened) {
         return c.json({ error: 'no terminal emulator found', command: fallback }, 409);
       }
+      track('open_in', { label: 'resume_in_terminal' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ opened: true, command });
     })
 
@@ -4219,6 +4673,9 @@ export function createApp(deps: ServerDeps) {
       // injection guard, this just validates the shape.
       const parsedBody = { data: c.req.valid('json') };
       const { target, path: relPath } = parsedBody.data;
+      // Telemetry counts an `open_in` only once it opened: `target` is free client text until
+      // `openApp`/`agentCliRunner` matched it, and labels must stay a closed set.
+      const trackOpened = (label: string) => track('open_in', { label }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       const dir = run.worktreePath && existsSync(run.worktreePath) ? run.worktreePath : repoRoot;
 
       // Diff pane "open in OS default app" (#365): one worktree file, opened with the platform's
@@ -4264,6 +4721,7 @@ export function createApp(deps: ServerDeps) {
         const filePath = join(run.worktreePath, result.path);
         const opened = await openFile(filePath);
         if (!opened) return c.json({ error: `could not open ${result.path}`, path: filePath }, 409);
+        trackOpened('default');
         return c.json({ opened: true, path: filePath });
       }
 
@@ -4289,7 +4747,10 @@ export function createApp(deps: ServerDeps) {
         // An id resumeCommand refuses (#431) degrades to a fresh CLI in the worktree,
         // exactly like a run that never recorded a session.
         const resume = sessionId && cliRunner === (run.runner ?? 'claude') ? resumeCommand(cliRunner, sessionId) : null;
-        const command = resume ?? cliRunner;
+        // The terminal this opens does not share our PATH (see `withResolvedClaudeBin`), so a
+        // claude found off PATH by detection has to be named by absolute path here too —
+        // otherwise the menu offers a handoff that opens on `command not found`.
+        const command = withResolvedClaudeBin(resume ?? cliRunner, cliRunner);
         // BOTH branches carry the account (spec 2026-07-29-agent-profiles): a resume needs the
         // config dir that holds its session, and a FRESH CLI in this worktree should still open
         // on the account the project works under — otherwise "Open in → Claude CLI" quietly
@@ -4306,11 +4767,13 @@ export function createApp(deps: ServerDeps) {
         if (!opened) {
           return c.json({ error: 'no terminal emulator found', command: fallback }, 409);
         }
+        trackOpened(`cli:${cliRunner}`);
         return c.json({ opened: true, path: dir, command });
       }
 
       const opened = await openApp(target, dir);
       if (!opened) return c.json({ error: `could not open ${target}`, path: dir }, 409);
+      trackOpened(target);
       return c.json({ opened: true, path: dir });
     })
 
@@ -4509,16 +4972,39 @@ export function createApp(deps: ServerDeps) {
       });
     })
 
+    // What the worktree holds that has not left it, and what its base has that it lacks — drives
+    // the header's one git button (Commit and push, Push, Update branch). Read-only.
+    .get('/runs/:id/git/status', async (c) => {
+      const { store } = c.get('project');
+      const run = store.getRun(c.req.param('id'));
+      if (!run) return c.json({ error: 'not found' }, 404);
+      const worktree = worktreeOf(run);
+      if (!worktree) return c.json({ error: NO_WORKTREE }, 409);
+      const result = await worktreeGitStatus(worktree, run.baseBranch);
+      if (!result.ok) return c.json({ error: result.error }, 409);
+      return c.json({ uncommitted: result.uncommitted, unpushed: result.unpushed, behind: result.behind });
+    })
+
     // Draft PR from the review gate (spec 009): final autosave → push →
     // `gh pr create --draft`; on success the run completes as done with the PR
     // badge. Failures come back as 409 with a `manual` merge command the GUI
     // shows next to the toast. CEZ_DRY_RUN=1 fakes the URL (no push, no gh).
-    .post('/runs/:id/pr', async (c) => {
+    .post('/runs/:id/pr', jsonZodValidator(createPrSchema, { absent: ({}) }), async (c) => {
       const { root: repoRoot, dataDir, store, manager } = c.get('project');
+      const draft = c.req.valid('json').draft ?? true;
       const id = c.req.param('id');
       const run = store.getRun(id);
       if (!run) return c.json({ error: 'not found' }, 404);
       if (manager.isActive(id)) return c.json({ error: 'run is still active — wait for the review gate' }, 409);
+      // A pull-request head run's branch holds the whole foreign PR under this run's changes: a
+      // draft PR from it into the default base would re-propose that PR (spec
+      // 2026-10-06-agentic-e2e-checks Phase 3). Refused until publishing back is designed.
+      if (run.prHead) {
+        return c.json(
+          { error: `this run verified pull request #${run.prHead.number}; publishing its changes is not supported yet` },
+          409,
+        );
+      }
       if (!run.worktreePath || !existsSync(run.worktreePath) || !run.branch) {
         return c.json(
           {
@@ -4531,6 +5017,7 @@ export function createApp(deps: ServerDeps) {
         repoRoot,
         run,
         handoffText: readHandoff(dataDir, id),
+        draft,
       });
       if (!outcome.ok) {
         return c.json({ error: outcome.error, manual: `git merge ${run.branch}` }, 409);
@@ -4547,7 +5034,7 @@ export function createApp(deps: ServerDeps) {
       });
       store.appendEvent(id, {
         type: 'note',
-        message: `draft PR created: ${outcome.url}${outcome.dryRun ? ' (dry run — no real PR)' : ''}`,
+        message: `${draft ? 'draft PR' : 'PR'} created: ${outcome.url}${outcome.dryRun ? ' (dry run — no real PR)' : ''}`,
       });
       return c.json({ url: outcome.url, dryRun: outcome.dryRun }, 201);
     })
@@ -4562,6 +5049,7 @@ export function createApp(deps: ServerDeps) {
       if (manager.isActive(id)) return c.json({ error: 'run is active — cancel it first' }, 409);
       if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
       store.updateRun(id, { worktreePath: undefined, branch: undefined });
+      if (run.prHead) await manager.sweepPrHeadRefs();
       return c.json({ removed: true });
     })
 
@@ -4573,7 +5061,12 @@ export function createApp(deps: ServerDeps) {
       if (!run) return c.json({ error: 'not found' }, 404);
       // Delete cleans up after itself: worktree + branch go with the run (spec 006).
       if (run.worktreePath) await removeWorktree(repoRoot, run.worktreePath, run.branch);
-      return store.deleteRun(id) ? c.json({ deleted: true }) : c.json({ error: 'not found' }, 404);
+      const deleted = store.deleteRun(id);
+      // The run's `refs/cezar/pr/<n>` goes with the last run that needed it (Phase 3).
+      if (deleted && run.prHead) await manager.sweepPrHeadRefs();
+      if (!deleted) return c.json({ error: 'not found' }, 404);
+      track('task_deleted', { label: run.status }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
+      return c.json({ deleted: true });
     });
 
   // ---- chained family: in-task drafts (project-scoped) ----------------------
@@ -4770,6 +5263,7 @@ export function createApp(deps: ServerDeps) {
           message: `variant ${winner.variant ?? '?'} was picked — this variant is archived, its worktree removed`,
         });
       }
+      if (losers.some((loser) => loser.prHead)) await manager.sweepPrHeadRefs();
       // Spread: `getRun` may answer undefined, and an undefined VALUE is dropped by
       // JSON.stringify — so writing the key unconditionally typed the route as sending a key it
       // does not. contract/workflows.ts says `.optional()`, which is what a client receives.
@@ -4805,6 +5299,8 @@ export function createApp(deps: ServerDeps) {
       }
       const opened = await openApp(target, root);
       if (!opened) return c.json({ error: `could not open ${target}`, path: root }, 409);
+      // After the allowlist and the open: a closed label set (see the run route above).
+      track('open_in', { label: `project:${target}` }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ opened: true as const, path: root });
     });
 
@@ -5036,27 +5532,27 @@ export function createApp(deps: ServerDeps) {
             event: isV2WireEventType(event.type) ? 'ui-event' : 'run-event',
             data: JSON.stringify(event),
           });
-        const onEvent = (payload: { runId: string; event: RunEvent }) => {
-          if (payload.runId !== id) return;
-          if (replaying) buffered.push(payload.event);
-          else void writeEvent(payload.event);
+        const onEvent = (event: RunEvent) => {
+          if (replaying) buffered.push(event);
+          else void writeEvent(event);
         };
         const onRun = (run: RunRecord) => {
           if (run.id !== id) return;
           void stream.writeSSE({ event: 'run', data: JSON.stringify(run) });
         };
-        store.on('event', onEvent);
+        const offEvent = onRunEvent(store, id, onEvent);
         store.on('run', onRun);
         stream.onAbort(() => {
-          store.off('event', onEvent);
+          offEvent();
           store.off('run', onRun);
         });
 
         const replay = query.cursor
           ? await readEventsAfterLiveCursor(eventsPath, query.cursor)
-          : { events: store.readEvents(id), boundarySeq: 0 };
+          : { events: streamRunEvents(eventsPath), boundarySeq: 0 };
         maxSeq = Math.max(maxSeq, replay.boundarySeq);
-        for (const event of replay.events) {
+        for await (const event of replay.events) {
+          if (stream.aborted) break;
           if (event.seq <= maxSeq) continue;
           await writeEvent(event);
           maxSeq = event.seq;
@@ -5114,10 +5610,10 @@ export function createApp(deps: ServerDeps) {
           void stream.writeSSE({ event: 'usage', data: JSON.stringify(owned) });
         });
         store.on('run', onRun);
-        store.on('deleted', onDeleted);
+        const offDeleted = onRunDeleted(store, onDeleted);
         stream.onAbort(() => {
           store.off('run', onRun);
-          store.off('deleted', onDeleted);
+          offDeleted();
           offTodos();
           offUsage();
         });
@@ -5159,12 +5655,12 @@ export function createApp(deps: ServerDeps) {
           // watcher — and each subscription is scoped to its own dataDir (2.3).
           const offTodos = capabilities().followups ? onTodosChanged(dataDir, () => void sendTodos()) : () => undefined;
           store.on('run', onRun);
-          store.on('deleted', onDeleted);
+          const offDeleted = onRunDeleted(store, onDeleted);
           attached.set(project, {
             store,
             detach: () => {
               store.off('run', onRun);
-              store.off('deleted', onDeleted);
+              offDeleted();
               offTodos();
             },
           });
@@ -5197,7 +5693,15 @@ export function createApp(deps: ServerDeps) {
             if (Object.keys(owned).length > 0) {
               void stream.writeSSE({
                 event: 'usage',
-                data: JSON.stringify({ project, usage: owned }),
+                data: JSON.stringify({
+                  project, usage: owned, sentAt: new Date().toISOString(),
+                  samples: Object.keys(owned).flatMap((runId) => {
+                    const run = store.getRun(runId);
+                    const timed = currentTimedUsage(runId);
+                    return timed && run?.status === 'running' && !run.archived
+                      ? [{ projectId: project, runId, ...timed }] : [];
+                  }),
+                }),
               });
             }
           }
@@ -5257,17 +5761,275 @@ export function createApp(deps: ServerDeps) {
   };
   const prChangesParams = z.object({ number: z.coerce.number().int().positive().safe() });
   const prChangesQuery = z.object({ refresh: queryValue.refine((v) => v === undefined || v === '1') });
+  // Serialize validation and persistence per project: a slow Connect cannot resurrect a
+  // connection after a subsequent Disconnect. Reads remain independent and demand-driven.
+  const trackerMutations = new Map<string, Promise<unknown>>();
+  const mutateTracker = <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+    const previous = trackerMutations.get(key) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(action);
+    trackerMutations.set(key, current);
+    void current.finally(() => {
+      if (trackerMutations.get(key) === current) trackerMutations.delete(key);
+    }).catch(() => {});
+    return current;
+  };
+  const trackerChanged = async (project: ProjectContext) => {
+    trackers.clearCache(project.root);
+    trackerWatches.invalidateProject(project.root);
+    clearProjectProbeCache();
+    const payload: TrackerChangedEvent = {
+      project: project === bootContext ? await resolveBootProject() : project.id,
+    };
+    workspaceEvents.emit('tracker-changed', payload);
+  };
+  // ---- chained family: project secrets ------------------------------------
+  // Spec 2026-10-10-project-secrets-vault-options. Write-only values: GET answers names and
+  // metadata and never a value, masked or not. The write gate is the one `/tracker/connection`
+  // has — the global request-origin guard (#426), no per-route capability — and the file is
+  // keyed by the same project id the run manager reads with, so the reserved boot alias of an
+  // unregistered boot project is refused rather than written somewhere nothing reads. The
+  // workspace scope has its own single-mount family below (`workspaceSecretsRoutes`), the same
+  // three handlers over the `workspace` scope.
+  const secretStore = deps.secrets ?? new SecretStore();
+  const unregisteredSecrets = { error: 'this project is not registered; project secrets need a project id' };
+  const secretsList = async (scope: SecretScopeRef): Promise<SecretsList> => {
+    const [listed, keyBackend] = await Promise.all([secretStore.list(scope), secretStore.keyBackend()]);
+    return { secrets: listed.secrets, keyBackend };
+  };
+  const putSecret = async (scope: SecretScopeRef, name: string, input: SecretValueInput) => {
+    try {
+      await secretStore.set(scope, name, input.value, input.audiences);
+    } catch (error) {
+      if (error instanceof SecretsError) return { status: 400 as const, error: error.message };
+      return { status: 409 as const, error: 'Could not save the secret. Check local storage permissions.' };
+    }
+    return null;
+  };
+  const deleteSecret = async (scope: SecretScopeRef, name: string) => {
+    let removed: boolean;
+    try {
+      removed = await secretStore.unset(scope, name);
+    } catch {
+      return { status: 409 as const, error: 'Could not remove the secret. Check local storage permissions.' };
+    }
+    return removed ? null : { status: 404 as const, error: 'no secret with that name' };
+  };
+  const secretsRoutes = new Hono<ProjectApiEnv>()
+    .get('/secrets', async (c) => {
+      const project = c.get('project');
+      return c.json(await secretsList({ kind: 'project', projectId: project.id, root: project.root }), 200);
+    })
+    .put('/secrets/:name', paramZodValidator(secretParamsSchema), jsonZodValidator(secretValueInputSchema), async (c) => {
+      const project = c.get('project');
+      if (project.id === 'default') return c.json(unregisteredSecrets, 409);
+      const failed = await putSecret({ kind: 'project', projectId: project.id, root: project.root }, c.req.valid('param').name, c.req.valid('json'));
+      if (failed) return c.json({ error: failed.error }, failed.status);
+      return c.body(null, 204);
+    })
+    .delete('/secrets/:name', paramZodValidator(secretParamsSchema), async (c) => {
+      const project = c.get('project');
+      if (project.id === 'default') return c.json(unregisteredSecrets, 409);
+      const failed = await deleteSecret({ kind: 'project', projectId: project.id, root: project.root }, c.req.valid('param').name);
+      if (failed) return c.json({ error: failed.error }, failed.status);
+      return c.body(null, 204);
+    });
+
+  // ---- chained family: one-click e2e setup ----------------------------------
+  // Spec 2026-10-10-e2e-one-click-setup. `GET /e2e` says what the project has; `POST /e2e/setup`
+  // stores the model key (when given) as a `checks` secret and starts the setup as an ordinary
+  // task — an ad-hoc workflow, never a catalog entry — whose branch the user merges.
+  const checkSecretNames = async (project: ProjectContext): Promise<string[]> => {
+    const scope = project.id === 'default' ? undefined : { projectId: project.id, root: project.root };
+    try {
+      return Object.keys((await secretStore.resolve(scope, 'checks')).values);
+    } catch {
+      return [];
+    }
+  };
+  const e2eRoutes = new Hono<ProjectApiEnv>()
+    .get('/e2e', async (c) => {
+      const project = c.get('project');
+      const status: E2eStatus = await readE2eStatus(project.root, project.store.listRuns(), await checkSecretNames(project));
+      return c.json(status, 200);
+    })
+    .post('/e2e/setup', jsonZodValidator(e2eSetupInputSchema), async (c) => {
+      const project = c.get('project');
+      const { credential } = c.req.valid('json');
+      const running = latestE2eSetupRun(project.store.listRuns());
+      if (running && setupInFlight(running)) {
+        return c.json({ error: `an e2e setup is already in progress (task ${running.id.slice(0, 8)})` }, 409);
+      }
+      if (!(await getRepoInfo(project.root))) {
+        return c.json({ error: 'e2e setup needs a git repository — it runs in its own worktree and finishes as a branch you merge' }, 409);
+      }
+      if (credential) {
+        if (project.id === 'default') return c.json(unregisteredSecrets, 409);
+        const failed = await putSecret(
+          { kind: 'project', projectId: project.id, root: project.root },
+          credential.name,
+          { value: credential.value, audiences: ['checks'] },
+        );
+        if (failed) return c.json({ error: failed.error }, 409);
+      }
+      const workflow = e2eSetupWorkflow(e2eCredentialsAmong(await checkSecretNames(project)));
+      const blocked = await providerActionError(
+        providersRequiredByWorkflow(workflow, (await loadConfig(project.root)).defaultRunner),
+      );
+      if (blocked) return c.json({ error: blocked }, 409);
+      // Not autonomous: an autonomous run skips the review gate (`settleSuccess`) a user may have
+      // turned on, and the setup's whole point is a branch the user reviews before it lands. Its agent step is not the last
+      // step, so it hands on to the checks without parking.
+      const run = project.manager.startRun(workflow, { task: E2E_SETUP_TASK });
+      return c.json({ runId: run.id }, 201);
+    });
+
+  // ---- chained family: workspace secrets (workspace-level) ------------------
+  // The user's own secrets, shared by every project — an LLM key for cezar's own features, a
+  // token every project's checks need. Single-mount like every workspace family.
+  const workspaceSecretsRoutes = new Hono()
+    .get('/workspace/secrets', async (c) => c.json(await secretsList({ kind: 'workspace' }), 200))
+    .put('/workspace/secrets/:name', paramZodValidator(secretParamsSchema), jsonZodValidator(secretValueInputSchema), async (c) => {
+      const failed = await putSecret({ kind: 'workspace' }, c.req.valid('param').name, c.req.valid('json'));
+      if (failed) return c.json({ error: failed.error }, failed.status);
+      return c.body(null, 204);
+    })
+    .delete('/workspace/secrets/:name', paramZodValidator(secretParamsSchema), async (c) => {
+      const failed = await deleteSecret({ kind: 'workspace' }, c.req.valid('param').name);
+      if (failed) return c.json({ error: failed.error }, failed.status);
+      return c.body(null, 204);
+    });
+
+  const trackerRoutes = new Hono<ProjectApiEnv>()
+    .get('/tracker/automation-options', queryZodValidator(trackerAutomationOptionsQuerySchema), async c => {
+      const project = c.get('project');
+      const driver = await trackers.driver(project.root, project.dataDir);
+      if ('available' in driver) return c.json(trackerAutomationOptionsSchema.parse(driver));
+      if (!driver.automationOptions) return c.json(trackerAutomationOptionsSchema.parse({ available: false, code: 'unavailable', reason: 'Automation events are not available for this tracker' }));
+      try {
+        const options = await driver.automationOptions(c.req.valid('query'));
+        return c.json(trackerAutomationOptionsSchema.parse({ available: true, association: driver.association, ...options }));
+      } catch {
+        return c.json(trackerAutomationOptionsSchema.parse({ available: false, code: 'unavailable', reason: 'Could not load tracker automation options. Try again.' }));
+      }
+    })
+    .post('/tracker/watch', jsonZodValidator(trackerWatchInputSchema), async c => {
+      try { return c.json(await trackerWatches.open(c.get('project'), c.req.valid('json')), 200); }
+      catch { return c.json({ error: 'Could not observe this tracker. Reload the view or close unused tracker views.' }, 409); }
+    })
+    .get('/tracker/watch/:watchId', paramZodValidator(trackerWatchParamsSchema), queryZodValidator(trackerWatchQuerySchema), async c => {
+      const { after } = c.req.valid('query');
+      const project = c.get('project');
+      const { watchId } = c.req.valid('param');
+      const result = after === undefined
+        ? await trackerWatches.read(project, watchId)
+        : await trackerWatches.wait(project, watchId, after, c.req.raw.signal);
+      if (!result) return c.json({ error: 'Tracker observation expired. Reopen the view.' }, 404);
+      c.header('Cache-Control', 'no-store');
+      return c.json(result, 200);
+    })
+    .post('/tracker/watch/:watchId', paramZodValidator(trackerWatchParamsSchema), async c => {
+      const result = await trackerWatches.refresh(c.get('project'), c.req.valid('param').watchId);
+      if (!result) return c.json({ error: 'Tracker observation expired. Reopen the view.' }, 404);
+      return c.json(result, 200);
+    })
+    .get('/tracker/connection', async c => c.json(await trackers.connection(c.get('project').root)))
+    .put('/tracker/connection', jsonZodValidator(trackerCredentialsSchema, { message: 'Invalid tracker credentials. Check the required fields.' }), async c => {
+      const project = c.get('project');
+      return mutateTracker(project.dataDir, async () => {
+        const result = await trackers.saveConnection(project.root, c.req.valid('json'));
+        if (!result) return c.json({ error: 'Could not save project credentials. Check local storage permissions. Demo mode cannot save credentials.' }, 409);
+        await trackerChanged(project);
+        return c.json(result, 200);
+      });
+    })
+    .delete('/tracker/connection', async c => {
+      const project = c.get('project');
+      return mutateTracker(project.dataDir, async () => {
+        if (!await trackers.removeConnection(project.root)) return c.json({ error: 'Could not remove project credentials.' }, 409);
+        await trackerChanged(project);
+        return c.json({ cleared: true as const }, 200);
+      });
+    })
+    .get('/tracker/candidates', queryZodValidator(trackerCandidatesQuerySchema), async c => {
+      const result = await trackers.candidates(c.get('project').root, c.req.valid('query'));
+      if (!result.available && result.code === 'invalid_cursor') return c.json({ error: result.reason }, 400);
+      return c.json(result, 200);
+    })
+    .get('/tracker/association', async (c) =>
+      c.json({ association: await readTrackerAssociation(c.get('project').dataDir) }))
+    .put('/tracker/association', jsonZodValidator(trackerAssociationInputSchema), async (c) => {
+      const project = c.get('project');
+      return mutateTracker(project.dataDir, async () => {
+        const result = await trackers.resolve(project.root, c.req.valid('json'));
+        if (!result.available) {
+          if (result.code === 'not_found') return c.json({ error: result.reason }, 404);
+          return c.json({ error: result.reason }, 409);
+        }
+        if (!await writeTrackerAssociation(project.dataDir, result.association)) {
+          return c.json({ error: 'Could not save the tracker connection. Previous connection was preserved.' }, 409);
+        }
+        await trackerChanged(project);
+        return c.json({ association: result.association }, 200);
+      });
+    })
+    .delete('/tracker/association', async (c) => {
+      const project = c.get('project');
+      return mutateTracker(project.dataDir, async () => {
+        if (!await clearTrackerAssociation(project.dataDir)) {
+          return c.json({ error: 'Could not disconnect the tracker. Try again.' }, 409);
+        }
+        await trackerChanged(project);
+        return c.json({ cleared: true as const }, 200);
+      });
+    })
+    .get('/tracker', queryZodValidator(trackerListQuerySchema), async (c) => {
+      const driver = await trackers.driver(c.get('project').root, c.get('project').dataDir);
+      if ('available' in driver) return c.json(driver, 200);
+      const { expectedScope } = c.req.valid('query');
+      if (expectedScope !== undefined && expectedScope !== trackerReadScope(driver.association)) {
+        return c.json({ available: false as const, code: 'source_changed' as const, reason: 'This tracker connection or scope changed. Reload the tracker view.' }, 200);
+      }
+      const result = await driver.listIssues(c.req.valid('query'));
+      if (!result.available && result.code === 'invalid_cursor') return c.json({ error: result.reason }, 400);
+      return c.json(result, 200);
+    })
+    .get('/tracker/search', queryZodValidator(trackerSearchQuerySchema), async (c) => {
+      const driver = await trackers.driver(c.get('project').root, c.get('project').dataDir);
+      if ('available' in driver) return c.json(driver, 200);
+      const { expectedScope } = c.req.valid('query');
+      if (expectedScope !== undefined && expectedScope !== trackerReadScope(driver.association)) {
+        return c.json({ available: false as const, code: 'source_changed' as const, reason: 'This tracker connection or scope changed. Reload the tracker view.' }, 200);
+      }
+      const result = await driver.searchItems(c.req.valid('query'));
+      if (!result.available && result.code === 'invalid_cursor') return c.json({ error: result.reason }, 400);
+      return c.json(result, 200);
+    })
+    .get('/tracker/:id', paramZodValidator(trackerItemParamsSchema), queryZodValidator(trackerItemQuerySchema), async (c) => {
+      const driver = await trackers.driver(c.get('project').root, c.get('project').dataDir);
+      if ('available' in driver) return c.json(driver, 200);
+      const { expectedScope } = c.req.valid('query');
+      if (expectedScope !== undefined && expectedScope !== trackerReadScope(driver.association)) {
+        return c.json({ available: false as const, code: 'source_changed' as const, reason: 'This tracker connection or scope changed. Reload the tracker view.' }, 200);
+      }
+      const result = await driver.getItem(c.req.valid('param').id);
+      if (!result.available && result.code === 'not_found') return c.json({ error: result.reason }, 404);
+      return c.json(result, 200);
+    });
+
   const githubRoutes = new Hono<ProjectApiEnv>()
     .get(
       '/github',
       // `limit` stays a bare string: the handler's `Number.parseInt`/`Number.isFinite` fallback to
       // 30 already accepts `?limit=banana`, and a numeric schema would 400 it instead.
-      queryZodValidator(z.object({ limit: queryValue, refresh: queryValue })),
+      queryZodValidator(githubListQuerySchema),
       async (c) => {
         const { root: repoRoot } = c.get('project');
         const query = c.req.valid('query');
         const limit = Number.parseInt(query.limit ?? '', 10);
-        return c.json(await fetchGithub(repoRoot, query.refresh === '1', Number.isFinite(limit) ? limit : 30));
+        return c.json(await fetchGithub(repoRoot, query.refresh === '1', Number.isFinite(limit) ? limit : 50, {
+          issuesCursor: query.issuesCursor,
+          prsCursor: query.prsCursor,
+        }));
       },
     )
 
@@ -5508,6 +6270,97 @@ export function createApp(deps: ServerDeps) {
       return c.json(result.changes);
     })
 
+    // The repository's whole path index in ONE bounded response (spec
+    // `.ai/specs/2026-10-05-repo-file-browser.md`, #1279) — the Git tab's Files sub-tab builds its
+    // tree from this and filters it client-side, which is why there is no search endpoint.
+    // `git ls-files` is the source, so `.gitignore`d build output and `node_modules` never appear,
+    // and the set it returns is the membership guard the content route below enforces.
+    .get('/repo/tree', async (c) => {
+      const { root: repoRoot } = c.get('project');
+      const info = await getRepoInfo(repoRoot);
+      // Same status AND the same words as /repo/changes: the Files tab reads this 409 as "the
+      // whole Git view has nothing to show", exactly as the Changes tab does.
+      if (!info) return c.json({ error: 'not a git repository' }, 409);
+      const result = await listRepoPaths(info.root);
+      if (!result.ok) return c.json({ error: result.error }, 409);
+      return c.json({ paths: result.paths, truncated: result.truncated });
+    })
+
+    // One repository file, for the Files sub-tab's viewer — the `/runs/:id/files` handler's shape
+    // with the run lookup replaced by `getRepoInfo`, plus ONE extra guard that the run route does
+    // not need and this one cannot do without.
+    //
+    // This serves the user's REAL checkout, not an isolated worktree. `readWorktreePath` stops
+    // traversal, `.git` and symlinks — it knows nothing about `.gitignore`, so on its own
+    // `?path=.env` would be served verbatim, and AGENTS.md § Zero config's promise that a
+    // repository `.env` is never read would be one fetch away from any cockpit client. The index
+    // membership check below is that control: only a path `git ls-files` returned is readable, so
+    // the reachable set is exactly what is committed or deliberately left untracked-and-unignored.
+    // A TRACKED `.env` stays readable, by design — it is in the index and in the remote already.
+    //
+    // The index is re-derived per request rather than cached: a cache would serve a file the user
+    // has since ignored, and `ls-files` is one bounded subprocess.
+    .get('/repo/files', queryZodValidator(repoFileQuerySchema), async (c) => {
+      const { root: repoRoot } = c.get('project');
+      const query = c.req.valid('query');
+      c.header('vary', 'Accept');
+      const wantsRaw =
+        query.raw !== undefined
+          ? query.raw === '1'
+          : negotiate(c.req.header('accept'), FILE_FORMATS) === 'image/*';
+      const info = await getRepoInfo(repoRoot);
+      if (!info) return c.json({ error: 'not a git repository' }, 409);
+      const index = await repoIndexContains(info.root, query.path);
+      if (!index.ok) return c.json({ error: index.error }, 409);
+      if (!index.indexed) {
+        // Deliberately ONE message for "ignored", "untracked and ignored" and "does not exist" —
+        // a distinct wording for the ignored case would disclose that an ignored file is present
+        // on disk, which is the very thing this guard exists to keep quiet about.
+        return c.json({ error: `path is not in the repository index: ${query.path}` }, 409);
+      }
+      const result = await readWorktreePath(info.root, query.path);
+      if (result.kind === 'invalid' || result.kind === 'missing') {
+        return c.json({ error: result.error }, 409);
+      }
+      if (result.kind === 'dir') {
+        // Reachable despite every indexed path being a file: a submodule is one `ls-files` entry
+        // that resolves to a directory. Refused in the resolver's own grammar rather than
+        // inventing a submodule view.
+        return c.json({ error: `not a regular file: ${result.path}` }, 409);
+      }
+      if (wantsRaw) {
+        const mime = imageMimeType(result.path);
+        if (mime === null || result.tooLarge) {
+          // `?raw=1` asked for bytes, so it hears why it cannot have them; a mere `Accept`
+          // preference falls through to the JSON answer. Same split as `/runs/:id/files`.
+          if (query.raw !== undefined) {
+            const error =
+              mime === null
+                ? `raw serving is limited to images: ${result.path}`
+                : `file too large to serve raw (${result.size} bytes): ${result.path}`;
+            return c.json({ error }, 409);
+          }
+        } else {
+          const bytes = await readFile(join(info.root, result.path));
+          return c.body(new Uint8Array(bytes).buffer as ArrayBuffer, 200, {
+            'content-type': mime,
+            'x-content-type-options': 'nosniff',
+            'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+          });
+        }
+      }
+      return c.json({
+        // `as const` or Hono's inference widens the literal to `string` and the consumer's
+        // discriminated narrowing collapses to `never` — the same trap `/runs/:id/files` documents.
+        type: 'file' as const,
+        path: result.path,
+        size: result.size,
+        binary: result.binary,
+        tooLarge: result.tooLarge,
+        ...(result.content !== undefined ? { content: result.content } : {}),
+      });
+    })
+
     .post('/repo/branch', jsonZodValidator(() => repoBranchSchema), async (c) => {
       const { root: repoRoot } = c.get('project');
       const info = await getRepoInfo(repoRoot);
@@ -5517,6 +6370,20 @@ export function createApp(deps: ServerDeps) {
       if (!result.ok) return c.json({ error: result.error }, 409);
       return c.json({ branch: result.branch, created: result.created });
     });
+
+  // An explicit "auto" default becomes `''` on the wire (#906): the empty id IS
+  // auto in every model picker, so an older cockpit reading this answer shows
+  // auto too rather than tripping over an unknown sentinel. Only `true` counts —
+  // `false` is the absence of an opinion, not an opinion.
+  // Typed rather than left to `Object.fromEntries`' index signature: `configAnswer`'s return type
+  // is asserted `Exact` against `configResponseSchema` (contract-parity.workspace.test.ts), and an
+  // index signature leaking into the spread would widen `defaultModels` past the contract.
+  const autoModelOverrides = (auto: CezConfig['defaultModelsAuto']): AgentModelDefaults =>
+    Object.fromEntries(
+      Object.entries(auto ?? {})
+        .filter(([, isAuto]) => isAuto === true)
+        .map(([runner]) => [runner, '']),
+    );
 
   // The Settings → Agents knobs in one read (R6 Step 1.5) — an ADDITIVE
   // sibling of PUT /api/config below; /api/health keeps its protected shape.
@@ -5529,9 +6396,17 @@ export function createApp(deps: ServerDeps) {
       systemPrompt: config.systemPrompt ?? null,
       // Native defaults seed each runner independently. A Cezar preset remains
       // selectable unless the operator opts into the fixed-model policy.
+      // An explicit auto override (#906) answers `''` for that runner — the one
+      // way to say "ignore the agent's own configured default" without editing
+      // the vendor's settings file. It layers over the native seed and under a
+      // repo preset, so setting a preset later simply wins.
       defaultModels: modelsLocked
         ? nativeModels
-        : { ...nativeModels, ...(config.defaultModels ?? {}) },
+        : {
+            ...nativeModels,
+            ...autoModelOverrides(config.defaultModelsAuto),
+            ...(config.defaultModels ?? {}),
+          },
       modelsLocked,
       maxParallel: config.maxParallel,
       memoryLimitMb: config.memoryLimitMb ?? null,
@@ -5556,7 +6431,12 @@ export function createApp(deps: ServerDeps) {
     .put('/config', jsonZodValidator(() => setConfigSchema), async (c) => {
       const { root: repoRoot, dataDir } = c.get('project');
       const parsed = { data: c.req.valid('json') };
-      if (agentModelsLocked(repoRoot) && parsed.data.defaultModels !== undefined) {
+      // The auto override is a model choice too (#906), so the fixed-model
+      // policy refuses it on exactly the same terms as a preset.
+      if (
+        agentModelsLocked(repoRoot) &&
+        (parsed.data.defaultModels !== undefined || parsed.data.defaultModelsAuto !== undefined)
+      ) {
         return c.json({ error: AGENT_MODELS_LOCKED_ERROR }, 409);
       }
       const configPath = join(dataDir, 'config.json');
@@ -5617,6 +6497,22 @@ export function createApp(deps: ServerDeps) {
         if (Object.keys(current).length === 0) delete raw.defaultModels;
         else raw.defaultModels = current;
       }
+      if (parsed.data.defaultModelsAuto !== undefined) {
+        // Same per-runner merge as the presets above, and the same "store only a
+        // real opinion" rule: `false`/`null` deletes rather than persisting a
+        // key that means nothing (#906).
+        const current =
+          raw.defaultModelsAuto && typeof raw.defaultModelsAuto === 'object'
+            ? { ...(raw.defaultModelsAuto as Record<string, unknown>) }
+            : {};
+        for (const [runner, isAuto] of Object.entries(parsed.data.defaultModelsAuto)) {
+          if (isAuto === undefined) continue;
+          if (isAuto) current[runner] = true;
+          else delete current[runner];
+        }
+        if (Object.keys(current).length === 0) delete raw.defaultModelsAuto;
+        else raw.defaultModelsAuto = current;
+      }
       try {
         await mkdir(dataDir, { recursive: true });
         await writeFile(configPath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8');
@@ -5633,6 +6529,7 @@ export function createApp(deps: ServerDeps) {
   // the file. All fields optional + additive: `null` (and `''` for the
   // R6 keys) clears a knob back to its default.
   const modelPresetSchema = z.string().trim().max(200).nullable().optional();
+  const autoModelSchema = z.boolean().nullable().optional();
   const setConfigSchema = z.object({
     baseBranch: z.string().trim().min(1).max(200).nullable().optional(),
     defaultRunner: z.enum(RUNNER_IDS).optional(),
@@ -5642,7 +6539,20 @@ export function createApp(deps: ServerDeps) {
         claude: modelPresetSchema,
         codex: modelPresetSchema,
         opencode: modelPresetSchema,
+        cursor: modelPresetSchema,
         pi: modelPresetSchema,
+      })
+      .optional(),
+    // Per-runner "auto is the default" override (#906). Additive, and necessarily
+    // its own key: clearing a preset cannot express an explicit auto, because the
+    // answer then falls through to the coding agent's own settings file.
+    // `false`/`null` clears the override back to no opinion.
+    defaultModelsAuto: z
+      .object({
+        claude: autoModelSchema,
+        codex: autoModelSchema,
+        opencode: autoModelSchema,
+        pi: autoModelSchema,
       })
       .optional(),
     // Concurrency + memory guard (Settings → Resources). maxParallel clamps to
@@ -5753,6 +6663,9 @@ export function createApp(deps: ServerDeps) {
     .route('/', todosRoutes)
     .route('/', sseRoutes)
     .route('/', githubRoutes)
+    .route('/', trackerRoutes)
+    .route('/', secretsRoutes)
+    .route('/', e2eRoutes)
     .route('/', repoRoutes)
     .route('/', configRoutes)
     .route('/', agentConfigRoutes);
@@ -5787,11 +6700,14 @@ export function createApp(deps: ServerDeps) {
     for (const number of [run.prNumber, run.issueNumber, run.markerRefs?.pr, run.markerRefs?.issue]) {
       if (typeof number === 'number' && Number.isInteger(number) && number > 0) numbers.push(number);
     }
+    for (const ref of run.prRefs ?? []) numbers.push(ref.number);
     return numbers;
   };
 
   const runIndexEntry = (projectId: string, run: RunRecord): RunIndexEntry => {
     const usage = currentUsage(run.id);
+    const automationId =
+      run.automation?.automationId ?? run.automationTrigger?.automationId ?? run.automationTracker?.automationId;
     return {
     projectId,
     id: run.id,
@@ -5805,6 +6721,7 @@ export function createApp(deps: ServerDeps) {
     ...(run.seenAt !== undefined ? { seenAt: run.seenAt } : {}),
     archived: run.archived,
     ...(run.autoResumeAt !== undefined ? { autoResumeAt: run.autoResumeAt } : {}),
+    ...(run.awaitingAnswerSince !== undefined ? { awaitingAnswerSince: run.awaitingAnswerSince } : {}),
     workflow: run.workflow,
     ...(run.branch !== undefined ? { branch: run.branch } : {}),
     ...(run.dispatch !== undefined
@@ -5816,6 +6733,7 @@ export function createApp(deps: ServerDeps) {
           },
         }
       : {}),
+    ...(automationId !== undefined ? { automationId } : {}),
     ...(run.startedAt !== undefined ? { startedAt: run.startedAt } : {}),
     // The tracker-reference inputs, verbatim — the cockpit's `taskReference()` owns the rule
     // that picks between them (see the schema's note).
@@ -5824,6 +6742,7 @@ export function createApp(deps: ServerDeps) {
       ? { referencedPullRequestUrl: run.referencedPullRequestUrl }
       : {}),
     ...(run.prNumber !== undefined ? { prNumber: run.prNumber } : {}),
+    ...(run.prRefs !== undefined ? { prRefs: run.prRefs } : {}),
     ...(run.issueNumber !== undefined ? { issueNumber: run.issueNumber } : {}),
     ...(run.referencedIssueUrl !== undefined ? { referencedIssueUrl: run.referencedIssueUrl } : {}),
     ...(run.markerRefs !== undefined ? { markerRefs: run.markerRefs } : {}),
@@ -5908,6 +6827,119 @@ export function createApp(deps: ServerDeps) {
       return c.json(body);
     });
 
+  const dashboard = new DashboardReader({
+    projects: async () => {
+      const selector = capabilities().singleProject ? { projectId: await resolveBootProject() } : undefined;
+      const projects = await listProjects(selector);
+      const bootId = await resolveBootProject(projects);
+      const summaries = projects.map((project) => {
+        const owned = project.status === 'missing' ? undefined
+          : project.id === bootId ? bootContext : contexts.peek(project.id);
+        return { id: project.id, root: project.root, ...(owned ? { store: owned.store } : {}) };
+      });
+      // Dashboard observability includes the folder this server actually serves even
+      // when the sidebar omits this unregistered launch folder (including task worktrees).
+      // Its existing context is authoritative; a dashboard read never registers it.
+      if (!summaries.some(project => project.id === bootId)) {
+        summaries.unshift({ id: bootId, root: bootRoot, store: bootContext.store });
+      }
+      return summaries;
+    },
+    telemetryProjects: async () => {
+      // Registry-only: no per-project probing, disk summaries, recovery, or new sampler.
+      const registry = (await loadWorkspaceConfig()).projects;
+      const bootId = await resolveBootProject(registry);
+      const boot = { id: bootId, root: bootRoot, store: bootContext.store };
+      if (capabilities().singleProject) return [boot];
+      return [boot, ...registry.filter(p => p.id !== bootId).flatMap(p => {
+        const owned = contexts.peek(p.id);
+        return owned ? [{ id: p.id, root: p.root, store: owned.store }] : [];
+      })];
+    },
+  });
+
+  const offDashboardRegistry = workspaceEvents.on((event, data) => {
+    if (event === 'project-removed') {
+      const id = (data as { id?: unknown }).id;
+      if (typeof id === 'string') dashboard.invalidateProject(id);
+    }
+  });
+  deps.onDispose?.(() => { offDashboardRegistry(); dashboard.dispose(); });
+
+  // The server's half of a cockpit error: is the bundle that page runs still the one being
+  // served? A page kept open across a rebuild or self-update asks for chunks that no longer
+  // exist — the stale-shell failure a WebKit "Importing a module script failed" usually is.
+  const servedBuildContext = (entry: unknown): Record<string, string | boolean> => {
+    const ctx: Record<string, string | boolean> = { 'server.version': version };
+    if (typeof entry !== 'string' || !isSafeAssetFilename(entry)) return ctx;
+    try {
+      ctx['build.entry_served'] = readFileSync(join(distDir, 'index.html'), 'utf8').includes(`/assets/${entry}`);
+      ctx['build.entry_exists'] = existsSync(join(distDir, 'assets', entry));
+    } catch {
+      ctx['build.entry_served'] = false; // no web/dist at all
+    }
+    return ctx;
+  };
+
+  // Cockpit telemetry (opt-in, docs/telemetry.md). The telemetry worker sends no CORS headers, so
+  // the browser reports through here; the relays answer 204 whether or not the user opted in, and
+  // only a closed set of page names is forwarded.
+  const telemetryConsentBody = (consent: TelemetryConsentPayload['consent']): TelemetryConsentPayload => ({
+    consent,
+    policyVersion: TELEMETRY_POLICY_VERSION,
+    blockedBy: telemetryBlockedBy(),
+    endpoint: (process.env.CEZ_TELEMETRY_URL || DEFAULT_TELEMETRY_URL).replace(/\/+$/, ''),
+  });
+  const telemetryRoutes = new Hono()
+    .get('/telemetry/consent', async (c) => c.json(telemetryConsentBody(await loadTelemetryConsent())))
+    .put(
+      '/telemetry/consent',
+      jsonZodValidator(setTelemetryConsentInputSchema, { message: 'consent must be granted or denied' }),
+      async (c) => {
+        const consent = await setTelemetryConsent(c.req.valid('json').consent);
+        return c.json(telemetryConsentBody(consent));
+      },
+    )
+    .post(
+      '/telemetry/page',
+      jsonZodValidator(telemetryPageInputSchema, { message: 'invalid route' }),
+      (c) => {
+        track('page_viewed', { label: c.req.valid('json').route }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
+        return c.body(null, 204);
+      },
+    )
+    .post(
+      '/telemetry/event',
+      jsonZodValidator(telemetryEventInputSchema, { message: 'invalid event' }),
+      (c) => {
+        const { event, label } = c.req.valid('json');
+        track(event, { label }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
+        return c.body(null, 204);
+      },
+    )
+    .use('/telemetry/error', bodyLimit({ maxSize: 32 * 1024 }))
+    .post(
+      '/telemetry/error',
+      jsonZodValidator(telemetryErrorInputSchema, { message: 'invalid error report' }),
+      (c) => {
+        const body = c.req.valid('json');
+        const err = new Error(body.message);
+        err.name = body.type;
+        err.stack = body.stack;
+        reportError(
+          err,
+          {
+            ...body.context,
+            source: 'cockpit',
+            handler: body.handler,
+            ...servedBuildContext(body.context?.['build.entry']),
+          },
+          { code: body.code, fingerprint: body.fingerprint, sid: deviceSid(c.req.header('x-cezar-sid')) },
+        );
+        return c.body(null, 204);
+      },
+    );
+
   // Workspace-level families answer for the whole workspace, so they are single-mount: never a
   // project-scoped spelling, which would be a second surface to protect with no consumer.
   const workspaceV1 = new Hono()
@@ -5917,11 +6949,16 @@ export function createApp(deps: ServerDeps) {
     .route('/', projectsRoutes)
     .route('/', agentProfilesRoutes)
     .route('/', skillsUpdateRoutes)
+    .route('/', selfUpdateRoutes)
+    .route('/', starCountRoutes)
     .route('/', workspaceConfigRoutes)
+    .route('/', workspaceSecretsRoutes)
     .route('/', fsBrowseRoutes)
     .route('/', automationChecksRoutes)
     .route('/', runsIndexRoutes)
-    .route('/', workspaceEventsRoutes);
+    .route('/', dashboardRoutes(dashboard, () => ({ tokens: capabilities().tokenUsageMetrics, cost: capabilities().costMetrics }), () => capabilities().automations))
+    .route('/', workspaceEventsRoutes)
+    .route('/', telemetryRoutes);
 
   // ---- mount ---------------------------------------------------------------
   // Scoped first, then the unscoped alias bound to the boot project. The paths are disjoint (no
@@ -5934,6 +6971,7 @@ export function createApp(deps: ServerDeps) {
   // in registration order. `/health` in particular answers for the workspace, has no project to
   // resolve, and is the CORS-open discovery route — it must not sit behind the resolver.
   const routed = app
+
     .route(V1_SCOPED_PREFIX, v1)
     .route(V1_PREFIX, v1)
     .route(V1_PREFIX, workspaceV1);
@@ -5978,8 +7016,10 @@ export function startServer(deps: ServerDeps, port: number): ServerType {
   // reason `capabilities()` is inside `createApp`: tests flip the variable between apps.
   const automationsEnabled = () => resolveCapabilities(process.env, deps.bindHost).automations;
   let rescheduleAutomations = () => {};
+  const appCleanups: Array<() => void> = [];
   const app = createApp({
     ...deps,
+    onDispose: (cleanup) => { appCleanups.push(cleanup); deps.onDispose?.(cleanup); },
     contexts: sharedContexts,
     automationStore: bootAutomationStore,
     workspaceEvents,
@@ -6002,6 +7042,10 @@ export function startServer(deps: ServerDeps, port: number): ServerType {
   // Every registered project gets a handle (spec 2026-09-14): `github` only when the remote is
   // on github.com — a project without one still fires its scheduled automations.
   const automationProjects = new Map<string, { root: string; github?: { owner: string; repo: string } }>();
+  // A second instance from the one the HTTP routes use (out of scope here, built inside the app
+  // function) — cheap: `createTrackerService` performs no I/O at construction, only a small
+  // per-connection provider cache that duplicating costs nothing correctness-wise.
+  const automationTrackers = createTrackerService();
   const registerAutomationProject = async (id: string, root: string): Promise<void> => {
     const parsed = parseRemote((await getRepoInfo(root))?.remote ?? '');
     automationProjects.set(id, { root, ...(parsed?.host === 'github.com' ? { github: { owner: parsed.owner, repo: parsed.repo } } : {}) });
@@ -6023,6 +7067,13 @@ export function startServer(deps: ServerDeps, port: number): ServerType {
         store,
         timeZone: localTimeZone(),
         ...(project.github ? { github: { ...project.github, poller: new GithubPoller() } } : {}),
+        // Present unconditionally (unlike `github`, precomputed above from a sync remote parse):
+        // whether the project actually has a tracker connection is resolved lazily, at poll time,
+        // by `getDriver()` — a project with none simply fails that call and the scheduler backs off.
+        tracker: {
+          poller: new TrackerPoller(),
+          getDriver: () => automationTrackers.driver(project.root, join(project.root, '.ai/cezar')),
+        },
         onChange: (automationId, revision) =>
           workspaceEvents.emit('automation-change', { project: projectId, automationId, revision }),
         launch: async (definition, candidate, receiptId) => {
@@ -6032,6 +7083,10 @@ export function startServer(deps: ServerDeps, port: number): ServerType {
         launchSchedule: async (definition, occurrence, receiptId) => {
           const context = await contextOf();
           return launchScheduledRun({ root: context.root, manager: context.manager, store: context.store, definition, occurrence, receiptId, projectName: basename(context.root), timeZone: localTimeZone(), dispatchEnabled });
+        },
+        launchTracker: async (definition, candidate, receiptId) => {
+          const context = await contextOf();
+          return launchTrackerAutomationRun({ root: context.root, manager: context.manager, store: context.store, definition, candidate, receiptId, dispatchEnabled });
         },
       };
     },
@@ -6080,7 +7135,7 @@ export function startServer(deps: ServerDeps, port: number): ServerType {
       })).then(() => automationScheduler.start()).catch(() => undefined);
     }).catch(() => undefined);
   });
-  server.once('close', () => { unsubscribe(); coordinator.stop(); automationScheduler.stop(); });
+  server.once('close', () => { for (const cleanup of appCleanups) cleanup(); unsubscribe(); coordinator.stop(); automationScheduler.stop(); });
   socketHub.attach(server, (req) => verifyWsUpgrade(req, deps.bindHost));
   return server;
 }
@@ -6211,11 +7266,20 @@ export function isSafeSessionId(sessionId: string): boolean {
   return SAFE_SESSION_ID.test(sessionId);
 }
 
+/** Only plain executable paths can cross both bash and cmd.exe safely. Refuse shell
+ * operators, expansions, controls and a trailing backslash (which can escape the closing
+ * quote). Paths with spaces remain supported, including Windows install directories. */
+export function quoteResumeBin(bin: string): string | null {
+  if (!bin.trim() || !/^[a-zA-Z0-9_./:\\ -]+$/.test(bin) || bin.endsWith('\\')) return null;
+  return /[\s\\]/.test(bin) ? `"${bin}"` : bin;
+}
+
 /**
  * The CLI command that reopens a run's session for interactive take-over, per
  * backend. Legacy/undefined records default to Claude. Returns null when the id
- * is not a shape we recognise — callers degrade (no take-over) rather than
- * splice it into a shell.
+ * is not a shape we recognise, or when a runner's overridable binary cannot be
+ * embedded safely (see {@link quoteResumeBin}) — callers degrade (no take-over)
+ * rather than splice either one into a shell.
  *
  * Validate, don't quote (#431): the session id is the only variable spliced
  * into the command string, and `openInTerminal` runs that string through bash
@@ -6230,12 +7294,25 @@ export function isSafeSessionId(sessionId: string): boolean {
 export function resumeCommand(runner: string | undefined, sessionId: string): string | null {
   if (!isSafeSessionId(sessionId)) return null;
   switch (runner) {
+    case 'junie':
+      // Verified live (`junie --help`, 26.9.22): `--resume` alone reopens the LAST session;
+      // the target session is named by the separate `--session-id=<id>` flag, not a positional
+      // argument (junie's positional slot is `[<task>]`) — `junie --resume ${sessionId}` would
+      // silently resume the wrong session and read the id as a task prompt instead.
+      return `junie --resume --session-id=${sessionId}`;
     case 'codex':
       return `codex resume ${sessionId}`;
     case 'opencode':
       return `opencode --session ${sessionId}`;
+    case 'cursor': {
+      const bin = quoteResumeBin(process.env.CEZ_CURSOR_AGENT_BIN ?? 'agent');
+      return bin === null ? null : `${bin} --resume ${sessionId}`;
+    }
     case 'pi':
       return `pi --session ${sessionId}`;
+    case 'copilot':
+      // `--resume <id>` takes a session id, a task id or an id prefix (`copilot --help`, 1.0.88).
+      return `copilot --resume ${sessionId}`;
     default:
       return `claude --resume ${sessionId}`;
   }

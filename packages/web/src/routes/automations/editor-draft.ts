@@ -40,9 +40,13 @@ export interface DraftFilters {
   maxRecords: number
 }
 
+/** Shared editor kinds; each serializes only its own trigger. */
+export type EditableAutomationKind = AutomationKind
+
 export interface EditorDraft {
   name: string
-  kind: AutomationKind
+  kind: EditableAutomationKind
+  trackerTrigger?: AutomationDefinition['trackerTrigger']
   schedule: AutomationSchedule
   events: AutomationEvent[]
   intervalSeconds: number
@@ -65,6 +69,11 @@ export interface EditorDraft {
   maxSubtasks: number
   reviewChild: boolean
   enabled: boolean
+  /** `task.checkout`/`task.allowForkHeads` (spec 2026-10-06-agentic-e2e-checks Phase 3). The editor
+   *  has no control for them yet; they are carried so saving a PR-head verifier from the cockpit
+   *  never silently turns it back into a base-branch one. */
+  checkout?: 'base' | 'pr-head'
+  allowForkHeads?: boolean
 }
 
 /** The seven events the poller reconstructs (Q6: nothing else is offered). */
@@ -159,6 +168,7 @@ export function fromDefinition(definition: AutomationDefinition): EditorDraft {
     ...base,
     name: definition.name,
     kind: definition.kind,
+    trackerTrigger: definition.trackerTrigger,
     schedule: definition.schedule ? { ...definition.schedule } : base.schedule,
     events: definition.events?.length ? [...definition.events] : base.events,
     intervalSeconds: definition.intervalSeconds ?? base.intervalSeconds,
@@ -187,6 +197,8 @@ export function fromDefinition(definition: AutomationDefinition): EditorDraft {
     maxSubtasks: task.dispatch?.maxSubtasks ?? base.maxSubtasks,
     reviewChild: task.dispatch?.reviewChild ?? base.reviewChild,
     enabled: definition.enabled,
+    ...(task.checkout !== undefined ? { checkout: task.checkout } : {}),
+    ...(task.allowForkHeads !== undefined ? { allowForkHeads: task.allowForkHeads } : {}),
   }
 }
 
@@ -214,7 +226,13 @@ export function templatePick(template: AutomationTemplate): TemplatePick {
 }
 
 const isRunner = (value: string): value is Runner =>
-  value === 'claude' || value === 'codex' || value === 'opencode' || value === 'pi'
+  value === 'claude' ||
+  value === 'codex' ||
+  value === 'junie' ||
+  value === 'opencode' ||
+  value === 'cursor' ||
+  value === 'pi' ||
+  value === 'copilot'
 
 /** "Use this": the template fills name, kind, trigger, prompt and task; everything else stays. */
 export function applyTemplate(draft: EditorDraft, template: TemplatePick): EditorDraft {
@@ -268,6 +286,10 @@ export function toBody(draft: EditorDraft): AutomationBody {
   if (draft.kind === 'schedule') {
     return { name: draft.name.trim(), kind: 'schedule', schedule: scheduleBody(draft.schedule), task }
   }
+  if (draft.kind === 'tracker') {
+    return { name: draft.name.trim(), kind: 'tracker', trackerTrigger: draft.trackerTrigger,
+      intervalSeconds: draft.intervalSeconds, filters: { lookbackDays: clamp(draft.filters.lookbackDays, 1, 90), maxRecords: clamp(draft.filters.maxRecords, 1, 100) }, task }
+  }
   const f = draft.filters
   const list = (text: string, key: keyof AutomationBodyFilters) => {
     const values = splitList(text)
@@ -289,7 +311,11 @@ export function toBody(draft: EditorDraft): AutomationBody {
       lookbackDays: clamp(f.lookbackDays, 1, 90),
       maxRecords: clamp(f.maxRecords, 1, 100),
     },
-    task,
+    task: {
+      ...task,
+      ...(draft.checkout !== undefined ? { checkout: draft.checkout } : {}),
+      ...(draft.allowForkHeads !== undefined ? { allowForkHeads: draft.allowForkHeads } : {}),
+    },
   }
 }
 
@@ -306,6 +332,7 @@ export function cliDefinitionOf(draft: EditorDraft): CliDefinition {
   return {
     name: body.name,
     kind: draft.kind,
+    ...(body.trackerTrigger ? { trackerTrigger: body.trackerTrigger } : {}),
     ...(body.schedule ? { schedule: body.schedule } : {}),
     ...(body.events ? { events: body.events } : {}),
     ...(body.intervalSeconds !== undefined ? { intervalSeconds: body.intervalSeconds } : {}),

@@ -593,6 +593,21 @@ describe('reduceThread — provider authorization recovery', () => {
     }])
   })
 
+  it('persists a junie authorization incident (the runner deliberately left unknown-but-usable)', () => {
+    expect(reduceThread([
+      line(1, 'provider-auth-required', {
+        provider: 'junie',
+        authFailureId: 'incident-1',
+        stepId: 'work',
+      }),
+    ]).turns[0]?.items).toEqual([{
+      kind: 'provider-auth-required',
+      id: 'v1:1',
+      provider: 'junie',
+      authFailureId: 'incident-1',
+    }])
+  })
+
   it.each([
     ['an unknown provider', { provider: 'future', authFailureId: 'incident-1' }],
     ['a blank incident id', { provider: 'claude', authFailureId: '' }],
@@ -637,6 +652,16 @@ describe('threadFooter', () => {
       expect(threadFooter(status, error)).toEqual(expected)
     })
   }
+
+  it('a failed run awaiting an answer says so instead of announcing a failure', () => {
+    expect(threadFooter('failed', 'the session closed before the question was answered', true)).toEqual({
+      state: 'closed',
+      tone: 'dim',
+      label: 'Session closed — waiting for your answer, which reopens it',
+    })
+    // The flag means nothing on any other status.
+    expect(threadFooter('done', undefined, true)).toEqual({ state: 'closed', tone: 'dim', label: 'Session closed' })
+  })
 })
 
 describe('threadFilePaths — the @ mention source (today: what the tools touched)', () => {
@@ -985,5 +1010,20 @@ describe('reduceThread — turn timestamps (#941)', () => {
     ])
     expect(turns[0]!.userMessage?.ts).toBeUndefined()
     expect(turns[0]!.startedAt).toBe('2026-07-14T12:00:00.400Z')
+  })
+})
+
+describe('reduceThread — lastEventAt (the Working… indicator\'s last activity)', () => {
+  it('is the newest stamped event of any kind, and skips unstamped ones', () => {
+    const state = reduceThread([
+      { ...line(1, 'turn.started', { turnId: 't1' }), ts: '2026-07-14T12:00:00.000Z' },
+      { ...line(2, 'item.delta', { itemId: 'i1', delta: { text: 'hi' } }), ts: '2026-07-14T12:00:09.000Z' },
+      { ...line(3, 'item.delta', { itemId: 'i1', delta: { text: '!' } }), ts: 'garbage' },
+    ] as RunEvent[])
+    expect(state.lastEventAt).toBe('2026-07-14T12:00:09.000Z')
+  })
+
+  it('is absent for an empty stream', () => {
+    expect(reduceThread([]).lastEventAt).toBeUndefined()
   })
 })
