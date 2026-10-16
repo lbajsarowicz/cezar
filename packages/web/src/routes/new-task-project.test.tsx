@@ -136,6 +136,7 @@ const REPO: RepoResponse = {
   status: [],
   log: [],
   branches: ['main'],
+  checkedOutElsewhere: {},
   baseBranch: null,
 }
 const OTHER_REPO: RepoResponse = {
@@ -143,6 +144,7 @@ const OTHER_REPO: RepoResponse = {
   status: [],
   log: [],
   branches: ['develop'],
+  checkedOutElsewhere: {},
   baseBranch: null,
 }
 
@@ -192,6 +194,7 @@ function serve({
           baseBranch: null,
           defaultRunner: 'claude',
           systemPrompt: null,
+          branchNaming: null,
           // The Model pill's label is config-driven, so it proves the CONFIG re-resolved too.
           defaultModels: pick({ claude: 'sonnet' }, { claude: 'opus' }),
         })
