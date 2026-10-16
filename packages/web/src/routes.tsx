@@ -603,6 +603,11 @@ export const AppRoutes = memo(function AppRoutes() {
             global ones are the top-level `/settings/global/*` block below. */}
         <Route path="settings" element={<SettingsIndexRoute scope="project" capabilities={capabilities} />} />
         <Route path="settings/skills" element={<SettingsSkillsRedirect />} />
+        {/* Prompt templates folded into Settings → Instructions; old links land on the list. */}
+        <Route
+          path="settings/prompt-templates"
+          element={<ScopedNavigate to={{ pathname: '/settings/instructions', hash: '#prompt-templates' }} replace />}
+        />
         {visibleSettingsSections('project', capabilities).map((section) => (
           <Route
             key={section.id}
