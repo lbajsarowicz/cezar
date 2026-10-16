@@ -730,7 +730,7 @@ describe('the tasks section', () => {
     await waitFor(() => expect(tasks()).not.toBeNull())
 
     const toggle = screen.getByLabelText('Live title updates')
-    expect(toggle.getAttribute('aria-checked') ?? toggle.getAttribute('data-state')).toBeTruthy()
+    expect(toggle.getAttribute('aria-checked') ?? toggle.getAttribute('data-state')).toMatch(/false|unchecked/)
     fireEvent.click(toggle)
     await waitFor(() => expect(puts()).toHaveLength(1))
     expect(puts()[0]?.body).toEqual({ liveTitleUpdates: true })

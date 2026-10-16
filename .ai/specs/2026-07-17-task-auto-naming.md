@@ -94,12 +94,14 @@ progresses** — but through the namer, never through raw turn text.
   replace an earlier one — a run that started as `469: /om-auto-review-pr` becomes
   `469: fixing sse watchdog races` once the work has a shape.
 - **The switch (settings-based, env default, default OFF):** new `config.json` key
-  **`liveTitleUpdates: boolean`**, surfaced in Settings → Agents next to `plannerModel`/
+  **`liveTitleUpdates: boolean`**, surfaced in Settings → Tasks next to `plannerModel`/
   `namerModel`. When the key is absent, the default comes from the env:
   **`CEZ_TITLE_UPDATES`** (`'1'` → on, anything else/unset → **OFF**). Config wins over env;
   env wins over the built-in OFF. The refresh spawns one agent process per turn end that the
   run's own cost never shows, so it follows the "cost widens ⇒ opt-in" house rule
   (BACKWARD_COMPATIBILITY.md, "Live title refresh default flip").
+  An empty-task run (attachments only) skips the creation-time call, so it gets one turn-end
+  naming call regardless of the toggle; after that the toggle governs as for any run.
 - **Cost bounding:** one cheap-model call per turn end, skipped when the toggle is off, when
   a user rename exists, when the run is `CEZ_DRY_RUN`-mocked (canned answer), or when the
   namer inputs haven't changed since the last call (no new turn text and unchanged diffStat).
@@ -141,7 +143,7 @@ only if cezar adopts ACP `session_info_update` natively.
 2. `task-refs.ts` + `RunRecord.prNumber/issueNumber` + number-prefixed heuristic title.
 3. `auto-name.ts` + mock branch + `startRun` wiring + `namerModel` config key.
 4. Live title updates: `recordTurnEnd` wiring + `liveTitleUpdates` config key +
-   `CEZ_TITLE_UPDATES` env default (OFF) + the Settings → Agents toggle.
+   `CEZ_TITLE_UPDATES` env default (OFF) + the Settings → Tasks toggle.
 5. Remove raw turn-text derivation (`title-summary.ts` retired).
 6. Optional: "regenerate title" row action reusing the same call (Zed/opencode pattern).
 

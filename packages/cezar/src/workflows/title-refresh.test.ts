@@ -13,7 +13,7 @@ import type { WorkflowDef } from './types.ts';
 const run = promisify(execFile);
 const GIT_ID = ['-c', 'user.name=test', '-c', 'user.email=test@local'];
 
-const counters = vi.hoisted(() => ({ createRunner: 0, discoverSkills: 0, prompts: [] as string[] }));
+const counters = vi.hoisted(() => ({ createRunner: 0, discoverSkills: 0, prompts: [] as string[], junk: false }));
 
 vi.mock('../core/runner-factory.ts', () => ({
   createRunner: () => {
@@ -22,7 +22,7 @@ vi.mock('../core/runner-factory.ts', () => ({
       backend: 'claude' as const,
       run: async (spec: AgentRunSpec) => {
         counters.prompts.push(spec.userPrompt);
-        return { text: '{"title":"refreshing the title"}', toolCalls: [], tokensUsed: 0 };
+        return { text: counters.junk ? 'not json' : '{"title":"refreshing the title"}', toolCalls: [], tokensUsed: 0 };
       },
       startSession: () => {
         throw new Error('no agent session in this suite');
@@ -70,6 +70,7 @@ describe('live title refresh: namer calls per turn', () => {
     counters.createRunner = 0;
     counters.discoverSkills = 0;
     counters.prompts.length = 0;
+    counters.junk = false;
     repoRoot = mkdtempSync(join(tmpdir(), 'cez-title-refresh-'));
     await run('git', ['init', '-q', '-b', 'main'], { cwd: repoRoot });
     writeFileSync(join(repoRoot, 'a.txt'), 'one\n');
@@ -117,6 +118,68 @@ describe('live title refresh: namer calls per turn', () => {
     const runId = namerOwnedRun();
     await turns(runId);
     await expect.poll(() => counters.createRunner, { timeout: 10_000 }).toBe(TURNS);
+  });
+
+  it('an empty-task run is named once at its first turn end with the toggle off', async () => {
+    const record = store.createRun({
+      title: 'Task from 1 attachment',
+      workflow: SKILL_DEF.name,
+      task: '',
+      steps: [{ id: 'work', name: 'Work', kind: 'agent' as const }],
+    });
+    store.updateRun(record.id, { status: 'running', workflowDef: SKILL_DEF });
+    const seam = manager as unknown as Seam;
+    await seam.recordTurnEnd(record.id, 'looked at the screenshot');
+    await expect.poll(() => counters.createRunner, { timeout: 10_000 }).toBe(1);
+    await expect.poll(() => store.getRun(record.id)?.titleOrigin, { timeout: 10_000 }).toBe('auto');
+    await seam.recordTurnEnd(record.id, 'fixed the layout');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(counters.createRunner).toBe(1);
+  });
+
+  function runWithTask(task: string): string {
+    const record = store.createRun({
+      title: 't',
+      workflow: SKILL_DEF.name,
+      task,
+      steps: [{ id: 'work', name: 'Work', kind: 'agent' as const }],
+    });
+    store.updateRun(record.id, { status: 'running', workflowDef: SKILL_DEF });
+    return record.id;
+  }
+
+  function namerSpy() {
+    return vi.spyOn(manager as unknown as { autoNameRun: (...args: unknown[]) => Promise<unknown> }, 'autoNameRun');
+  }
+
+  it('an empty-task run whose one naming call fails is not named again with the toggle off', async () => {
+    counters.junk = true;
+    const namer = namerSpy();
+    const runId = runWithTask('');
+    const seam = manager as unknown as Seam;
+    await seam.recordTurnEnd(runId, 'looked at the screenshot');
+    expect(namer).toHaveBeenCalledTimes(1);
+    // Junk twice is the namer's give-up path: both attempts answered, no title applied.
+    await expect.poll(() => counters.prompts.length, { timeout: 10_000 }).toBe(2);
+    await namer.mock.results[0]?.value;
+    expect(store.getRun(runId)?.titleOrigin).toBeUndefined();
+    await seam.recordTurnEnd(runId, 'fixed the layout');
+    expect(namer).toHaveBeenCalledTimes(1);
+  });
+
+  it('a run with task text and no namer title gets no turn-end call with the toggle off', async () => {
+    const namer = namerSpy();
+    const runId = runWithTask('fix the header');
+    await (manager as unknown as Seam).recordTurnEnd(runId, 'looked at the header');
+    expect(namer).not.toHaveBeenCalled();
+  });
+
+  it('CEZ_AUTONAME=0 keeps an empty-task run unnamed', async () => {
+    process.env.CEZ_AUTONAME = '0';
+    const namer = namerSpy();
+    const runId = runWithTask('');
+    await (manager as unknown as Seam).recordTurnEnd(runId, 'looked at the screenshot');
+    expect(namer).not.toHaveBeenCalled();
   });
 
   it('a live refresh reads the skill description from the run snapshot, never a fresh scan', async () => {

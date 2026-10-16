@@ -1278,6 +1278,7 @@ export class RunManager {
     this.pendingContinuations.clear();
     this.memoryPausing.clear();
     this.lastNamerKey.clear();
+    this.catchUpNamed.clear();
   }
 
   /**
@@ -1518,8 +1519,8 @@ export class RunManager {
     // the model answers. Never awaited here, never fails the run. The same call
     // also answers the task branch when instructions are set; `execute` waits
     // for that part, bounded, before it forks.
-    // An attachment-only task gives the namer nothing to read; the turn-end refresh names it instead
-    // (under `branchNaming` its branch keeps the default `cez/<id8>`).
+    // An empty-task run gives the namer nothing to read; its first turn end names it once,
+    // whatever the live-refresh toggle says (under `branchNaming` its branch keeps the default `cez/<id8>`).
     this.pendingBranchNames.set(
       run.id,
       input.task.trim() ? this.autoNameRun(run.id, skillHint, input.task) : Promise.resolve(undefined),
@@ -2080,6 +2081,7 @@ export class RunManager {
     this.store.clearRunSecrets(runId);
     this.memoryPausing.delete(runId);
     this.lastNamerKey.delete(runId);
+    this.catchUpNamed.delete(runId);
     this.pendingBranchNames.delete(runId);
     this.forceStarted.delete(runId);
     // The run's slot is gone from busySlots() as of the deletes above — hand it
@@ -2997,6 +2999,8 @@ export class RunManager {
 
   /** Last live-refresh namer inputs per run — unchanged inputs skip the call. */
   private lastNamerKey = new Map<string, string>();
+  /** Empty-task runs already given their one toggle-independent turn-end naming call. */
+  private catchUpNamed = new Set<string>();
 
   /**
    * Acquire the one-at-a-time lease for runs executing in `repoRoot`.
@@ -6643,7 +6647,7 @@ export class RunManager {
           else this.store.appendEvent(runId, { type: 'note', message: 'diff stat unavailable — git diff --shortstat failed in the worktree' });
         }
       }
-      await this.maybeRefreshTitle(runId, turnText);
+      await this.maybeRefreshTitle(runId, turnText, owner);
     } catch {
       // Bookkeeping only — nothing here may disturb the run.
     }
@@ -6681,14 +6685,19 @@ export class RunManager {
    * `CEZ_TITLE_UPDATES` env, default OFF), user-owned title, marker-owned title
    * (the agent declares via `CEZ:TITLE` — the token-saving fast path), dry-run
    * mocks (canned answers add nothing), empty turn text, unchanged namer inputs.
+   * An empty-task run skipped the creation-time namer, so its first turn end
+   * names it once even with the toggle off; the toggle governs after that.
    */
-  private async maybeRefreshTitle(runId: string, turnText: string): Promise<void> {
+  private async maybeRefreshTitle(runId: string, turnText: string, owner?: ActiveRun): Promise<void> {
     if (!autoNamingActive()) return;
     if (!turnText.trim()) return;
-    const config = await loadConfig(this.repoRoot);
-    if (!liveTitleUpdatesEnabled(config)) return;
     const run = this.store.getRun(runId);
     if (!run || run.titleOrigin === 'user' || run.titleOrigin === 'marker') return;
+    const catchUp = !run.task.trim() && run.titleOrigin === undefined && !this.catchUpNamed.has(runId);
+    if (!catchUp && !liveTitleUpdatesEnabled(await loadConfig(this.repoRoot))) return;
+    // The awaits above can outlast the session: once it is dropped, these maps are no longer cleared for it.
+    if (owner && this.active.get(runId) !== owner) return;
+    if (catchUp) this.catchUpNamed.add(runId);
     const statText = run.diffStat ? `${run.diffStat.files} files, +${run.diffStat.adds} -${run.diffStat.dels}` : undefined;
     const key = `${turnText.slice(0, 200)}|${statText ?? ''}`;
     if (this.lastNamerKey.get(runId) === key) return;
