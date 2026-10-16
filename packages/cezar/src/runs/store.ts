@@ -104,6 +104,9 @@ const stepStateSchema = z.object({
    *  from a step that died before its session event resolves to nothing on the provider.
    *  Absent on runs.json written before this field (treated as confirmed, their prior behaviour). */
   sessionConfirmed: z.boolean().optional(),
+  /** The cumulative token total the backend last reported for `sessionId`. Codex reports a thread's
+   *  running total, so a reopened thread that restores it is told apart from new usage by this. */
+  sessionTokensTotal: z.number().optional(),
   /** Backend that owns `sessionId`. Optional so pre-affinity runs.json files still parse;
    *  `storedRunnerSchema` so a legacy `claude-cli` folds to `claude` instead of failing (#547). */
   backend: storedRunnerSchema.optional(),

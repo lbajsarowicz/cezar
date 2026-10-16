@@ -14,7 +14,7 @@ import {
   type AskRequest,
 } from '../core/ask.ts';
 import { AUTO_END_DELAY_MS, type AgentSession } from '../core/claude-cli-runner.ts';
-import { interruptAfterGrace, missingSessionNote, ResumeFallback, resumeFallbackPredicate, trackFallbackOutcome } from './resume-fallback.ts';
+import { interruptAfterGrace, missingSessionNote, ResumeFallback, resumeFallbackPredicate, trackFallbackOutcome, vetoesRetryFallback } from './resume-fallback.ts';
 import { isOpencodeSessionId } from '../core/opencode-server-runner.ts';
 import {
   loadPrivateMcp,
@@ -1070,9 +1070,6 @@ interface PersistedAttachments {
   attachments: PersistedAttachment[];
 }
 
-/** A user-authored live message is made durable before it may wait for the
- *  repository lease. Reusing this preparation when the lease arrives prevents
- *  duplicate transcript events and duplicate attachment files. */
 /**
  * Whether a step's recorded session can be reopened. A placeholder cezar pre-assigned but the
  * provider never confirmed (the step died before its `session` event) resolves to nothing on the
@@ -1084,6 +1081,50 @@ function isResumableSession(step: { sessionId?: string; sessionConfirmed?: boole
   return backend !== 'opencode' || (step.sessionId !== undefined && isOpencodeSessionId(step.sessionId));
 }
 
+/**
+ * Codex reports a thread's cumulative token total, and a reopened thread may restore the total it
+ * had reached — usage an earlier step already counted. A total that arrives before the resumed
+ * session does any work and equals the thread's recorded total is that restored baseline; anything
+ * else is new usage. Shared by both resume sites (`runContinuation`, `runAgentStep`).
+ */
+class ResumedUsage {
+  private baseline = 0;
+  private open: boolean;
+
+  constructor(private readonly recordedTotal: number | undefined) {
+    this.open = recordedTotal !== undefined;
+  }
+
+  /** The tokens this session used for a reported cumulative `total`, or undefined when `total` is
+   *  the restored baseline. */
+  used(total: number): number | undefined {
+    if (this.open) {
+      this.open = false;
+      if (total === this.recordedTotal) {
+        this.baseline = total;
+        return undefined;
+      }
+    }
+    return total - this.baseline;
+  }
+
+  /** The resumed session started working: any total from now on is its own. */
+  activity(event: AgentEvent): void {
+    if (event.type === 'text' || event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'turn-end') {
+      this.open = false;
+    }
+  }
+
+  /** A fresh session replaced the resumed one and counts from zero. */
+  reset(): void {
+    this.baseline = 0;
+    this.open = false;
+  }
+}
+
+/** A user-authored live message is made durable before it may wait for the
+ *  repository lease. Reusing this preparation when the lease arrives prevents
+ *  duplicate transcript events and duplicate attachment files. */
 interface PreparedUserMessage {
   text: string;
   persisted: PersistedAttachment[];
@@ -4000,8 +4041,20 @@ export class RunManager {
       (event) => this.handleRunnerUiEvent(runId, state, sink, event),
       resumeFallbackPredicate(backend, 'continue'),
     );
+    const resumedUsage = new ResumedUsage(
+      backend === 'codex' && sessionId !== undefined
+        ? [...(recordBeforeTurn?.steps ?? [])].reverse().find((s) => s.sessionId === sessionId)?.sessionTokensTotal
+        : undefined,
+    );
+    let usedTokens = 0;
     const onEvent = (event: AgentEvent) => {
       if (state.cancelled || this.active.get(runId) !== state) return;
+      resumedUsage.activity(event);
+      if (event.type === 'token-usage') {
+        const used = resumedUsage.used(event.tokensUsed);
+        if (used === undefined) return;
+        usedTokens = used;
+      }
       if (resumeGuard.hold(event)) {
         if (sessionError === undefined && event.type === 'error') {
           sessionError = event.message;
@@ -4035,7 +4088,7 @@ export class RunManager {
         this.store.updateStep(runId, stepId, { sessionId: event.sessionId, backend, sessionConfirmed: true });
       }
       if (event.type === 'token-usage') {
-        this.store.updateStep(runId, stepId, { tokensUsed: event.tokensUsed });
+        this.store.updateStep(runId, stepId, { tokensUsed: usedTokens, sessionTokensTotal: event.tokensUsed });
       }
       if (event.type === 'cost') {
         stepCost += event.usd;
@@ -4352,12 +4405,13 @@ export class RunManager {
         await session.result;
         if (sessionError) throw new Error(sessionError);
       } catch (err) {
-        // Claude pruned the transcript this task resumes (cleanupPeriodDays): continue in a fresh
+        // The session this task resumes is gone (`resumeFallbackPredicate`): continue in a fresh
         // session seeded with the task's persisted state instead of failing every Continue.
         const replay = state.cancelled || this.active.get(runId) !== state ? undefined : resumeGuard.takeFallback();
         if (!replay || !recordBeforeTurn || sessionId === undefined) throw err;
         sessionError = undefined;
         turnText = '';
+        resumedUsage.reset();
         const freshId = randomUUID();
         this.store.updateStep(runId, stepId, { sessionId: freshId, sessionConfirmed: backend === 'claude' });
         this.store.appendEvent(runId, { type: 'note', stepId, message: missingSessionNote(backend) });
@@ -6000,16 +6054,21 @@ export class RunManager {
       failureNote ?? '',
     ].join('\n\n---\n\n');
     let sessionId = resumeFrom?.sessionId ?? graphHooks?.resumeSessionId ?? randomUUID();
-    const stored = this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
+    // The step that recorded the session being reopened: this step's own for a retry, and for a
+    // graph `session.continue` whichever node's session it is.
+    const recordedSteps = this.store.getRun(runId)?.steps ?? [];
+    const source = resumeFrom
+      ? recordedSteps.find((s) => s.id === step.id)
+      : graphHooks?.resumeSessionId !== undefined
+        ? [...recordedSteps].reverse().find((s) => s.sessionId === graphHooks.resumeSessionId)
+        : undefined;
     // claude pins the id at spawn, so a fresh one is provider-owned immediately; the id-minting
-    // backends only confirm theirs when the `session` event arrives. Reopening the step's own
-    // recorded session keeps what is already known about it.
+    // backends only confirm theirs when the `session` event arrives. A reopened session keeps
+    // what is already known about it.
     this.store.updateStep(runId, step.id, {
       sessionId,
       backend,
-      sessionConfirmed: resumeFrom || (graphHooks?.resumeSessionId !== undefined && stored?.sessionId === graphHooks.resumeSessionId)
-        ? stored?.sessionConfirmed
-        : backend === 'claude',
+      sessionConfirmed: source ? source.sessionConfirmed : backend === 'claude',
     });
 
     const stepRecord = this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
@@ -6023,22 +6082,18 @@ export class RunManager {
       (event) => emit({ ...event, stepId: step.id }),
       (event) => this.handleRunnerUiEvent(runId, state, sink, event),
       retry ? resumeFallbackPredicate(backend, 'retry') : undefined,
+      retry ? vetoesRetryFallback : undefined,
     );
     let resumeGuard = guardResume(resumeFrom !== undefined || graphHooks?.resumeSessionId !== undefined, resumeFrom !== undefined);
-    // Codex reports a thread's cumulative total, and a reopened thread may restore the total its
-    // earlier turns (already counted in `startTokens`) reached. A total that arrives before the
-    // resumed session does any work is that restored baseline, not this attempt's usage.
-    let usageBaseline = 0;
-    let baselineOpen = backend === 'codex' && (resumeFrom !== undefined || graphHooks?.resumeSessionId !== undefined);
+    const resumedUsage = new ResumedUsage(backend === 'codex' ? source?.sessionTokensTotal : undefined);
+    let usedTokens = 0;
     const onEvent = (event: AgentEvent) => {
       if (state.cancelled || this.active.get(runId) !== state) return;
-      if (event.type === 'text' || event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'turn-end') {
-        baselineOpen = false;
-      }
-      if (event.type === 'token-usage' && baselineOpen) {
-        baselineOpen = false;
-        usageBaseline = event.tokensUsed;
-        return;
+      resumedUsage.activity(event);
+      if (event.type === 'token-usage') {
+        const used = resumedUsage.used(event.tokensUsed);
+        if (used === undefined) return;
+        usedTokens = used;
       }
       if (resumeGuard.hold(event)) {
         if (sessionError === undefined && event.type === 'error') {
@@ -6076,7 +6131,7 @@ export class RunManager {
         this.store.updateStep(runId, step.id, { sessionId: event.sessionId, backend, sessionConfirmed: true });
       }
       if (event.type === 'token-usage') {
-        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + event.tokensUsed - usageBaseline });
+        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + usedTokens, sessionTokensTotal: event.tokensUsed });
       }
       if (event.type === 'cost') {
         stepCost += event.usd;
@@ -6341,7 +6396,7 @@ export class RunManager {
       sessionId = randomUUID();
       this.store.updateStep(runId, step.id, { sessionId, backend, sessionConfirmed: backend === 'claude' });
       resumeGuard = guardResume(false, false);
-      baselineOpen = false;
+      resumedUsage.reset();
     }
     if (resumeFrom) {
       emit({ type: 'note', stepId: step.id, message: `retrying in this step's previous session — sending only the failure` });
@@ -6440,8 +6495,7 @@ export class RunManager {
         if (!replay || !resuming || !record) throw err;
         sessionError = undefined;
         turnText = '';
-        usageBaseline = 0;
-        baselineOpen = false;
+        resumedUsage.reset();
         const freshId = randomUUID();
         this.store.updateStep(runId, step.id, { sessionId: freshId, backend, sessionConfirmed: backend === 'claude' });
         emit({ type: 'note', stepId: step.id, message: missingSessionNote(backend) });
@@ -6462,7 +6516,7 @@ export class RunManager {
       // events to the RunManager — only it knows how the session settled).
       sink.sessionEnded(state.cancelled ? 'cancelled' : 'end_turn');
       if (!state.cancelled && this.active.get(runId) === state) {
-        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + result.tokensUsed - usageBaseline });
+        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + (resumedUsage.used(result.tokensUsed) ?? 0) });
       }
       return null;
     } catch (err) {

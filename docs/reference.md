@@ -260,8 +260,8 @@ sent only the failing output, so it keeps what it already read; when a graph nod
 prompt renders differently on the retry, the new prompt is sent too. Under another
 backend or account the step starts a fresh session with the task and the failing
 output appended. On Claude, Codex and OpenCode the same fresh session takes over when
-the reopened session fails before doing anything, unless the failure is a usage limit
-or another refusal by the provider, which a fresh session would hit as well.
+the reopened session fails before doing anything, unless the failure is a usage limit,
+another refusal by the provider or a timeout, which a fresh session would hit as well.
 The failing output the retried step is sent has host secrets, the run's registered
 secrets and known token shapes redacted.
 

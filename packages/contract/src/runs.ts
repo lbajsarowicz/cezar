@@ -98,6 +98,9 @@ export const stepStateSchema = z.object({
    *  behaviour). claude pins its id at spawn; the id-minting backends announce theirs with a
    *  `session` event, so a placeholder is unconfirmed until then and is never resumed. */
   sessionConfirmed: z.boolean().optional(),
+  /** The cumulative token total the backend last reported for `sessionId`. Codex reports a thread's
+   *  running total, so a reopened thread that restores it is told apart from new usage by this. */
+  sessionTokensTotal: z.number().optional(),
   /** Backend that owns `sessionId`; absent on records written before backend affinity. */
   backend: runnerSchema.optional(),
   /** Agent account (spec 2026-07-29-agent-profiles) that owns `sessionId` — `default`, or a

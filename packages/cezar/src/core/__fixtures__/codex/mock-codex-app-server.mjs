@@ -125,6 +125,9 @@ rl.on('line', (line) => {
     } else if (process.env.MOCK_CODEX_REJECT_RESUME === '1') {
       emit({ id: msg.id, error: { code: -32603, message: `no rollout found for thread id ${msg.params?.threadId ?? ''}` } });
       rl.close();
+    } else if (process.env.MOCK_CODEX_REJECT_RESUME === 'limit') {
+      emit({ id: msg.id, error: { code: -32603, message: 'HTTP 429 Too Many Requests: usage_limit_reached' } });
+      rl.close();
     } else {
       emit({ id: msg.id, result: { thread: { id: msg.params?.threadId } } });
       threadBase = restoredTotal;

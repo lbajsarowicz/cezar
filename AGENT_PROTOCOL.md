@@ -131,7 +131,8 @@ Notable fields (full doc-comments in the source):
   resumed retry only the failure. When a resume fails before the session shows
   any sign of life, the engine's one fallback (`workflows/resume-fallback.ts`)
   starts a fresh session instead. A retry (claude, codex, opencode) falls back
-  on any such error that is not a usage limit or another provider refusal.
+  on any such error unless one of them is a usage limit, another provider
+  refusal or a timeout.
   Continue falls back only on a recognised missing session: a pruned Claude
   transcript, or an opencode session that is gone (a 404, or an id that is not
   opencode's own `ses_…` shape); a gone codex thread still fails a Continue.

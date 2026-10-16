@@ -5,11 +5,11 @@ import { dirname, basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AgentRunner } from '../core/agent-runner.ts';
+import type { AgentEvent, AgentRunner } from '../core/agent-runner.ts';
 import { CursorAgentRunner } from '../core/cursor-agent-runner.ts';
 import { RunStore } from '../runs/store.ts';
 import { graphToSteps, type WorkflowGraph } from './graph.ts';
-import { isProviderRefusalError, missingSessionNote } from './resume-fallback.ts';
+import { isProviderRefusalError, missingSessionNote, ResumeFallback, resumeFallbackPredicate, vetoesRetryFallback } from './resume-fallback.ts';
 import { RunManager } from './run.ts';
 import type { WorkflowDef } from './types.ts';
 
@@ -162,6 +162,45 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     const id = await runToEnd();
     expect(turns()).toHaveLength(2);
     expect(store.getRun(id)?.steps.find((s) => s.id === 'implement')?.tokensUsed).toBe(3000);
+  }, 30_000);
+
+  it('counts a pre-turn total that does not match the recorded one as new usage', async () => {
+    // 700 is not the 1,500 the thread had reached, so it is real usage, never subtracted.
+    setEnv('MOCK_CODEX_RESTORED_TOTAL', '700');
+    setEnv('CEZ_ENV_PASSTHROUGH', 'MOCK_CODEX_TURNS_FILE,MOCK_CODEX_RESTORED_TOTAL');
+    const id = await runToEnd();
+    expect(store.getRun(id)?.steps.find((s) => s.id === 'implement')?.tokensUsed).toBe(1500 + 2200);
+  }, 30_000);
+
+  it('does not recount a codex thread a Continue reopens', async () => {
+    const record = manager.startRun({ name: 'one', source: 'file', steps: [{ id: 'work', prompt: '{{task}}' }, { id: 'verify', command: 'true' }] }, { task: TASK, runner: 'codex', worktree: false });
+    const terminal = new Set(['done', 'review', 'failed', 'cancelled']);
+    let deadline = Date.now() + 25_000;
+    while (!terminal.has(store.getRun(record.id)?.status ?? '')) {
+      if (Date.now() > deadline) throw new Error(`run did not finish: ${store.getRun(record.id)?.status}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(store.getRun(record.id)?.steps.find((s) => s.id === 'work')?.sessionTokensTotal).toBe(1500);
+
+    setEnv('MOCK_CODEX_RESTORED_TOTAL', '1500');
+    setEnv('CEZ_ENV_PASSTHROUGH', 'MOCK_CODEX_TURNS_FILE,MOCK_CODEX_RESTORED_TOTAL');
+    expect(manager.continueRun(record.id, { text: 'keep going', runner: 'codex' })).toEqual({ ok: true });
+    deadline = Date.now() + 25_000;
+    while (!['waiting', 'done', 'failed'].includes(store.getRun(record.id)?.steps.find((s) => s.id === 'continue-1')?.status ?? '')) {
+      if (Date.now() > deadline) throw new Error('continue did not settle');
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const step = store.getRun(record.id)?.steps.find((s) => s.id === 'continue-1');
+    expect(step?.sessionId).toBe('th_mock_1');
+    expect(step?.tokensUsed).toBe(1500);
+  }, 60_000);
+
+  it('does not fall back when codex refuses the resumed retry', async () => {
+    setEnv('MOCK_CODEX_REJECT_RESUME', 'limit');
+    const id = await runToEnd();
+    expect(store.getRun(id)?.status).toBe('failed');
+    expect(turns()).toHaveLength(1);
+    expect(store.readEvents(id).some((e) => e.type === 'note' && e.message === missingSessionNote('codex'))).toBe(false);
   }, 30_000);
 
   it('continues an opencode task in a fresh session with its saved context when the session is gone', async () => {
@@ -451,10 +490,27 @@ describe('isProviderRefusalError', () => {
     ['Claude AI usage limit reached|1767225600'],
     ["You've hit your usage limit. Upgrade to Pro to continue."],
     ['insufficient_quota: You exceeded your current quota'],
+    ['You exceeded your current quota, please check your plan'],
     ['Credit balance is too low'],
     ['quota exceeded for this billing period'],
+    ['usage_limit_reached'],
+    ['usageLimitExceeded'],
     ['429 Too Many Requests'],
+    ['Too Many Requests'],
+    ['HTTP 429'],
+    ['request failed with status 429'],
+    ['529 Overloaded'],
+    ['you are being rate limited'],
     ['Service overloaded, please retry'],
+    ['402 Payment Required'],
+    ['Payment Required'],
+    ['billing hard limit has been reached'],
+    ['HTTP 403'],
+    ['403 Forbidden'],
+    ['Forbidden'],
+    ['permission_error: this key cannot use the model'],
+    ['Not logged in · Please run /login'],
+    ['Invalid API key · Please run /login'],
   ])('treats a provider refusal as one: %s', (message) => {
     expect(isProviderRefusalError(message)).toBe(true);
   });
@@ -465,7 +521,37 @@ describe('isProviderRefusalError', () => {
     'opencode no longer has session ses_x (GET /session/ses_x → 404)',
     'resume failed: ERR_RESUME_PROTOCOL_v7',
     'API Error: 500 Internal Server Error',
+    'ran 529 tests, 429 passed',
   ])('does not mistake a session failure for a refusal: %s', (message) => {
     expect(isProviderRefusalError(message)).toBe(false);
+  });
+});
+
+describe('a retry fallback is vetoed by a refusal or a timeout', () => {
+  const error = (message: string): AgentEvent => ({ type: 'error', message });
+  const retryGuard = () => new ResumeFallback(true, () => undefined, () => undefined, resumeFallbackPredicate('codex', 'retry'), vetoesRetryFallback);
+
+  it('falls back on an unrecognised error alone', () => {
+    const guard = retryGuard();
+    guard.hold(error('resume failed: ERR_RESUME_PROTOCOL_v7'));
+    expect(guard.takeFallback()).toEqual([]);
+  });
+
+  it('a refusal held first is not undone by a later generic error', () => {
+    const guard = retryGuard();
+    guard.hold(error('HTTP 429 Too Many Requests'));
+    guard.hold(error('codex app-server exited with code 1'));
+    expect(guard.takeFallback()).toBeUndefined();
+  });
+
+  it.each([
+    'claude CLI timed out after 30m and was killed',
+    'codex app-server timed out after 30m and was killed',
+    'opencode timed out after 30m and was killed',
+  ])('a timeout is not a reason to start over: %s', (message) => {
+    const guard = retryGuard();
+    guard.hold(error(message));
+    guard.hold(error('session closed'));
+    expect(guard.takeFallback()).toBeUndefined();
   });
 });

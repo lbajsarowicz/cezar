@@ -57,12 +57,12 @@ export const TURN_IDLE_GRACE_MS = 5_000;
 
 const OPENCODE_MISSING_SESSION = 'opencode no longer has session';
 
-/** A resume of a session opencode does not have (gone, or never one of its own ids). */
 /** Opencode mints `ses_…` ids; anything else is cezar's pre-assigned placeholder, never a session. */
 export function isOpencodeSessionId(id: string): boolean {
   return id.startsWith('ses_');
 }
 
+/** A resume of a session opencode does not have (gone, or never one of its own ids). */
 export function isOpencodeMissingSessionError(message: string): boolean {
   return message.includes(OPENCODE_MISSING_SESSION);
 }
