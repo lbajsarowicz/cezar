@@ -248,6 +248,7 @@ async function serveCommand(
     { RunManager },
     { resolveTrackerAgentEnv },
     { ProviderAuthService },
+    { reportInconclusiveProbe },
     { WorkspaceEventBus, startServer },
     { ProviderRuntimeAuthObserver, recoverWithProviderRuntimeAuthObservation },
     { resolveCapabilities },
@@ -261,6 +262,7 @@ async function serveCommand(
     import('./workflows/run.ts'),
     import('./server/tracker/agent-credentials.ts'),
     import('./core/provider-auth.ts'),
+    import('./server/provider-telemetry.ts'),
     import('./server/server.ts'),
     import('./server/provider-auth-runtime.ts'),
     import('./server/capabilities.ts'),
@@ -281,7 +283,7 @@ async function serveCommand(
   // the previous process exited are re-queued or resumed instead of failed.
   const store = await openStore(repoRoot, { keepLive: true });
   const manager = new RunManager(store, repoRoot, { semaphore, projectId: bootProjectId, resolveTrackerEnv: resolveTrackerAgentEnv });
-  const providerAuth = new ProviderAuthService({ cwd: repoRoot });
+  const providerAuth = new ProviderAuthService({ cwd: repoRoot, onInconclusive: (probe) => void reportInconclusiveProbe(probe) });
   const workspaceEvents = new WorkspaceEventBus();
   const providerRuntimeAuth = new ProviderRuntimeAuthObserver(providerAuth, (status) => {
     workspaceEvents.emit('provider-status', status);
@@ -527,7 +529,8 @@ async function runCommand(
     { initWorkspace },
     { loadWorkflows },
     { ProviderAuthService, providerAuthChecksDisabled },
-    { providersRequiredByWorkflow, unavailableProviderMessage },
+    { providersRequiredByWorkflow, unavailableProviderMessage, withSelectedAccounts },
+    { reportInconclusiveProbe },
     { applyProviderEnablement },
     { loadConfig },
     { loadWorkspaceConfig },
@@ -539,6 +542,7 @@ async function runCommand(
     import('./workflows/load.ts'),
     import('./core/provider-auth.ts'),
     import('./server/provider-action-gate.ts'),
+    import('./server/provider-telemetry.ts'),
     import('./core/provider-availability.ts'),
     import('./config.ts'),
     import('./workspace/config.ts'),
@@ -557,7 +561,7 @@ async function runCommand(
     return;
   }
 
-  const providerAuth = new ProviderAuthService({ cwd: repoRoot });
+  const providerAuth = new ProviderAuthService({ cwd: repoRoot, onInconclusive: (probe) => void reportInconclusiveProbe(probe) });
   const requiredProviders = providersRequiredByWorkflow(
     workflow,
     (await loadConfig(repoRoot)).defaultRunner,
@@ -569,7 +573,12 @@ async function runCommand(
     ]);
     const blocked = unavailableProviderMessage(
       requiredProviders,
-      applyProviderEnablement(discovered, workspace.disabledProviders),
+      await withSelectedAccounts(
+        applyProviderEnablement(discovered, workspace.disabledProviders),
+        requiredProviders,
+        { repoRoot },
+        providerAuth,
+      ),
     );
     if (blocked) {
       console.error(blocked);
