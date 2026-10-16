@@ -128,21 +128,15 @@ Notable fields (full doc-comments in the source):
   runner that declares `strictResume` reopens that id (claude `--resume`, codex
   `thread/resume`, opencode `GET /session/:id`) and fails the session when it
   is gone — never a silent fresh one — so the workflow engine may send a
-  resumed retry only the failure and fall back to a fresh session itself. A
-  runner without it (pi, whose missing-session behavior is unverified, and
-  cursor, whose one-shot print mode does not resume at all) gets retries as
-  fresh sessions. `resumeFallbackPrompt?: () => string` builds the opening
-  message for a fresh session when `resume` cannot reopen the id; it is a
-  thunk because building it reads the run's whole event log, and opencode
-  calls it only inside the reopen-failure branch, so a normal resume pays
-  nothing. That branch is entered only for a genuinely missing session (404,
-  or an id that is not the backend's own shape) — a transport drop or a 5xx
-  propagates, since replacing a session that may still exist would discard
-  provider-owned context. The retry path leaves the prompt unset so the engine's
-  own fresh-session fallback owns that decision. A step records its id only as
-  resumable once the PROVIDER minted it: claude pins its id at spawn, while
-  codex/opencode/pi/cursor announce theirs with a `session` event, so the
-  engine's pre-assigned placeholder is never resumed.
+  resumed retry only the failure. A missing Claude conversation goes through
+  the engine's one missing-session fallback (`workflows/resume-fallback.ts`),
+  shared by Continue, graph nodes and retries; on codex and opencode a gone
+  session fails the step. A runner without `strictResume` (pi, whose
+  missing-session behavior is unverified, and cursor, whose one-shot print
+  mode does not resume at all) gets retries as fresh sessions. A step records
+  its id only as resumable once the PROVIDER minted it: claude pins its id at
+  spawn, while codex/opencode/pi/cursor announce theirs with a `session`
+  event, so the engine's pre-assigned placeholder is never resumed.
 
 **System prompt channel** — a backend without a dedicated system-prompt input
 must deliver `spec.systemPrompt` as a leading block of the opening user message.

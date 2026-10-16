@@ -9,6 +9,11 @@ import { createInterface } from 'node:readline';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// The cosmetic pauses between events exist for the demo cockpit; CEZ_MOCK_PACE scales them
+// (0 = none, the vitest default). `mock:slow`/`mock:pause` are test contracts and never scale.
+const paceEnv = Number(process.env.CEZ_MOCK_PACE);
+const PACE = process.env.CEZ_MOCK_PACE && paceEnv >= 0 ? paceEnv : 1;
+const pace = (ms) => sleep(ms * PACE);
 const write = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 
 // `--include-partial-messages` → every text/thinking block of an assistant
@@ -55,15 +60,20 @@ if (process.env.CEZ_MOCK_ARGS_FILE) {
   }
 }
 
-// A `--resume` spawn models a CLI reopening a stored conversation: init is emitted only once the
-// session is known to exist (in `respond`), so a missing conversation emits no init and looks like
-// the pre-session failure the engine's fallback keys on. A fresh spawn emits init immediately.
-const resumedSpawn = process.argv.includes('--resume');
-let initEmitted = false;
-if (!resumedSpawn) {
-  emit({ type: 'system', subtype: 'init' });
-  initEmitted = true;
+// Testability hook: CEZ_MOCK_MISSING_SESSIONS=<id,id|*> makes `--resume <id>` fail the way the
+// real CLI does once it has pruned that transcript (cleanupPeriodDays).
+const resumeAt = process.argv.indexOf('--resume');
+const resumedId = resumeAt >= 0 ? process.argv[resumeAt + 1] : undefined;
+const missingSessions = (process.env.CEZ_MOCK_MISSING_SESSIONS ?? '').split(',').filter(Boolean);
+if (resumedId && (missingSessions.includes('*') || missingSessions.includes(resumedId))) {
+  // Flushed before exiting: a pipe write is asynchronous on macOS, and exit would drop it.
+  const result = { type: 'result', subtype: 'error_during_execution', is_error: true, session_id: resumedId };
+  await new Promise((resolve) => process.stdout.write(`${JSON.stringify(result)}\n`, resolve));
+  await new Promise((resolve) => process.stderr.write(`No conversation found with session ID: ${resumedId}\n`, resolve));
+  process.exit(1);
 }
+
+emit({ type: 'system', subtype: 'init' });
 
 let turn = 0;
 
@@ -130,50 +140,25 @@ function writeHandoffAndTodo() {
 
 async function respond(userText, imageCount) {
   turn += 1;
-  await sleep(250);
-  // `mock:session-gone` on a `--resume` spawn → the envelope Claude Code emits for a conversation
-  // it no longer has: an `is_error` result carrying the reason in `errors`, then exit 1.
-  // `mock:session-gone-text` also puts the reason into `result`.
-  const resumeAt = process.argv.indexOf('--resume');
-  if (resumeAt >= 0 && userText.includes('mock:session-gone')) {
-    const reason = `No conversation found with session ID: ${process.argv[resumeAt + 1]}`;
+  await pace(250);
+  // `mock:session-gone` on a `--resume` spawn → the other envelope Claude Code emits for a
+  // conversation it no longer has: an `is_error` result carrying the reason only in `errors`,
+  // then exit 1.
+  if (resumedId && userText.includes('mock:session-gone')) {
     emit({
       type: 'result',
       subtype: 'error_during_execution',
       is_error: true,
-      ...(userText.includes('mock:session-gone-text') ? { result: reason } : {}),
-      errors: [reason],
+      errors: [`No conversation found with session ID: ${resumedId}`],
       usage: { input_tokens: 0, output_tokens: 0 },
       total_cost_usd: 0,
     });
     process.stdout.write('', () => process.exit(1));
     return new Promise(() => {});
   }
-  // `mock:resume-mystery` on a `--resume` spawn → a resume failure whose wording is not one of the
-  // known missing-session strings. The fallback is keyed on "not a provider refusal", so this must
-  // still degrade to a fresh session rather than dead-ending.
-  if (resumeAt >= 0 && userText.includes('mock:resume-mystery')) {
-    emit({
-      type: 'result',
-      subtype: 'error_during_execution',
-      is_error: true,
-      errors: ['resume failed: ERR_RESUME_PROTOCOL_v7'],
-      usage: { input_tokens: 0, output_tokens: 0 },
-      total_cost_usd: 0,
-    });
-    process.stdout.write('', () => process.exit(1));
-    return new Promise(() => {});
-  }
-  // The conversation exists, so the CLI announces the session before the turn. A `--resume` spawn
-  // that never reached this point (a missing conversation, handled above) emits no init.
-  if (!initEmitted) {
-    initEmitted = true;
-    emit({ type: 'system', subtype: 'init' });
-  }
-  // `mock:resume-mid-fail` on a `--resume` spawn → the session reopened and its turn STARTED (the
-  // init above flushes the turn.started), then the provider failed mid-turn. This must settle as a
-  // real failure, never as "could not reopen": a fresh retry would repeat it and double the spend.
-  if (resumeAt >= 0 && userText.includes('mock:resume-mid-fail')) {
+  // `mock:resume-mid-fail` on a `--resume` spawn → the session reopened, then the provider failed
+  // mid-turn. A real failure, never a missing conversation.
+  if (resumedId && userText.includes('mock:resume-mid-fail')) {
     emit({
       type: 'result',
       subtype: 'error_during_execution',
@@ -186,9 +171,8 @@ async function respond(userText, imageCount) {
     return new Promise(() => {});
   }
   // `mock:resume-limit` on a `--resume` spawn → the account, not the conversation, is the problem:
-  // the session reopened fine but the provider refuses the turn. Distinct from `mock:session-gone`
-  // so a retry can prove it does NOT pay for a whole fresh session on a usage limit.
-  if (resumeAt >= 0 && userText.includes('mock:resume-limit')) {
+  // the session reopened fine but the provider refuses the turn.
+  if (resumedId && userText.includes('mock:resume-limit')) {
     emit({
       type: 'result',
       subtype: 'error_during_execution',
@@ -388,7 +372,7 @@ async function respond(userText, imageCount) {
       type: 'assistant',
       message: { role: 'assistant', content: [{ type: 'text', text: md }], usage: { input_tokens: 100, output_tokens: 200 } },
     });
-    await sleep(100);
+    await pace(100);
     emit({ type: 'result', subtype: 'success', result: md, usage: { input_tokens: 100, output_tokens: 200 }, total_cost_usd: 0.001 });
     return;
   }
@@ -443,7 +427,7 @@ async function respond(userText, imageCount) {
         },
         parent_tool_use_id: null,
       });
-      await sleep(200);
+      await pace(200);
     }
 
     // Children, interleaved across agents so the activity lines visibly race.
@@ -468,14 +452,14 @@ async function respond(userText, imageCount) {
             },
             parent_tool_use_id: agent.id,
           });
-          await sleep(250);
+          await pace(250);
           emit({
             type: 'user',
             message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: step.id, content: step.result }] },
             parent_tool_use_id: agent.id,
           });
         }
-        await sleep(250);
+        await pace(250);
       }
     }
 
@@ -486,7 +470,7 @@ async function respond(userText, imageCount) {
         message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: agent.id, content: agent.result }] },
         parent_tool_use_id: null,
       });
-      await sleep(200);
+      await pace(200);
     }
 
     const summary = 'Both sub-agents reported back: the redirect drops the cookie in src/middleware.ts:12, and the store layer is clean. (dry-run mock)';
@@ -495,7 +479,7 @@ async function respond(userText, imageCount) {
       message: { role: 'assistant', content: [{ type: 'text', text: summary }], usage: { input_tokens: 400, output_tokens: 60 } },
       parent_tool_use_id: null,
     });
-    await sleep(150);
+    await pace(150);
     emit({
       type: 'result',
       subtype: 'success',
@@ -511,9 +495,13 @@ async function respond(userText, imageCount) {
   // dry-run tests can assert the full apply pipeline.
   if (userText.includes('[cez-namer]')) {
     const numbered = /(?:^|\D)(\d{1,7})(?:\D|$)/.exec(userText);
+    // Branch naming instructions (spec 2026-10-11-branch-naming-instructions): a canned branch
+    // so dry-run tests can assert the fork used it. Only when the prompt carried instructions.
+    const named = userText.includes('Branch naming instructions:');
     const name = JSON.stringify({
       title: 'implementing cr fixes',
       ...(numbered ? { pr: Number(numbered[1]) } : {}),
+      ...(named ? { branch: 'feature/implementing cr fixes' } : {}),
     });
     emit({
       type: 'assistant',
@@ -523,7 +511,7 @@ async function respond(userText, imageCount) {
         usage: { input_tokens: 200, output_tokens: 30 },
       },
     });
-    await sleep(50);
+    await pace(50);
     emit({
       type: 'result',
       subtype: 'success',
@@ -556,7 +544,7 @@ async function respond(userText, imageCount) {
         usage: { input_tokens: 500, output_tokens: 120 },
       },
     });
-    await sleep(100);
+    await pace(100);
     emit({
       type: 'result',
       subtype: 'success',
@@ -587,7 +575,7 @@ async function respond(userText, imageCount) {
         usage: { input_tokens: 850, output_tokens: 40 },
       },
     });
-    await sleep(300);
+    await pace(300);
     emit({
       type: 'assistant',
       message: {
@@ -596,7 +584,7 @@ async function respond(userText, imageCount) {
         usage: { input_tokens: 120, output_tokens: 55 },
       },
     });
-    await sleep(300);
+    await pace(300);
     emit({
       type: 'user',
       message: {
@@ -604,7 +592,7 @@ async function respond(userText, imageCount) {
         content: [{ type: 'tool_result', tool_use_id: `toolu_mock_${turn}`, content: ' M src/example.ts' }],
       },
     });
-    await sleep(200);
+    await pace(200);
     // Agent screenshot in a tool result — exercises the image pipeline
     // (persist to <id>-images/, serve via /api/runs/:id/images/, zoomable
     // card + lightbox in the transcript).
@@ -616,7 +604,7 @@ async function respond(userText, imageCount) {
         usage: { input_tokens: 80, output_tokens: 30 },
       },
     });
-    await sleep(200);
+    await pace(200);
     emit({
       type: 'user',
       message: {
@@ -633,7 +621,7 @@ async function respond(userText, imageCount) {
         ],
       },
     });
-    await sleep(300);
+    await pace(300);
     emit({
       type: 'assistant',
       message: {
@@ -642,7 +630,7 @@ async function respond(userText, imageCount) {
         usage: { input_tokens: 300, output_tokens: 90 },
       },
     });
-    await sleep(150);
+    await pace(150);
     emit({
       type: 'result',
       subtype: 'success',
@@ -662,7 +650,7 @@ async function respond(userText, imageCount) {
       usage: { input_tokens: 200, output_tokens: 60 },
     },
   });
-  await sleep(150);
+  await pace(150);
   emit({
     type: 'result',
     subtype: 'success',

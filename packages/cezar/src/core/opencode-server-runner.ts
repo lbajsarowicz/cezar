@@ -64,9 +64,7 @@ export const TURN_IDLE_GRACE_MS = 5_000;
  * outlives its server — opencode keeps it in its own storage — so "Continue"
  * (`spec.resume`) boots a fresh server and reopens `spec.sessionId` with `GET
  * /session/:id`; a session that is gone (a 404, or an id that is not an opencode `ses_…` id)
- * fails loudly, unless the caller supplied a `resumeFallbackPrompt`, in which case the
- * continuation opens a fresh session with that portable context instead of dead-ending. A
- * transport drop or any other status is no evidence the session is gone and propagates.
+ * fails loudly instead of quietly opening a blank one.
  *
  * Auth = the host's opencode config/logins. The agent runs autonomously
  * (auto-approved permissions); OpenCode has no per-tool allowlist, so
@@ -382,38 +380,15 @@ class OpencodeSession implements AgentSession {
     const resumeId = this.spec.resume ? this.spec.sessionId : undefined;
     let sessionId: string | undefined;
     let resumed = false;
-    let fallbackPrompt: string | undefined;
     if (resumeId) {
-      let missingError: Error | undefined;
       // Opencode mints its own `ses_…` ids; anything else is cezar's pre-assigned placeholder for a
-      // session that died before opencode announced its id. It resolves to nothing (the real server
-      // answers 500, not 404), so treat it as missing rather than asking.
-      if (!resumeId.startsWith('ses_')) {
-        missingError = new Error(`opencode cannot resume non-session id ${resumeId}`);
-      } else {
-        try {
-          const existing = await this.http('GET', `/session/${encodeURIComponent(resumeId)}`, undefined);
-          const found = stringField(existing, 'id');
-          if (found !== resumeId) missingError = new Error(`opencode could not reopen session ${resumeId}`);
-          else sessionId = found;
-        } catch (err) {
-          // Only a 404 ("no such session") justifies a fresh session. A transport drop or a 5xx is
-          // no evidence the session is gone, and replacing it would discard provider-owned context
-          // for nothing — so those propagate, exactly as before.
-          if (err instanceof OpencodeHttpError && err.status === 404) missingError = err;
-          else throw err;
-        }
-      }
-      if (missingError) {
-        // With a portable opening prompt the continuation degrades to a fresh session; without
-        // one the original failure stands. The prompt is built here, not by the caller, because
-        // it reads the whole event log.
-        fallbackPrompt = this.spec.resumeFallbackPrompt?.();
-        if (!fallbackPrompt) throw missingError;
-        this.emit({ type: 'note', message: `opencode: session ${resumeId} could not be reopened — continuing in a fresh session` });
-      } else {
-        resumed = true;
-      }
+      // session that died before opencode announced its id, and the real server answers it with a
+      // 500 rather than a 404.
+      if (!resumeId.startsWith('ses_')) throw new Error(`opencode cannot resume non-session id ${resumeId}`);
+      const existing = await this.http('GET', `/session/${encodeURIComponent(resumeId)}`, undefined);
+      if (stringField(existing, 'id') !== resumeId) throw new Error(`opencode could not reopen session ${resumeId}`);
+      sessionId = resumeId;
+      resumed = true;
     }
     if (!sessionId) {
       const created = await this.http('POST', '/session', { title: 'cezar task' });
@@ -432,7 +407,7 @@ class OpencodeSession implements AgentSession {
     // A reopened session already holds the system prompt from its own first turn.
     const first = resumed
       ? this.spec.userPrompt
-      : prependSystemPrompt(this.spec.systemPrompt, fallbackPrompt ?? this.spec.userPrompt);
+      : prependSystemPrompt(this.spec.systemPrompt, this.spec.userPrompt);
     await this.prompt(first);
   }
 

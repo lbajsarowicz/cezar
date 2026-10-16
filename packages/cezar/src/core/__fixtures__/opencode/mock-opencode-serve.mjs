@@ -95,13 +95,12 @@ const server = createServer((req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ id: SESSION_ID, title: 'cezar task' }));
       } else if (id.startsWith('ses_')) {
-        // A well-formed but unknown session id: the real server says 404, which the runner reads
-        // as "gone" and may replace with a fresh session.
+        // A well-formed but unknown session id: the real server says 404.
         res.writeHead(404, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ name: 'NotFoundError', data: { message: `Session not found: ${id}` } }));
       } else {
         // Not an opencode id at all (cezar's pre-assigned placeholder): real opencode answers 500
-        // UnknownError, so the runner must treat the shape itself as missing, never look it up.
+        // UnknownError.
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ name: 'UnknownError', data: { message: `Invalid session id: ${id}` } }));
       }

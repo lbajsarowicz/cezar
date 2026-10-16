@@ -17,8 +17,8 @@ const GIT_ID = ['-c', 'user.name=test', '-c', 'user.email=test@local'];
 const captured = vi.hoisted(() => ({ specs: [] as AgentRunSpec[] }));
 
 // `freshContinuationContext` reads and parses the run's whole event log, so the continuation must
-// only build it when a session actually needs the portable context (a backend switch, or opencode's
-// gone-session fallback). Spy through to the real one so the content assertions below still hold.
+// only build it when a session actually needs the portable context (a backend switch, or a
+// missing-session fallback). Spy through to the real one so the content assertions below still hold.
 vi.mock('./continuation-context.ts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./continuation-context.ts')>();
   return { ...actual, freshContinuationContext: vi.fn(actual.freshContinuationContext) };
@@ -130,7 +130,7 @@ describe('a resumed session keeps its workflow step tools', () => {
   /** A terminal run whose `workflowDef` and steps are exactly what the caller says. */
   function terminalRun(input: {
     def?: WorkflowDef;
-    steps: { id: string; sessionId?: string; backend?: 'claude' | 'codex' | 'opencode' }[];
+    steps: { id: string; sessionId?: string; backend?: 'claude' | 'codex' }[];
     status?: 'done' | 'failed';
     error?: string;
     autoResumeAt?: string;
@@ -287,31 +287,6 @@ describe('a resumed session keeps its workflow step tools', () => {
     await settled(id);
   });
 
-  it('a resumed session also carries the portable context as its gone-session fallback', async () => {
-    const id = terminalRun({
-      def: SINGLE_DEF,
-      steps: [{ id: 'work', sessionId: 'sess-1', backend: 'opencode' }],
-      status: 'failed',
-      error: 'boom',
-    });
-    store.appendEvent(id, { type: 'user-message', text: 'first fix the API' });
-    store.appendEvent(id, { type: 'text', text: 'The API is fixed; UI remains.' });
-
-    expect(manager!.continueRun(id, { text: 'keep going', runner: 'opencode' })).toEqual({ ok: true });
-    const spec = await specAt(0);
-    expect(spec.resume).toBe(true);
-    expect(spec.sessionId).toBe('sess-1');
-    // The live resume gets the instruction alone; the fallback opening carries the whole portable
-    // context, so a stored session opencode has since dropped degrades instead of dead-ending.
-    expect(spec.userPrompt).toBe('keep going');
-    const fallback = spec.resumeFallbackPrompt?.();
-    expect(fallback).toContain('You are continuing an existing Cezar task');
-    expect(fallback).toContain('do the thing');
-    expect(fallback).toContain('User:\nfirst fix the API');
-    expect(fallback).toContain('## New user instruction\nkeep going');
-    await settled(id);
-  });
-
   it('does not build the portable context for a successful same-backend resume', async () => {
     vi.mocked(freshContinuationContext).mockClear();
     const id = terminalRun({
@@ -324,7 +299,7 @@ describe('a resumed session keeps its workflow step tools', () => {
     expect(spec.resume).toBe(true);
     await settled(id);
 
-    // The NDJSON read + parse is the whole point of the lazy fallback: a normal resume must not pay.
+    // A normal resume must not pay for the NDJSON read + parse.
     expect(freshContinuationContext).not.toHaveBeenCalled();
   });
 

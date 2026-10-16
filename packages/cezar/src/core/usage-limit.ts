@@ -44,12 +44,9 @@ const CLAUDE_MARKER_RE = /claude(?:\s+ai)?\s+usage\s+limit\s+reached\s*\|\s*(\d{
 /**
  * "This is a limit, not a crash." Deliberately narrow: it gates the two prose shapes below, and a
  * false positive there would schedule a resume on a timestamp that means something else entirely.
- * Exported so the retry path (`RunManager.isProviderRefusalError`) can recognize the same prose
- * even when it carries no reset instant — a limit with an unknown reset is still a refusal, not a
- * missing session.
  */
-export const LIMIT_PHRASE_RE =
-  /\b(?:usage|rate|session|weekly|hourly)[\s-]?limit\b|\brate[_-]?limit(?:_error|ed)?\b|\binsufficient[_-]?quota\b|\bquota\s+(?:exceeded|reached)\b|\bout\s+of\s+(?:credits|quota)\b|\bcredit\s+balance\s+(?:is\s+)?(?:too\s+low|exhausted)\b|\blimit\s+(?:has\s+been\s+)?reached\b/i;
+const LIMIT_PHRASE_RE =
+  /\b(?:usage|rate|session|weekly|hourly)[\s-]?limit\b|\brate[_-]?limit(?:_error|ed)?\b|\bquota\s+(?:exceeded|reached)\b|\bout\s+of\s+(?:credits|quota)\b/i;
 
 /** `…try again at 2026-08-03T18:00:00Z`, `…resets at 2026-08-03 18:00`. */
 const RESET_AT_RE =
@@ -69,6 +66,11 @@ const UNIT_MS: Record<string, number> = {
   m: 60_000, min: 60_000, mins: 60_000, minute: 60_000, minutes: 60_000,
   h: 3_600_000, hr: 3_600_000, hrs: 3_600_000, hour: 3_600_000, hours: 3_600_000,
 };
+
+/** True for any usage-limit error, reset instant or not — `task_failed`'s `usage_limit` kind (#1438). */
+export function isUsageLimitMessage(message: string): boolean {
+  return CLAUDE_MARKER_RE.test(message) || LIMIT_PHRASE_RE.test(message);
+}
 
 /**
  * Read a usage limit out of a terminal error message, or `null` when it is not one (or carries no

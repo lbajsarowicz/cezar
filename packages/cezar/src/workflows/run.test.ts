@@ -20,8 +20,12 @@ import { createWorktree, removeWorktree } from '../git-worktree.ts';
 import { RunStore, type RunRecord, type StepState } from '../runs/store.ts';
 import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { parseTaskMarkers } from '../runs/task-markers.ts';
-import { appendTurnText, endsWithDoneMarker, endsWithMonitoringMarker, isProviderRefusalError, RunManager, turnEndMarkerText } from './run.ts';
+import { appendTurnText, endsWithDoneMarker, endsWithMonitoringMarker, RunManager, turnEndMarkerText } from './run.ts';
 import type { WorkflowDef } from './types.ts';
+import { track } from '../telemetry.ts';
+
+// A spy, inert like the real `track` without consent — lets skill provisioning assert its signal.
+vi.mock('../telemetry.ts', async (importOriginal) => ({ ...(await importOriginal<object>()), track: vi.fn() }));
 
 type UsageAccountingHarness = {
   beginUsageInvocation(runId: string, state: Record<string, unknown>, stepId: string): void;
@@ -71,29 +75,6 @@ describe('appendTurnText', () => {
     expect(appendTurnText('', 'first')).toBe('first');
     expect(appendTurnText('first', '')).toBe('first');
     expect(appendTurnText(appendTurnText('', 'first'), 'second')).toBe('first\nsecond');
-  });
-});
-
-describe('isProviderRefusalError', () => {
-  it.each([
-    ["You've hit your usage limit. Upgrade to Pro to continue."],
-    ['insufficient_quota: You exceeded your current quota'],
-    ['Credit balance is too low'],
-    ['quota exceeded for this billing period'],
-    ['Your weekly limit has been reached'],
-    ['429 Too Many Requests'],
-    ['Service overloaded, please retry'],
-  ])('treats a provider refusal as one: %s', (message) => {
-    expect(isProviderRefusalError(message)).toBe(true);
-  });
-
-  it.each([
-    'No conversation found with session ID: abc',
-    'opencode could not reopen session ses_x',
-    'resume failed: ERR_RESUME_PROTOCOL_v7',
-    'API Error: 500 Internal Server Error',
-  ])('does not mistake a session failure for a refusal: %s', (message) => {
-    expect(isProviderRefusalError(message)).toBe(false);
   });
 });
 
@@ -3593,7 +3574,45 @@ describe("registry /skill expansion on a fresh run's opening prompt (#278)", () 
     expect(echoed?.text).not.toContain('/demo-review look at the diff');
   }, 40_000);
 
+  it("installs the slash skill and the companion it names into the task's worktree", async () => {
+    // The worktree is a fresh checkout: neither skill is in it unless cezar puts it there,
+    // and the agent then answers "Unknown skill" / "companion not installed".
+    writeFileSync(
+      join(repoRoot, '.ai/cezar/skills/demo-review.md'),
+      '---\nname: demo-review\ndescription: Review a diff.\n---\n\nRun the `demo-engine` skill verbatim.\n',
+    );
+    writeFileSync(join(repoRoot, '.ai/cezar/skills/demo-engine.md'), '---\nname: demo-engine\n---\n\nEngine.\n');
+    const record = manager.startRun(SINGLE_STEP, { task: '/demo-review 12', worktree: true });
+    runId = record.id;
+    await waitFor(() => eventsOf(record.id).some((e) => e.stepId === 'task' && e.type === 'text'));
+    const wt = store.getRun(record.id)!.worktreePath!;
+    for (const dir of ['.claude/skills', '.agents/skills']) {
+      expect(readFileSync(join(wt, dir, 'demo-review/SKILL.md'), 'utf8')).toContain('demo-engine');
+      expect(readFileSync(join(wt, dir, 'demo-engine/SKILL.md'), 'utf8')).toContain('Engine.');
+    }
+    expect(vi.mocked(track)).toHaveBeenCalledWith('skills_provisioned', { label: 'installed', value: 2 });
+  }, 40_000);
+
+  it("writes no skill copies into the user's own checkout on an in-place run", async () => {
+    // In place the cwd IS the checkout, whose skill dirs `discoverSkills` reads ahead of the
+    // builtin — a written-out copy would shadow the real skill for good.
+    const savedApiUrl = process.env.CEZ_API_URL;
+    process.env.CEZ_API_URL = 'http://127.0.0.1:1';
+    try {
+      const record = manager.startRun(SINGLE_STEP, { task: '/create-cezar-automation daily', worktree: false });
+      runId = record.id;
+      await waitFor(() => eventsOf(record.id).some((e) => e.stepId === 'task' && e.type === 'text'));
+      for (const dir of ['.claude/skills', '.agents/skills']) {
+        expect(existsSync(join(repoRoot, dir, 'create-cezar-automation'))).toBe(false);
+      }
+    } finally {
+      if (savedApiUrl === undefined) delete process.env.CEZ_API_URL;
+      else process.env.CEZ_API_URL = savedApiUrl;
+    }
+  }, 40_000);
+
   it('leaves an unknown slash command untouched so backend-native commands still work', async () => {
+    vi.mocked(track).mockClear();
     const record = manager.startRun(SINGLE_STEP, { task: '/compact please', worktree: false });
     runId = record.id;
     await waitFor(() =>
@@ -3605,5 +3624,7 @@ describe("registry /skill expansion on a fresh run's opening prompt (#278)", () 
       (e) => e.stepId === 'task' && e.type === 'text' && e.text?.includes('looking into'),
     );
     expect(echoed?.text).toContain('/compact please');
+    // A backend's own command is not a missing skill.
+    expect(vi.mocked(track)).not.toHaveBeenCalledWith('skills_provisioned', expect.anything());
   }, 40_000);
 });
