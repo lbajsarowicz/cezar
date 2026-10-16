@@ -176,8 +176,9 @@ export async function getDiff(root: string, cap = 400_000): Promise<string> {
 }
 
 /** Local + origin branch names, deduped (origin/x counts as x), sorted.
- *  Feeds the Repo tab's base-branch picker. */
-export async function getBranches(root: string): Promise<string[]> {
+ *  Feeds the Repo tab's base-branch picker. `hide` is the set of branches run records own —
+ *  a named task branch (spec 2026-10-11-branch-naming-instructions) has no `cez/` prefix. */
+export async function getBranches(root: string, hide: ReadonlySet<string> = new Set()): Promise<string[]> {
   const names = new Set<string>();
   try {
     // One `for-each-ref` covers both halves; full refnames tell local
@@ -196,7 +197,7 @@ export async function getBranches(root: string): Promise<string[]> {
   } catch {
     // no branches — empty list
   }
-  return [...names].filter((n) => !n.startsWith('cez/')).sort((a, b) => a.localeCompare(b));
+  return [...names].filter((n) => !n.startsWith('cez/') && !hide.has(n)).sort((a, b) => a.localeCompare(b));
 }
 
 /** One commit — message + stat + patch — for the Repo view's expandable rows. */

@@ -50,6 +50,7 @@
  */
 
 import { isSafeGitRef } from './git-refs.ts';
+import { resolveTaskRemotes, splitRemoteRef } from './git-remotes.ts';
 
 /** What a caller's `git` runner must answer with. Both existing runners are
  *  wider than this; `code` is the process exit code only, and only when the
@@ -88,24 +89,25 @@ const PINNED_COMMIT = /^[0-9a-f]{7,64}$/i;
 
 /**
  * In-place runs persist their starting commit because they have no task branch.
- * If that commit is now contained by the repository's advertised origin branch,
- * use that branch as the moving base: the SHA is a fork snapshot, not a request
- * to count every upstream commit fetched after the run began. Keep the SHA when
- * origin/HEAD is unavailable or does not contain it; that preserves the narrow
- * fallback for local-only and unrelated commits.
+ * If that commit is now contained by the base remote's advertised default branch
+ * (`<remote>/HEAD` — `upstream` on a fork clone, usually `origin`), use that
+ * branch as the moving base: the SHA is a fork snapshot, not a request to count
+ * every upstream commit fetched after the run began. Keep the SHA when
+ * `<remote>/HEAD` is unavailable or does not contain it; that preserves the
+ * narrow fallback for local-only and unrelated commits.
  */
-async function freshestPinnedBaseRef(runGit: GitRunner, base: string): Promise<FreshestBase> {
-  if (!PINNED_COMMIT.test(base)) return { base };
-  const originHead = await runGit(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
-  const remote = originHead.ok ? originHead.stdout.trim() : '';
-  if (!remote.startsWith('origin/') || !isSafeGitRef(remote)) return { base };
+async function freshestPinnedBaseRef(runGit: GitRunner, base: string, baseRemote: string | null): Promise<FreshestBase> {
+  if (!PINNED_COMMIT.test(base) || !baseRemote) return { base };
+  const remoteHead = await runGit(['symbolic-ref', '--quiet', '--short', `refs/remotes/${baseRemote}/HEAD`]);
+  const remote = remoteHead.ok ? remoteHead.stdout.trim() : '';
+  if (!remote.startsWith(`${baseRemote}/`) || !isSafeGitRef(remote)) return { base };
   const contains = await runGit(['merge-base', '--is-ancestor', base, remote]);
   return { base: contains.ok ? remote : base };
 }
 
 /**
- * The freshest ref the configured base branch names: `origin/<base>` when the
- * local branch is behind it, the local branch when it is equal or ahead (or
+ * The freshest ref the configured base branch names: `<remote>/<base>` on the
+ * base (PR-target) remote when the local branch is behind it, the local branch when it is equal or ahead (or
  * origin has no such branch), and — when the two diverged — whichever side the
  * task actually forked from.
  *
@@ -113,32 +115,35 @@ async function freshestPinnedBaseRef(runGit: GitRunner, base: string): Promise<F
  * when the worktree is created; this one re-applies it every time a diff is
  * measured, because that is when the local ref's staleness actually shows up.
  * A base that is already remote-tracking, a commit sha pinned from a detached
- * HEAD, or a repo with no `origin` all fall through unchanged.
+ * HEAD, or a repo with no remote all fall through unchanged.
  */
 async function freshestBaseRef(runGit: GitRunner, base: string): Promise<FreshestBase> {
-  if (!isSafeGitRef(base) || base === 'HEAD' || base.startsWith('origin/')) return { base };
-  if (PINNED_COMMIT.test(base)) return freshestPinnedBaseRef(runGit, base);
-  const remote = `origin/${base}`;
+  if (!isSafeGitRef(base) || base === 'HEAD') return { base };
+  const remotes = await resolveTaskRemotes(runGit);
+  if (splitRemoteRef(base, remotes.names).remote) return { base };
+  if (PINNED_COMMIT.test(base)) return freshestPinnedBaseRef(runGit, base, remotes.base);
+  if (!remotes.base) return { base };
+  const remote = `${remotes.base}/${base}`;
   const hasRemote = await runGit(['rev-parse', '--verify', '--quiet', `${remote}^{commit}`]);
   if (!hasRemote.ok) return { base };
   // The tip the decision reads; the caller memoizes it so a fetch that advances
-  // `origin/<base>` under an unchanged HEAD invalidates the cached anchor.
-  const remoteTip = hasRemote.stdout.trim();
-  // Exits 0 iff local is equal to or ahead of origin — the case where the local
-  // ref carries unpushed base commits and is the better answer. A clean exit 1
-  // is the only evidence that origin is strictly ahead; any other failure (a
-  // broken object, a signal) says nothing about ancestry, so keep the local ref
-  // rather than silently switching the diff base to origin.
+  // `<remote>/<base>` under an unchanged HEAD invalidates the cached anchor.
+  const remoteTip = { ref: remote, sha: hasRemote.stdout.trim() };
+  // Exits 0 iff local is equal to or ahead of the remote — the case where the
+  // local ref carries unpushed base commits and is the better answer. A clean
+  // exit 1 is the only evidence that the remote is strictly ahead; any other
+  // failure (a broken object, a signal) says nothing about ancestry, so keep the
+  // local ref rather than silently switching the diff base to the remote.
   const localCurrent = await runGit(['merge-base', '--is-ancestor', remote, base]);
   if (localCurrent.ok) return { base, remoteTip };
   if (localCurrent.code !== 1) return { base, remoteTip };
   const localBehind = await runGit(['merge-base', '--is-ancestor', base, remote]);
   if (localBehind.ok) return { base: remote, remoteTip };
   // DIVERGED. `resolveBaseRef` forks a zero-config task from the user's own
-  // diverged branch (`keepDiverged`) but a configured base from origin, and
+  // diverged branch (`keepDiverged`) but a configured base from the remote, and
   // only the fork shows which: the task forked from whichever side's
   // merge-base with HEAD is the newer one. Keep local only when its merge-base
-  // strictly descends from origin's — otherwise the stale-base rule stands.
+  // strictly descends from the remote's — otherwise the stale-base rule stands.
   const [mbLocal, mbRemote] = await Promise.all([
     runGit(['merge-base', base, 'HEAD']),
     runGit(['merge-base', remote, 'HEAD']),
@@ -150,10 +155,16 @@ async function freshestBaseRef(runGit: GitRunner, base: string): Promise<Freshes
   return { base: forkedFromLocal.ok ? base : remote, remoteTip };
 }
 
-/** `freshestBaseRef`'s answer plus the `origin/<base>` tip it read (if any). */
+/** The `<remote>/<base>` ref `freshestBaseRef` read, and the commit it pointed at. */
+interface RemoteTip {
+  ref: string;
+  sha: string;
+}
+
+/** `freshestBaseRef`'s answer plus the `<remote>/<base>` tip it read (if any). */
 interface FreshestBase {
   base: string;
-  remoteTip?: string;
+  remoteTip?: RemoteTip;
 }
 
 /**
@@ -235,10 +246,10 @@ export async function resolveTaskDiffBase(
   const { result, headSha, remoteTip } = await computeTaskDiffBase(runGit, baseBranch, opts);
   // Only the repointed path is worth caching: it costs a reflog probe and two
   // shortstat comparisons, while the normal merge-base is a single spawn. The
-  // cache is validated against HEAD and the `origin/<base>` tip the resolution
+  // cache is validated against HEAD and the `<remote>/<base>` tip the resolution
   // read, so a new commit, a fresh branch or an advancing upstream base misses.
-  // A pinned sha has no `origin/<base>` tip to validate against, yet it still
-  // follows `origin/HEAD`, so it is never memoized.
+  // A pinned sha has no `<remote>/<base>` tip to validate against, yet it still
+  // follows `<remote>/HEAD`, so it is never memoized.
   if (opts.cacheKey && result.repointedHead && headSha && !PINNED_COMMIT.test(baseBranch)) {
     storeBase(result, headSha, baseBranch, opts, remoteTip);
   }
@@ -259,12 +270,12 @@ interface ResolveCacheEntry {
    *  apart — checking out the task's own branch again usually leaves HEAD at
    *  the same commit — so the entry is valid only while both match. */
   headBranch: string;
-  /** The `origin/<base>` tip the cached resolution read, when that ref existed.
+  /** The `<remote>/<base>` tip the cached resolution read, when that ref existed.
    *  Upstream resolves the base against the freshly fetched remote tip
-   *  (`freshestBaseRef`), so an advancing `origin/<base>` can change the anchor
+   *  (`freshestBaseRef`), so an advancing `<remote>/<base>` can change the anchor
    *  under an unchanged HEAD; the hit re-validates it. Absent when the base is
    *  local-only, remote-tracking or pinned, where the tip is not an input. */
-  remoteTip?: string;
+  remoteTip?: RemoteTip;
   repointedHead?: RepointedHead;
   baseBranch: string;
   taskBranch?: string;
@@ -299,8 +310,8 @@ async function cachedBase(
   const [headSha = '', headBranch = ''] = head.stdout.trim().split('\n');
   if (headSha !== cached.headSha || headBranch !== cached.headBranch) return null;
   if (cached.remoteTip !== undefined) {
-    const remote = await runGit(['rev-parse', '--verify', '--quiet', `origin/${baseBranch}^{commit}`]);
-    if (!remote.ok || remote.stdout.trim() !== cached.remoteTip) return null;
+    const remote = await runGit(['rev-parse', '--verify', '--quiet', `${cached.remoteTip.ref}^{commit}`]);
+    if (!remote.ok || remote.stdout.trim() !== cached.remoteTip.sha) return null;
   }
   return { base: cached.base, ...(cached.repointedHead ? { repointedHead: cached.repointedHead } : {}) };
 }
@@ -310,7 +321,7 @@ function storeBase(
   headSha: string,
   baseBranch: string,
   opts: { taskBranch?: string; runStartedAt?: string; cacheKey?: string },
-  remoteTip?: string,
+  remoteTip?: RemoteTip,
 ): void {
   resolveCache.delete(opts.cacheKey as string);
   resolveCache.set(opts.cacheKey as string, {
@@ -331,7 +342,7 @@ async function computeTaskDiffBase(
   runGit: GitRunner,
   baseBranch: string,
   opts: { taskBranch?: string; runStartedAt?: string },
-): Promise<{ result: TaskDiffBase; headSha: string; remoteTip?: string }> {
+): Promise<{ result: TaskDiffBase; headSha: string; remoteTip?: RemoteTip }> {
   const { base, remoteTip } = await freshestBaseRef(runGit, baseBranch);
   const mergeBase = async (): Promise<string> => {
     const res = await runGit(['merge-base', base, 'HEAD']);
