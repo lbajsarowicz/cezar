@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentRunner } from '../core/agent-runner.ts';
 import { CursorAgentRunner } from '../core/cursor-agent-runner.ts';
 import { RunStore } from '../runs/store.ts';
-import { MISSING_SESSION_NOTE } from './resume-fallback.ts';
+import { graphToSteps, type WorkflowGraph } from './graph.ts';
+import { isProviderRefusalError, missingSessionNote } from './resume-fallback.ts';
 import { RunManager } from './run.ts';
 import type { WorkflowDef } from './types.ts';
 
@@ -117,7 +118,7 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     expect(all[1]).toContain(TASK);
     expect(all[1]).toContain('## Handoff (cezar)');
     expect(all[1]).toContain('1 test failed');
-    expect(store.readEvents(id).some((e) => e.type === 'note' && e.message === MISSING_SESSION_NOTE)).toBe(true);
+    expect(store.readEvents(id).some((e) => e.type === 'note' && e.message === missingSessionNote('codex'))).toBe(true);
     expect(store.readEvents(id).some((e) => e.type === 'error' && e.stepId === 'implement')).toBe(false);
   }, 30_000);
 
@@ -147,11 +148,56 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
       expect(prompts).toHaveLength(2);
       expect(prompts[1]).toContain(TASK);
       expect(prompts[1]).toContain('1 test failed');
-      expect(store.readEvents(id).some((e) => e.type === 'note' && e.message === MISSING_SESSION_NOTE)).toBe(true);
+      expect(store.readEvents(id).some((e) => e.type === 'note' && e.message === missingSessionNote('opencode'))).toBe(true);
     } finally {
       rmSync(promptsFile, { force: true });
     }
   }, 30_000);
+
+  it('counts only the new usage of a resumed codex thread that restores its total', async () => {
+    // The first attempt's thread reached 1,500 tokens; the reopened thread reports that total
+    // before its turn and 3,000 after it. The step used 1,500 + 1,500, not 1,500 + 3,000.
+    setEnv('MOCK_CODEX_RESTORED_TOTAL', '1500');
+    setEnv('CEZ_ENV_PASSTHROUGH', 'MOCK_CODEX_TURNS_FILE,MOCK_CODEX_RESTORED_TOTAL');
+    const id = await runToEnd();
+    expect(turns()).toHaveLength(2);
+    expect(store.getRun(id)?.steps.find((s) => s.id === 'implement')?.tokensUsed).toBe(3000);
+  }, 30_000);
+
+  it('continues an opencode task in a fresh session with its saved context when the session is gone', async () => {
+    const promptsFile = join(repoRoot, '..', `${basename(repoRoot)}-opencode-prompts.ndjson`);
+    setEnv('CEZ_OPENCODE_BIN', MOCK_OPENCODE);
+    setEnv('MOCK_OPENCODE_PROMPTS_FILE', promptsFile);
+    setEnv('CEZ_ENV_PASSTHROUGH', 'MOCK_OPENCODE_PROMPTS_FILE,MOCK_OPENCODE_SESSIONS_GONE');
+    try {
+      const record = manager.startRun({ name: 'one', source: 'file', steps: [{ id: 'work', prompt: '{{task}}' }, { id: 'verify', command: 'true' }] }, { task: TASK, runner: 'opencode', worktree: false });
+      const terminal = new Set(['done', 'review', 'failed', 'cancelled']);
+      let deadline = Date.now() + 25_000;
+      while (!terminal.has(store.getRun(record.id)?.status ?? '')) {
+        if (Date.now() > deadline) throw new Error(`run did not finish: ${store.getRun(record.id)?.status}`);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(store.getRun(record.id)?.steps.find((s) => s.id === 'work')?.sessionId).toBe('ses_mock_1');
+
+      setEnv('MOCK_OPENCODE_SESSIONS_GONE', '1');
+      expect(manager.continueRun(record.id, { text: 'keep going', runner: 'opencode' })).toEqual({ ok: true });
+      deadline = Date.now() + 25_000;
+      while (!['waiting', 'done', 'failed'].includes(store.getRun(record.id)?.steps.find((s) => s.id === 'continue-1')?.status ?? '')) {
+        if (Date.now() > deadline) throw new Error('continue did not settle');
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const step = store.getRun(record.id)?.steps.find((s) => s.id === 'continue-1');
+      expect(step?.status).not.toBe('failed');
+      const prompts = readFileSync(promptsFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string);
+      const fresh = prompts.at(-1)!;
+      expect(fresh).toContain('You are continuing an existing Cezar task');
+      expect(fresh).toContain(TASK);
+      expect(fresh).toContain('## New user instruction\nkeep going');
+      expect(store.readEvents(record.id).some((e) => e.type === 'note' && e.message === missingSessionNote('opencode'))).toBe(true);
+    } finally {
+      rmSync(promptsFile, { force: true });
+    }
+  }, 60_000);
 
   it('does not resume a strict backend under a different account', async () => {
     const seam = manager as unknown as {
@@ -265,7 +311,7 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
       const freshPrompt = prompts.at(-1)!;
       expect(freshPrompt).toContain(TASK);
       expect(freshPrompt).toContain('1 test failed');
-      expect(notesOf(id)).toContain(MISSING_SESSION_NOTE);
+      expect(notesOf(id)).toContain(missingSessionNote('claude'));
       const implement = store.getRun(id)?.steps.find((s) => s.id === 'implement');
       expect(implement?.sessionId).toBe(fresh![fresh!.indexOf('--session-id') + 1]);
       // The dead resume's bookkeeping was dropped, so the run's token totals stay consistent.
@@ -298,7 +344,7 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
       expect(store.getRun(id)?.status).toBe('failed');
       expect(argv).toHaveLength(2);
       expect(argv[1]).toContain('--resume');
-      expect(notesOf(id)).not.toContain(MISSING_SESSION_NOTE);
+      expect(notesOf(id)).not.toContain(missingSessionNote('claude'));
     }, 30_000);
 
     it('does not restart a session that reopened and then failed mid-turn', async () => {
@@ -306,7 +352,61 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
       expect(store.getRun(id)?.status).toBe('failed');
       expect(argv).toHaveLength(2);
       expect(argv[1]).toContain('--resume');
-      expect(notesOf(id)).not.toContain(MISSING_SESSION_NOTE);
+      expect(notesOf(id)).not.toContain(missingSessionNote('claude'));
+    }, 30_000);
+
+    it('still falls back when a resume error has an unrecognized wording', async () => {
+      const { id, argv } = await runClaude('mock:resume-mystery');
+      // A retry falls back on anything that is not a refusal, not on an allowlist of wordings.
+      expect(store.getRun(id)?.steps.map((s) => [s.id, s.status])).toEqual([
+        ['implement', 'done'],
+        ['verify', 'done'],
+      ]);
+      expect(argv).toHaveLength(3);
+      expect(argv[1]).toContain('--resume');
+      expect(argv[2]).not.toContain('--resume');
+      expect(notesOf(id)).toContain(missingSessionNote('claude'));
+    }, 30_000);
+
+    it('sends a graph node its re-rendered instructions with the failure when they changed', async () => {
+      const graph: WorkflowGraph = {
+        nodes: [
+          { id: 'start', type: 'start' },
+          { id: 'implement', type: 'agent', prompt: 'pass {{nodes.retry.iteration}}: {{task}}' },
+          { id: 'tests', type: 'check', command: 'test -f .verified || { touch .verified; echo "1 test failed"; exit 1; }' },
+          { id: 'retry', type: 'loop', max: 2 },
+          { id: 'ok', type: 'end', status: 'success' },
+          { id: 'gave-up', type: 'end', status: 'failed' },
+        ],
+        edges: [
+          { from: 'start', to: 'implement' },
+          { from: 'implement', to: 'tests' },
+          { from: 'tests.pass', to: 'ok' },
+          { from: 'tests.fail', to: 'retry' },
+          { from: 'retry.repeat', to: 'implement' },
+          { from: 'retry.exhausted', to: 'gave-up' },
+        ],
+      };
+      const stdinFile = join(repoRoot, '..', `${basename(repoRoot)}-graph-stdin.ndjson`);
+      setEnv('CEZ_DRY_RUN', '1');
+      setEnv('CEZ_MOCK_STDIN_FILE', stdinFile);
+      try {
+        const record = manager.startRun({ name: 'graph', source: 'file', steps: graphToSteps(graph), graph }, { task: TASK, runner: 'claude', worktree: false });
+        const terminal = new Set(['done', 'review', 'failed', 'cancelled']);
+        const deadline = Date.now() + 25_000;
+        while (!terminal.has(store.getRun(record.id)?.status ?? '')) {
+          if (Date.now() > deadline) throw new Error(`run did not finish: ${store.getRun(record.id)?.status}`);
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        const prompts = readFileSync(stdinFile, 'utf8').trim().split('\n').map((line) => (JSON.parse(line) as { userText: string }).userText);
+        expect(prompts).toHaveLength(2);
+        expect(notesOf(record.id).some((m) => m.includes('sending only the failure'))).toBe(true);
+        expect(prompts[1]).toContain('Your instructions for this step changed since the previous attempt');
+        expect(prompts[1]).toContain(`pass 1: ${TASK}`);
+        expect(prompts[1]).toContain('1 test failed');
+      } finally {
+        rmSync(stdinFile, { force: true });
+      }
     }, 30_000);
   });
   describe('on cursor', () => {
@@ -343,5 +443,29 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
         rmSync(argsFile, { force: true });
       }
     }, 30_000);
+  });
+});
+
+describe('isProviderRefusalError', () => {
+  it.each([
+    ['Claude AI usage limit reached|1767225600'],
+    ["You've hit your usage limit. Upgrade to Pro to continue."],
+    ['insufficient_quota: You exceeded your current quota'],
+    ['Credit balance is too low'],
+    ['quota exceeded for this billing period'],
+    ['429 Too Many Requests'],
+    ['Service overloaded, please retry'],
+  ])('treats a provider refusal as one: %s', (message) => {
+    expect(isProviderRefusalError(message)).toBe(true);
+  });
+
+  it.each([
+    'No conversation found with session ID: abc',
+    'no rollout found for thread id th_1',
+    'opencode no longer has session ses_x (GET /session/ses_x → 404)',
+    'resume failed: ERR_RESUME_PROTOCOL_v7',
+    'API Error: 500 Internal Server Error',
+  ])('does not mistake a session failure for a refusal: %s', (message) => {
+    expect(isProviderRefusalError(message)).toBe(false);
   });
 });

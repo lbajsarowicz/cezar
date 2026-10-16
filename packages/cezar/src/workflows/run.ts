@@ -14,7 +14,8 @@ import {
   type AskRequest,
 } from '../core/ask.ts';
 import { AUTO_END_DELAY_MS, type AgentSession } from '../core/claude-cli-runner.ts';
-import { interruptAfterGrace, isMissingSessionError, MISSING_SESSION_NOTE, ResumeFallback, trackFallbackOutcome } from './resume-fallback.ts';
+import { interruptAfterGrace, missingSessionNote, ResumeFallback, resumeFallbackPredicate, trackFallbackOutcome } from './resume-fallback.ts';
+import { isOpencodeSessionId } from '../core/opencode-server-runner.ts';
 import {
   loadPrivateMcp,
   PRIVATE_MCP_FILE,
@@ -468,6 +469,8 @@ const REPOSITORY_ROOT_LOCK_DISABLED_NOTE =
 interface ActiveRun {
   /** Identity of this async owner; stale promises must not mutate a replacement owner. */
   ownerToken: symbol;
+  /** Each agent step's last opening instructions, so a resumed retry can tell whether they changed. */
+  stepInstructions?: Map<string, string>;
   cancelled: boolean;
   interrupt: () => void;
   /** Where this run's steps execute: the task worktree, or the repo root. */
@@ -1070,6 +1073,17 @@ interface PersistedAttachments {
 /** A user-authored live message is made durable before it may wait for the
  *  repository lease. Reusing this preparation when the lease arrives prevents
  *  duplicate transcript events and duplicate attachment files. */
+/**
+ * Whether a step's recorded session can be reopened. A placeholder cezar pre-assigned but the
+ * provider never confirmed (the step died before its `session` event) resolves to nothing on the
+ * backend; for opencode the id's shape says so too, which also covers records written before
+ * `sessionConfirmed` existed.
+ */
+function isResumableSession(step: { sessionId?: string; sessionConfirmed?: boolean }, backend: string): boolean {
+  if (step.sessionConfirmed === false) return false;
+  return backend !== 'opencode' || (step.sessionId !== undefined && isOpencodeSessionId(step.sessionId));
+}
+
 interface PreparedUserMessage {
   text: string;
   persisted: PersistedAttachment[];
@@ -1795,9 +1809,7 @@ export class RunManager {
       // chosen one cannot be resumed without silently switching the login back.
       const sessionAccount = sessionStep.profileId ?? DEFAULT_AGENT_ACCOUNT_ID;
       const accountMatches = run.agentProfile === undefined || run.agentProfile === sessionAccount;
-      // A placeholder cezar pre-assigned but the provider never confirmed (the step died before its
-      // `session` event) resolves to nothing on the backend, so it is not resumable either.
-      const resumable = sessionBackend === backend && accountMatches && sessionStep.sessionConfirmed !== false;
+      const resumable = sessionBackend === backend && accountMatches && isResumableSession(sessionStep, sessionBackend);
       this.pendingContinuations.set(run.id, {
         stepId: queuedContinuation.id,
         sessionId: resumable ? sessionStep.sessionId : undefined,
@@ -3727,11 +3739,8 @@ export class RunManager {
     const targetAccount = opts.agentProfile
       ?? (targetRunner === (run.runner ?? 'claude') ? run.agentProfile : undefined);
     const accountSwitched = targetAccount !== undefined && targetAccount !== sessionAccount;
-    // A placeholder cezar pre-assigned but the provider never confirmed (the step died before its
-    // `session` event) resolves to nothing on the backend, so it is not resumable: the
-    // continuation opens a fresh session with the portable context instead.
-    const resumable = sessionStep.sessionConfirmed !== false;
-    const resume = sessionBackend === targetRunner && !accountSwitched && resumable;
+    // A session that is not resumable opens a fresh one with the portable context instead.
+    const resume = sessionBackend === targetRunner && !accountSwitched && isResumableSession(sessionStep, sessionBackend);
 
     // Follow-up runner/model/account override (#401, spec 2026-07-29-agent-profiles): the composer
     // lets the user pick which backend, model and login handle this continuation — the same flat
@@ -3989,6 +3998,7 @@ export class RunManager {
       sessionId !== undefined,
       (event) => this.store.appendEvent(runId, { ...event, stepId }),
       (event) => this.handleRunnerUiEvent(runId, state, sink, event),
+      resumeFallbackPredicate(backend, 'continue'),
     );
     const onEvent = (event: AgentEvent) => {
       if (state.cancelled || this.active.get(runId) !== state) return;
@@ -4350,7 +4360,7 @@ export class RunManager {
         turnText = '';
         const freshId = randomUUID();
         this.store.updateStep(runId, stepId, { sessionId: freshId, sessionConfirmed: backend === 'claude' });
-        this.store.appendEvent(runId, { type: 'note', stepId, message: MISSING_SESSION_NOTE });
+        this.store.appendEvent(runId, { type: 'note', stepId, message: missingSessionNote(backend) });
         const context = freshContinuationContext(
           { ...recordBeforeTurn, steps: recordBeforeTurn.steps.filter((step) => step.id !== stepId) },
           this.store.readEvents(runId).filter((event) => event.stepId !== stepId),
@@ -4363,7 +4373,7 @@ export class RunManager {
         }, {
           cancelled: () => state.cancelled || this.active.get(runId) !== state,
           sessionError: () => sessionError,
-        });
+        }, backend);
         if (sessionError) throw new Error(sessionError);
       }
       sink.sessionEnded(state.cancelled ? 'cancelled' : 'end_turn');
@@ -5939,6 +5949,9 @@ export class RunManager {
     // matches; a leading `/name` that is not a known skill passes through byte-for-byte.
     userPrompt = expandRegistrySlashSkillText(userPrompt, state.skills ?? []);
     if (chainNote) userPrompt = `${chainNote}\n\n---\n\n${userPrompt}`;
+    const instructions = userPrompt;
+    const previousInstructions = state.stepInstructions?.get(step.id);
+    (state.stepInstructions ??= new Map()).set(step.id, instructions);
     // A commander recovered after a restart opens its first session holding whatever its children
     // reported while it was gone (spec Q7). Prepended and cleared here, after the slash expansion
     // so a leading `/skill` still matched, and before the failure/attachment suffixes.
@@ -5974,17 +5987,29 @@ export class RunManager {
     const previous = failureNote && graphHooks?.resumeSessionId === undefined
       ? this.store.getRun(runId)?.steps.find((s) => s.id === step.id)
       : undefined;
-    let resumeFrom = previous?.sessionId && previous.backend === backend && previous.sessionConfirmed !== false
+    let resumeFrom = previous?.sessionId && previous.backend === backend && isResumableSession(previous, backend)
       ? { sessionId: previous.sessionId, profileId: previous.profileId }
       : undefined;
-    const resumePrompt = treeBlocks.length ? `${treeBlocks.join('\n\n')}\n\n---\n\n${failureNote ?? ''}` : `${failureNote ?? ''}`;
+    // A graph node re-renders its prompt from upstream outputs on every pass, so a retry whose
+    // instructions changed must carry the new ones, not just the failure.
+    const resumePrompt = [
+      ...treeBlocks,
+      ...(previousInstructions !== undefined && previousInstructions !== instructions
+        ? [`Your instructions for this step changed since the previous attempt:\n\n${instructions}`]
+        : []),
+      failureNote ?? '',
+    ].join('\n\n---\n\n');
     let sessionId = resumeFrom?.sessionId ?? graphHooks?.resumeSessionId ?? randomUUID();
+    const stored = this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
     // claude pins the id at spawn, so a fresh one is provider-owned immediately; the id-minting
-    // backends only confirm theirs when the `session` event arrives.
+    // backends only confirm theirs when the `session` event arrives. Reopening the step's own
+    // recorded session keeps what is already known about it.
     this.store.updateStep(runId, step.id, {
       sessionId,
       backend,
-      sessionConfirmed: resumeFrom ? previous?.sessionConfirmed : backend === 'claude',
+      sessionConfirmed: resumeFrom || (graphHooks?.resumeSessionId !== undefined && stored?.sessionId === graphHooks.resumeSessionId)
+        ? stored?.sessionConfirmed
+        : backend === 'claude',
     });
 
     const stepRecord = this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
@@ -5997,11 +6022,24 @@ export class RunManager {
       resuming,
       (event) => emit({ ...event, stepId: step.id }),
       (event) => this.handleRunnerUiEvent(runId, state, sink, event),
-      retry ? isMissingSessionError : undefined,
+      retry ? resumeFallbackPredicate(backend, 'retry') : undefined,
     );
     let resumeGuard = guardResume(resumeFrom !== undefined || graphHooks?.resumeSessionId !== undefined, resumeFrom !== undefined);
+    // Codex reports a thread's cumulative total, and a reopened thread may restore the total its
+    // earlier turns (already counted in `startTokens`) reached. A total that arrives before the
+    // resumed session does any work is that restored baseline, not this attempt's usage.
+    let usageBaseline = 0;
+    let baselineOpen = backend === 'codex' && (resumeFrom !== undefined || graphHooks?.resumeSessionId !== undefined);
     const onEvent = (event: AgentEvent) => {
       if (state.cancelled || this.active.get(runId) !== state) return;
+      if (event.type === 'text' || event.type === 'tool-call' || event.type === 'tool-result' || event.type === 'turn-end') {
+        baselineOpen = false;
+      }
+      if (event.type === 'token-usage' && baselineOpen) {
+        baselineOpen = false;
+        usageBaseline = event.tokensUsed;
+        return;
+      }
       if (resumeGuard.hold(event)) {
         if (sessionError === undefined && event.type === 'error') {
           sessionError = event.message;
@@ -6038,7 +6076,7 @@ export class RunManager {
         this.store.updateStep(runId, step.id, { sessionId: event.sessionId, backend, sessionConfirmed: true });
       }
       if (event.type === 'token-usage') {
-        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + event.tokensUsed });
+        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + event.tokensUsed - usageBaseline });
       }
       if (event.type === 'cost') {
         stepCost += event.usd;
@@ -6303,6 +6341,7 @@ export class RunManager {
       sessionId = randomUUID();
       this.store.updateStep(runId, step.id, { sessionId, backend, sessionConfirmed: backend === 'claude' });
       resumeGuard = guardResume(false, false);
+      baselineOpen = false;
     }
     if (resumeFrom) {
       emit({ type: 'note', stepId: step.id, message: `retrying in this step's previous session — sending only the failure` });
@@ -6393,17 +6432,19 @@ export class RunManager {
         result = await session.result;
         if (sessionError) throw new Error(sessionError);
       } catch (err) {
-        // The session this step resumed was pruned by Claude (cleanupPeriodDays): rerun the step in
-        // a fresh session, as `runContinuation` does. A graph node is seeded with the task's
-        // persisted state; a retry's own prompt already carries the whole task and the failure.
+        // The session this step resumed is gone (`resumeFallbackPredicate`): rerun the step in a fresh
+        // session, as `runContinuation` does. A graph node is seeded with the task's persisted state;
+        // a retry's own prompt already carries the whole task and the failure.
         const replay = state.cancelled || this.active.get(runId) !== state ? undefined : resumeGuard.takeFallback();
         const record = this.store.getRun(runId);
         if (!replay || !resuming || !record) throw err;
         sessionError = undefined;
         turnText = '';
+        usageBaseline = 0;
+        baselineOpen = false;
         const freshId = randomUUID();
         this.store.updateStep(runId, step.id, { sessionId: freshId, backend, sessionConfirmed: backend === 'claude' });
-        emit({ type: 'note', stepId: step.id, message: MISSING_SESSION_NOTE });
+        emit({ type: 'note', stepId: step.id, message: missingSessionNote(backend) });
         const freshPrompt = resumeFrom
           ? userPrompt
           : `${freshContinuationContext(record, this.store.readEvents(runId), readHandoff(this.dataDir, runId))}\n\n---\n\n## New user instruction\n${userPrompt}`;
@@ -6414,14 +6455,14 @@ export class RunManager {
         }, {
           cancelled: () => state.cancelled || this.active.get(runId) !== state,
           sessionError: () => sessionError,
-        });
+        }, backend);
         if (sessionError) throw new Error(sessionError);
       }
       // v2 counterpart of v1's `done` (spec: the mappers leave session-close
       // events to the RunManager — only it knows how the session settled).
       sink.sessionEnded(state.cancelled ? 'cancelled' : 'end_turn');
       if (!state.cancelled && this.active.get(runId) === state) {
-        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + result.tokensUsed });
+        this.store.updateStep(runId, step.id, { tokensUsed: startTokens + result.tokensUsed - usageBaseline });
       }
       return null;
     } catch (err) {

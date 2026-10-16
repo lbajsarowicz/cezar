@@ -128,10 +128,14 @@ Notable fields (full doc-comments in the source):
   runner that declares `strictResume` reopens that id (claude `--resume`, codex
   `thread/resume`, opencode `GET /session/:id`) and fails the session when it
   is gone — never a silent fresh one — so the workflow engine may send a
-  resumed retry only the failure. A missing Claude conversation goes through
-  the engine's one missing-session fallback (`workflows/resume-fallback.ts`),
-  shared by Continue, graph nodes and retries; on codex and opencode a gone
-  session fails the step. A runner without `strictResume` (pi, whose
+  resumed retry only the failure. When a resume fails before the session shows
+  any sign of life, the engine's one fallback (`workflows/resume-fallback.ts`)
+  starts a fresh session instead. A retry (claude, codex, opencode) falls back
+  on any such error that is not a usage limit or another provider refusal.
+  Continue falls back only on a recognised missing session: a pruned Claude
+  transcript, or an opencode session that is gone (a 404, or an id that is not
+  opencode's own `ses_…` shape); a gone codex thread still fails a Continue.
+  A graph node's own `session.continue` falls back on the Claude case only. A runner without `strictResume` (pi, whose
   missing-session behavior is unverified, and cursor, whose one-shot print
   mode does not resume at all) gets retries as fresh sessions. A step records
   its id only as resumable once the PROVIDER minted it: claude pins its id at

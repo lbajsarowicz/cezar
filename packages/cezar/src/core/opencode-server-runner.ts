@@ -58,6 +58,11 @@ export const TURN_IDLE_GRACE_MS = 5_000;
 const OPENCODE_MISSING_SESSION = 'opencode no longer has session';
 
 /** A resume of a session opencode does not have (gone, or never one of its own ids). */
+/** Opencode mints `ses_…` ids; anything else is cezar's pre-assigned placeholder, never a session. */
+export function isOpencodeSessionId(id: string): boolean {
+  return id.startsWith('ses_');
+}
+
 export function isOpencodeMissingSessionError(message: string): boolean {
   return message.includes(OPENCODE_MISSING_SESSION);
 }
@@ -395,7 +400,7 @@ class OpencodeSession implements AgentSession {
       // Opencode mints its own `ses_…` ids; anything else is cezar's pre-assigned placeholder for a
       // session that died before opencode announced its id, and the real server answers it with a
       // 500 rather than a 404.
-      if (!resumeId.startsWith('ses_')) throw opencodeMissingSession(resumeId, 'not an opencode session id');
+      if (!isOpencodeSessionId(resumeId)) throw opencodeMissingSession(resumeId, 'not an opencode session id');
       let existing: Record<string, unknown>;
       try {
         existing = await this.http('GET', `/session/${encodeURIComponent(resumeId)}`, undefined);

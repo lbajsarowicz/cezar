@@ -541,14 +541,28 @@ describe('RunManager.continueRun override', () => {
 
   it('resumes a session id the provider confirmed', () => {
     const id = resumableRun();
-    store.updateStep(id, 's1', { backend: 'opencode', sessionConfirmed: true });
+    store.updateStep(id, 's1', { backend: 'opencode', sessionId: 'ses_1', sessionConfirmed: true });
     const calls: unknown[][] = [];
     (manager as unknown as { runContinuation: (...args: unknown[]) => Promise<void> }).runContinuation = async (...args) => {
       calls.push(args);
     };
 
     expect(manager.continueRun(id, { text: 'keep going', runner: 'opencode' })).toEqual({ ok: true });
-    expect(calls[0]?.[2]).toBe('sess-1');
+    expect(calls[0]?.[2]).toBe('ses_1');
+  });
+
+  it('does not resume an opencode id opencode did not mint, whatever the record says', () => {
+    // Records written before `sessionConfirmed` keep cezar's pre-assigned placeholder as if it were real.
+    const id = resumableRun();
+    store.updateStep(id, 's1', { backend: 'opencode', sessionId: '3f9a2c10-0000-4000-8000-000000000000', sessionConfirmed: true });
+    const calls: unknown[][] = [];
+    (manager as unknown as { runContinuation: (...args: unknown[]) => Promise<void> }).runContinuation = async (...args) => {
+      calls.push(args);
+    };
+
+    expect(manager.continueRun(id, { text: 'keep going', runner: 'opencode' })).toEqual({ ok: true });
+    expect(calls[0]?.[2]).toBeUndefined();
+    expect(calls[0]?.[3]).toBe('opencode');
   });
 
   it('an omitted override preserves the run current backend/model (backward compat)', () => {

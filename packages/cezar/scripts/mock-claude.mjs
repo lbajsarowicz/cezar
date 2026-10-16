@@ -156,9 +156,23 @@ async function respond(userText, imageCount) {
     process.stdout.write('', () => process.exit(1));
     return new Promise(() => {});
   }
-  // `mock:resume-mid-fail` on a `--resume` spawn → the session reopened, then the provider failed
-  // mid-turn. A real failure, never a missing conversation.
+  // `mock:resume-mystery` on a `--resume` spawn → a resume failure in a wording cezar has never seen.
+  if (resumedId && userText.includes('mock:resume-mystery')) {
+    emit({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      errors: ['resume failed: ERR_RESUME_PROTOCOL_v7'],
+      usage: { input_tokens: 0, output_tokens: 0 },
+      total_cost_usd: 0,
+    });
+    process.stdout.write('', () => process.exit(1));
+    return new Promise(() => {});
+  }
+  // `mock:resume-mid-fail` on a `--resume` spawn → the session reopened and the agent started
+  // answering, then the provider failed mid-turn. A real failure, never a missing conversation.
   if (resumedId && userText.includes('mock:resume-mid-fail')) {
+    emit({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Looking at the failing test.' }] } });
     emit({
       type: 'result',
       subtype: 'error_during_execution',

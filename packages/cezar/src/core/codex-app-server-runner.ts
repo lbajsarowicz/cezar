@@ -43,11 +43,6 @@ export interface CodexRunnerOptions {
   timeoutMs?: number;
 }
 
-/** `thread/resume` for a thread whose rollout codex no longer has on disk. */
-export function isCodexMissingThreadError(message: string): boolean {
-  return /no rollout found for thread id/i.test(message);
-}
-
 /**
  * `AgentRunner` over `codex app-server` — the same JSONL transport the VS Code
  * extension and desktop app use (JSON-RPC 2.0, newline-delimited, over

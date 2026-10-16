@@ -1,14 +1,37 @@
-import type { AgentEvent, AgentSession, ContentBlock } from '../core/agent-runner.ts';
+import type { AgentBackend, AgentEvent, AgentSession, ContentBlock } from '../core/agent-runner.ts';
 import { isClaudeMissingSessionError } from '../core/claude-cli-runner.ts';
-import { isCodexMissingThreadError } from '../core/codex-app-server-runner.ts';
 import { isOpencodeMissingSessionError } from '../core/opencode-server-runner.ts';
+import { isRuntimeProviderAuthFailure } from '../core/provider-auth.ts';
 import type { UiEvent } from '../core/ui-events.ts';
+import { isUsageLimitMessage } from '../core/usage-limit.ts';
 import { track } from '../telemetry.ts';
 
-/** The resumed backend no longer has the conversation it was asked to reopen. A retry falls back on
- *  every strict-resume backend; Continue keeps failing a gone codex/opencode session (#562). */
-export function isMissingSessionError(message: string): boolean {
-  return isClaudeMissingSessionError(message) || isCodexMissingThreadError(message) || isOpencodeMissingSessionError(message);
+/**
+ * The account or provider refused the turn, rather than the backend losing the session. A fresh
+ * session would be refused the same way, after paying for the whole prompt again.
+ */
+export function isProviderRefusalError(message: string): boolean {
+  return (
+    isUsageLimitMessage(message) ||
+    isRuntimeProviderAuthFailure(message) ||
+    /\b(?:429|529)\b|overloaded|insufficient[_-]?quota|credit\s+balance\s+(?:is\s+)?(?:too\s+low|exhausted)/i.test(message)
+  );
+}
+
+/**
+ * Which errors of a resume that never came alive mean "start over in a fresh session".
+ *
+ * A retry falls back on any such error that is not a refusal: an allowlist of missing-session
+ * wordings would dead-end a backend whose wording cezar has never seen, and a retry used to run
+ * fresh anyway. Continue reopens a session that may hold far more than the saved context carries,
+ * so it falls back only on a recognised missing session — Claude's pruned transcript, and
+ * opencode's gone session (opencode Continue always opened a fresh session before it could resume).
+ * A gone codex thread still fails a Continue.
+ */
+export function resumeFallbackPredicate(backend: AgentBackend, kind: 'retry' | 'continue'): (message: string) => boolean {
+  if (kind === 'retry') return (message) => !isProviderRefusalError(message);
+  if (backend === 'opencode') return (message) => isClaudeMissingSessionError(message) || isOpencodeMissingSessionError(message);
+  return isClaudeMissingSessionError;
 }
 
 /** v2 bookkeeping a dead resume still emits; any other v2 event is the session doing work. */
@@ -22,7 +45,7 @@ const HELD_UI_EVENTS = new Set<UiEvent['type']>([
 
 /**
  * Guards one resumed session against a conversation the backend no longer has (Claude prunes
- * transcripts after `cleanupPeriodDays`). Until the resume shows signs of life its errors and
+ * transcripts after `cleanupPeriodDays`; see `resumeFallbackPredicate` for the rest). Until the resume shows signs of life its errors and
  * turn bookkeeping are held back, and messages sent into it are remembered, so a fresh session
  * can take over without the failed attempt in the thread or the user's messages lost with it.
  * Shared by both resume sites — `runContinuation` and `runAgentStep` (AGENTS.md § construction sites).
@@ -40,6 +63,7 @@ export class ResumeFallback {
     private readonly emit: (event: AgentEvent) => void,
     /** Where a held v2 event goes once the session is proven alive or really failed. */
     private readonly emitUi: (event: UiEvent) => void,
+    /** Which held errors mean the session is gone; Claude's pruned transcript unless told otherwise. */
     private readonly isMissing: (message: string) => boolean = isClaudeMissingSessionError,
   ) {
     this.pending = resuming;
@@ -138,6 +162,11 @@ export function interruptAfterGrace(session: AgentSession | undefined): void {
 export const MISSING_SESSION_NOTE =
   "claude no longer has this conversation (its transcript was removed) — continuing in a fresh session with this task's saved context";
 
+export function missingSessionNote(backend: AgentBackend): string {
+  if (backend === 'claude') return MISSING_SESSION_NOTE;
+  return `the ${backend} session could not be reopened — continuing in a fresh session with this task's saved context`;
+}
+
 /**
  * Awaits the fresh session that replaced a pruned resume and sends `session_resume_fallback` with
  * how it ended (#1438). Shared by both resume sites so their outcomes cannot drift.
@@ -146,6 +175,7 @@ export async function trackFallbackOutcome<T>(
   /** Launches the fresh session and returns its result — inside, so a launch that throws still counts. */
   fresh: () => Promise<T>,
   ended: { cancelled: () => boolean; sessionError: () => string | undefined },
+  backend?: AgentBackend,
 ): Promise<T> {
   let threw = false;
   try {
@@ -155,6 +185,7 @@ export async function trackFallbackOutcome<T>(
     throw err;
   } finally {
     const label = ended.cancelled() ? 'cancelled' : threw || ended.sessionError() !== undefined ? 'fresh_failed' : 'recovered';
-    track('session_resume_fallback', { label });
+    // Claude's label predates the other backends' fallback and stays bare.
+    track('session_resume_fallback', { label: backend && backend !== 'claude' ? `${backend}:${label}` : label });
   }
 }
