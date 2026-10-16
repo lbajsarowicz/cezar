@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -314,6 +314,36 @@ describe('a resumed session keeps its workflow step tools', () => {
     expect(spec.additionalDirectories ?? []).not.toContain(join(repoRoot, '.ai/skills/demo-dir'));
     expect(spec.additionalDirectories ?? []).not.toContain(join(repoRoot, '.ai/skills'));
     await settled(id);
+  });
+
+  it('names the provisioned skill path instead of the body, on the opening spawn and on Continue', async () => {
+    mkdirSync(join(repoRoot, '.ai/skills/demo-dir'), { recursive: true });
+    writeFileSync(join(repoRoot, '.ai/skills/demo-dir/SKILL.md'), '---\nname: demo-dir\n---\nDirectory skill body.\n');
+    const def: WorkflowDef = {
+      name: 'skilled-task',
+      source: 'file',
+      steps: [{ id: 'work', name: 'Work', prompt: '{{task}}', skill: 'demo-dir' }],
+    };
+    const record = manager!.startRun(def, { task: 'do the thing', worktree: true, runner: 'claude' });
+    const opening = await specAt(0);
+    const wt = store.getRun(record.id)!.worktreePath!;
+    const file = join(wt, '.claude/skills/demo-dir/SKILL.md');
+    expect(opening.cwd).toBe(wt);
+    expect(opening.systemPrompt).toContain(`Skill file: ${file}`);
+    expect(opening.systemPrompt).not.toContain('Directory skill body.');
+    await settled(record.id);
+
+    // A reclaimed worktree comes back without the provisioned entries; Continue reinstalls them.
+    for (const dir of ['.claude/skills', '.agents/skills']) rmSync(join(wt, dir), { recursive: true, force: true });
+    expect(manager!.continueRun(record.id, { text: '/demo-dir once more', runner: 'claude' })).toEqual({ ok: true });
+    const resumed = await specAt(1);
+    expect(resumed.userPrompt).toContain(`Skill file: ${file}`);
+    expect(resumed.userPrompt).not.toContain('Directory skill body.');
+    expect(existsSync(file)).toBe(true);
+    await expect
+      .poll(() => store.getRun(record.id)?.steps.find((s) => s.id === 'continue-1')?.status, { timeout: 15_000 })
+      .toSatisfy((status) => ['done', 'failed', 'cancelled'].includes(String(status)));
+    await settled(record.id);
   });
 
   it('the usage-limit auto-resume keeps the step tools too', async () => {

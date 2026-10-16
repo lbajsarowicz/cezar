@@ -5,13 +5,26 @@
 ## TLDR
 
 A task that selects a directory skill (`<name>/SKILL.md`) no longer carries the skill's whole
-Markdown body in its prompt. Cezar copies the project's discovered skills into the task's worktree,
-where each agent CLI discovers them natively, and the prompt carries the skill's name, description,
+Markdown body in its prompt. The skill is provisioned into the task's worktree,
+where each agent CLI discovers it natively, and the prompt carries the skill's name, description,
 file path and one instruction: load it with your skill tool or read the file. Single-file skills,
 and backends whose native skill loading is unverified, keep the inlined body. A task that starts
 with `/skill` while its step already selects that skill no longer receives the body twice. Skill
 discovery is memoized in-process, and the team-skill cache refreshes on its documented six-hour
 TTL instead of never.
+
+## Placement comes from `skills-provision.ts`
+
+The worktree copy described in the sections below did not ship. #1429 added `provisionSkills`
+(`packages/cezar/src/skills-provision.ts`), which installs the selected skill and every catalog
+skill it names into the run's `.claude/skills` and `.agents/skills` on fresh runs, continuations and
+live `/skill` messages. It links each skill directory (falling back to a junction, then a copy), and a
+self-ignoring `.gitignore` keeps the entries out of git. This spec keeps only the delivery half on
+top of it: `skillDelivery` names the provisioned `SKILL.md` when its contents equal the selected
+skill's source file (a tracked or user-owned entry under the same name never matches), a team skill
+when its materialized copy declares the skill's name, and an in-place run's own installed `SKILL.md`.
+A Continue also re-provisions the owning step's skill, because the resumed session's system prompt
+names that path and a reclaimed worktree is re-created without it.
 
 ## Why this shape
 

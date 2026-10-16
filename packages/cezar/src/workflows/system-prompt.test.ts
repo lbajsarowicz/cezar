@@ -91,6 +91,10 @@ describe('skill-aware task naming (#432)', () => {
     // A bare number without a skill stays bare — no `469: 469`.
     expect(makeRunTitle('469', workflow)).toBe('469');
     expect(makeRunTitle('#469', workflow)).toBe('#469');
+    // An attachment-only task (telemetry 18c930de) is named after its attachments.
+    expect(makeRunTitle('', workflow, 1)).toBe('Task from 1 attachment');
+    expect(makeRunTitle('', workflow, 2)).toBe('Task from 2 attachments');
+    expect(makeRunTitle('', workflow)).toBe('(untitled task)');
   });
 });
 
@@ -461,26 +465,28 @@ describe('systemPrompt end-to-end (dry run)', () => {
     expect(named?.titleSummary).toBe('432: implementing cr fixes');
     expect(named?.titleOrigin).toBe('auto');
 
-    // This repo does not ignore its skill dirs, so nothing is copied into the worktree and the
-    // skill's source dir sits outside it: the body goes inline rather than name a path a
-    // `--add-dir` grant (read+write) would be needed to reach.
-    const skillFile = join(repoRoot, '.ai/skills/om-auto-review-pr/SKILL.md');
-    const skillPrompt = skillSystemPrompt({
-      name: 'om-auto-review-pr',
-      description: SKILL_DESCRIPTION,
-      body: SKILL_BODY,
-      path: skillFile,
-      source: 'ai',
-    });
+    // The skill is provisioned into the run's worktree, so the prompt names that copy
+    // instead of carrying the body.
+    const worktreePath = record?.worktreePath;
+    if (!worktreePath) throw new Error('run did not create its worktree');
+    const skillPrompt = skillSystemPrompt(
+      {
+        name: 'om-auto-review-pr',
+        description: SKILL_DESCRIPTION,
+        body: SKILL_BODY,
+        path: join(repoRoot, '.ai/skills/om-auto-review-pr/SKILL.md'),
+        source: 'ai',
+      },
+      { mode: 'path', file: join(worktreePath, '.claude/skills/om-auto-review-pr/SKILL.md') },
+    );
     expect(capturedSystemPrompt()).toBe(
       composeSystemPrompt(skillPrompt, CONFIG_PROMPT, HANDOFF_INSTRUCTIONS),
     );
+    expect(capturedSystemPrompt()).not.toContain(SKILL_BODY);
 
     // The mock writes the actual first user message it received into the run
     // worktree, proving the argument is still the runner's user prompt rather
     // than being swallowed by title construction.
-    const worktreePath = record?.worktreePath;
-    if (!worktreePath) throw new Error('run did not create its worktree');
     expect(readFileSync(join(worktreePath, 'notes.md'), 'utf8')).toContain(': 432\n');
   }, 30_000);
 

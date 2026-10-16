@@ -6,10 +6,12 @@ import type { ContentBlock } from '../core/agent-runner.ts';
 import {
   expandRegistrySlashSkill,
   expandRegistrySlashSkillText,
+  isUnknownSkillFailure,
   skillDelivery,
   skillSystemPrompt,
 } from './run.ts';
 import { DEFAULT_ALLOWED_TOOLS } from './types.ts';
+import { provisionSkills } from '../skills-provision.ts';
 
 describe('skillSystemPrompt — installed-path hint for worktree agents', () => {
   const base = { name: 'om-code-review', description: 'Review a diff.', body: 'Do the review.' };
@@ -163,15 +165,11 @@ describe('skillDelivery — which skills travel as a path', () => {
     expect(skillDelivery(dirSkill, 'claude', cwd)).toEqual({ mode: 'inline' });
   });
 
-  it('never names a same-named worktree copy whose files differ from the selected skill', () => {
+  it('never names a same-named worktree entry whose SKILL.md differs from the selected skill', () => {
     // A tracked `.agents/skills/<name>` that discovery shadowed with a higher-precedence source.
     const shadowed = cwdWith('.agents/skills');
     writeFileSync(join(shadowed, '.agents/skills/om-code-review/SKILL.md'), '---\nname: om-code-review\n---\nshadowed\n');
     expect(skillDelivery(dirSkill, 'claude', shadowed)).toEqual({ mode: 'inline' });
-    // A copy an earlier step added a file to.
-    const extended = cwdWith('.claude/skills');
-    writeFileSync(join(extended, '.claude/skills/om-code-review/extra.md'), 'do something else\n');
-    expect(skillDelivery(dirSkill, 'claude', extended)).toEqual({ mode: 'inline' });
     // A copy whose source is gone cannot be verified.
     const orphan = { ...dirSkill, path: join(main, '.ai/skills/missing/SKILL.md') };
     expect(skillDelivery(orphan, 'claude', cwdWith('.agents/skills'))).toEqual({ mode: 'inline' });
@@ -226,6 +224,17 @@ describe('skillDelivery — which skills travel as a path', () => {
       file: join(cwd, '.claude/skills/team-skill/SKILL.md'),
     });
     expect(skillDelivery(team, 'claude', cwdWith())).toEqual({ mode: 'inline' });
+  });
+
+  it('names the entry provisionSkills installed in the worktree', async () => {
+    const cwd = cwdWith();
+    const skill = { ...dirSkill, description: 'Review a diff.', body: 'body' };
+    expect(await provisionSkills(cwd, [skill], [skill])).toEqual(['om-code-review']);
+    expect(skillDelivery(dirSkill, 'claude', cwd)).toEqual({
+      mode: 'path',
+      file: join(cwd, '.claude/skills/om-code-review/SKILL.md'),
+    });
+    expect(skillDelivery(dirSkill, 'codex', cwd).mode).toBe('path');
   });
 });
 
@@ -301,5 +310,20 @@ describe('expandRegistrySlashSkillText — step skill dedupe and backend-aware d
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+});
+
+describe('isUnknownSkillFailure — the skill_missing_in_session signal', () => {
+  const tool = (name: string, status: 'failed' | 'completed', error: string) =>
+    ({ type: 'item.completed', item: { kind: 'tool', id: 't1', name, toolKind: 'other', title: name, status, error } }) as const;
+
+  it("matches Claude's Skill tool refusing an uninstalled skill", () => {
+    expect(isUnknownSkillFailure(tool('Skill', 'failed', '<tool_use_error>Unknown skill: om-auto-review-pr</tool_use_error>'))).toBe(true);
+  });
+
+  it('ignores the phrase from any other tool, and a Skill call that succeeded', () => {
+    expect(isUnknownSkillFailure(tool('Bash', 'failed', 'expected "Unknown skill: x"'))).toBe(false);
+    expect(isUnknownSkillFailure(tool('Skill', 'completed', 'Unknown skill: x'))).toBe(false);
+    expect(isUnknownSkillFailure(tool('Skill', 'failed', 'permission denied'))).toBe(false);
   });
 });
