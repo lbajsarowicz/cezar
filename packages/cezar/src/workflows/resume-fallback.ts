@@ -1,7 +1,15 @@
 import type { AgentEvent, AgentSession, ContentBlock } from '../core/agent-runner.ts';
 import { isClaudeMissingSessionError } from '../core/claude-cli-runner.ts';
+import { isCodexMissingThreadError } from '../core/codex-app-server-runner.ts';
+import { isOpencodeMissingSessionError } from '../core/opencode-server-runner.ts';
 import type { UiEvent } from '../core/ui-events.ts';
 import { track } from '../telemetry.ts';
+
+/** The resumed backend no longer has the conversation it was asked to reopen. A retry falls back on
+ *  every strict-resume backend; Continue keeps failing a gone codex/opencode session (#562). */
+export function isMissingSessionError(message: string): boolean {
+  return isClaudeMissingSessionError(message) || isCodexMissingThreadError(message) || isOpencodeMissingSessionError(message);
+}
 
 /** v2 bookkeeping a dead resume still emits; any other v2 event is the session doing work. */
 const HELD_UI_EVENTS = new Set<UiEvent['type']>([
@@ -32,6 +40,7 @@ export class ResumeFallback {
     private readonly emit: (event: AgentEvent) => void,
     /** Where a held v2 event goes once the session is proven alive or really failed. */
     private readonly emitUi: (event: UiEvent) => void,
+    private readonly isMissing: (message: string) => boolean = isClaudeMissingSessionError,
   ) {
     this.pending = resuming;
   }
@@ -40,7 +49,7 @@ export class ResumeFallback {
   hold(event: AgentEvent): boolean {
     if (!this.pending) return false;
     if (event.type === 'error') {
-      if (isClaudeMissingSessionError(event.message)) this.missing = true;
+      if (this.isMissing(event.message)) this.missing = true;
       this.held.push(event);
       return true;
     }

@@ -55,6 +55,17 @@ export const KILL_GRACE_MS = 4_000;
  */
 export const TURN_IDLE_GRACE_MS = 5_000;
 
+const OPENCODE_MISSING_SESSION = 'opencode no longer has session';
+
+/** A resume of a session opencode does not have (gone, or never one of its own ids). */
+export function isOpencodeMissingSessionError(message: string): boolean {
+  return message.includes(OPENCODE_MISSING_SESSION);
+}
+
+function opencodeMissingSession(sessionId: string, detail: string): Error {
+  return new Error(`${OPENCODE_MISSING_SESSION} ${sessionId} (${detail})`);
+}
+
 /**
  * `AgentRunner` over `opencode serve` — a headless HTTP server (the same one
  * the opencode TUI talks to) with an SSE event stream. One server per session,
@@ -384,9 +395,16 @@ class OpencodeSession implements AgentSession {
       // Opencode mints its own `ses_…` ids; anything else is cezar's pre-assigned placeholder for a
       // session that died before opencode announced its id, and the real server answers it with a
       // 500 rather than a 404.
-      if (!resumeId.startsWith('ses_')) throw new Error(`opencode cannot resume non-session id ${resumeId}`);
-      const existing = await this.http('GET', `/session/${encodeURIComponent(resumeId)}`, undefined);
-      if (stringField(existing, 'id') !== resumeId) throw new Error(`opencode could not reopen session ${resumeId}`);
+      if (!resumeId.startsWith('ses_')) throw opencodeMissingSession(resumeId, 'not an opencode session id');
+      let existing: Record<string, unknown>;
+      try {
+        existing = await this.http('GET', `/session/${encodeURIComponent(resumeId)}`, undefined);
+      } catch (err) {
+        // Only a 404 says the session is gone; a 5xx or a transport drop is no evidence of it.
+        if (err instanceof OpencodeHttpError && err.status === 404) throw opencodeMissingSession(resumeId, err.message);
+        throw err;
+      }
+      if (stringField(existing, 'id') !== resumeId) throw opencodeMissingSession(resumeId, 'the server returned another session');
       sessionId = resumeId;
       resumed = true;
     }

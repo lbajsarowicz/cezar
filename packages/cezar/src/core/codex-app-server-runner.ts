@@ -43,6 +43,11 @@ export interface CodexRunnerOptions {
   timeoutMs?: number;
 }
 
+/** `thread/resume` for a thread whose rollout codex no longer has on disk. */
+export function isCodexMissingThreadError(message: string): boolean {
+  return /no rollout found for thread id/i.test(message);
+}
+
 /**
  * `AgentRunner` over `codex app-server` — the same JSONL transport the VS Code
  * extension and desktop app use (JSON-RPC 2.0, newline-delimited, over
@@ -426,7 +431,14 @@ class CodexSession implements AgentSession {
     };
     const resumed = Boolean(this.spec.resume && this.spec.sessionId);
     if (resumed) {
-      await this.rpc.request('thread/resume', { threadId: this.spec.sessionId, ...clean(overrides) });
+      try {
+        await this.rpc.request('thread/resume', { threadId: this.spec.sessionId, ...clean(overrides) });
+      } catch (err) {
+        // A bootstrap rejection otherwise reaches the engine only as a thrown result; the error event
+        // is what lets a resume of a gone thread fall back to a fresh session.
+        this.emit({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+        throw err;
+      }
       this.threadId = this.spec.sessionId;
     } else {
       const res = await this.rpc.request('thread/start', clean(overrides));

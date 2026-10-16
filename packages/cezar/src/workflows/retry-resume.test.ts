@@ -16,6 +16,7 @@ const run = promisify(execFile);
 const GIT_ID = ['-c', 'user.name=test', '-c', 'user.email=test@local'];
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MOCK_CODEX = join(HERE, '..', 'core', '__fixtures__', 'codex', 'mock-codex-app-server.mjs');
+const MOCK_OPENCODE = join(HERE, '..', 'core', '__fixtures__', 'opencode', 'mock-opencode-serve.mjs');
 const TASK = 'make the verify check pass';
 
 /** The check fails on its first run and passes on every later one. */
@@ -47,7 +48,8 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     setEnv('CEZ_AUTONAME', '0');
     setEnv('MOCK_CODEX_TURNS_FILE', turnsFile);
     setEnv('CEZ_MOCK_MISSING_SESSIONS', undefined);
-    setEnv('CEZ_ENV_PASSTHROUGH', 'MOCK_CODEX_TURNS_FILE');
+    setEnv('MOCK_CODEX_REJECT_RESUME', undefined);
+    setEnv('CEZ_ENV_PASSTHROUGH', 'MOCK_CODEX_TURNS_FILE,MOCK_CODEX_REJECT_RESUME');
     await run('git', ['init', '-q', '-b', 'main'], { cwd: repoRoot });
     writeFileSync(join(repoRoot, '.gitignore'), '.verified\n');
     await run('git', ['add', '-A'], { cwd: repoRoot });
@@ -68,8 +70,8 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     rmSync(turnsFile, { force: true });
   });
 
-  async function runToEnd(): Promise<string> {
-    const record = manager.startRun(WORKFLOW, { task: TASK, runner: 'codex', worktree: false });
+  async function runToEnd(runner: 'codex' | 'opencode' = 'codex'): Promise<string> {
+    const record = manager.startRun(WORKFLOW, { task: TASK, runner, worktree: false });
     const terminal = new Set(['done', 'review', 'failed', 'cancelled']);
     const deadline = Date.now() + 25_000;
     while (!terminal.has(store.getRun(record.id)?.status ?? '')) {
@@ -99,6 +101,56 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     expect(retry).not.toContain('## Handoff (cezar)');
     expect(store.getRun(id)?.steps.find((s) => s.id === 'implement')?.sessionId).toBe('th_mock_1');
     expect(store.readEvents(id).some((e) => e.type === 'note' && String(e.message).includes("previous session — sending only the failure"))).toBe(true);
+  }, 30_000);
+
+  it('falls back to a fresh session carrying the whole task when codex no longer has the thread', async () => {
+    setEnv('MOCK_CODEX_REJECT_RESUME', '1');
+    const id = await runToEnd();
+    expect(store.getRun(id)?.steps.map((s) => [s.id, s.status])).toEqual([
+      ['implement', 'done'],
+      ['verify', 'done'],
+    ]);
+
+    // The rejected resume never starts a turn: the first attempt, then the fresh fallback.
+    const all = turns();
+    expect(all).toHaveLength(2);
+    expect(all[1]).toContain(TASK);
+    expect(all[1]).toContain('## Handoff (cezar)');
+    expect(all[1]).toContain('1 test failed');
+    expect(store.readEvents(id).some((e) => e.type === 'note' && e.message === MISSING_SESSION_NOTE)).toBe(true);
+    expect(store.readEvents(id).some((e) => e.type === 'error' && e.stepId === 'implement')).toBe(false);
+  }, 30_000);
+
+  it('keeps the run token totals when the codex resume falls back', async () => {
+    setEnv('MOCK_CODEX_REJECT_RESUME', '1');
+    const id = await runToEnd();
+    const record = store.getRun(id);
+    const step = record?.steps.find((s) => s.id === 'implement');
+    expect(step?.usageInvocationsStarted).toBe(step?.usageInvocationsObserved);
+    expect(record?.inputTokens).toBe(2400);
+    expect(record?.outputTokens).toBe(600);
+  }, 30_000);
+
+  it('falls back to a fresh session when opencode answers the resume with a 404', async () => {
+    const promptsFile = join(repoRoot, '..', `${basename(repoRoot)}-opencode-prompts.ndjson`);
+    setEnv('CEZ_OPENCODE_BIN', MOCK_OPENCODE);
+    setEnv('MOCK_OPENCODE_PROMPTS_FILE', promptsFile);
+    setEnv('MOCK_OPENCODE_SESSIONS_GONE', '1');
+    setEnv('CEZ_ENV_PASSTHROUGH', 'MOCK_OPENCODE_PROMPTS_FILE,MOCK_OPENCODE_SESSIONS_GONE');
+    try {
+      const id = await runToEnd('opencode');
+      expect(store.getRun(id)?.steps.map((s) => [s.id, s.status])).toEqual([
+        ['implement', 'done'],
+        ['verify', 'done'],
+      ]);
+      const prompts = readFileSync(promptsFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string);
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain(TASK);
+      expect(prompts[1]).toContain('1 test failed');
+      expect(store.readEvents(id).some((e) => e.type === 'note' && e.message === MISSING_SESSION_NOTE)).toBe(true);
+    } finally {
+      rmSync(promptsFile, { force: true });
+    }
   }, 30_000);
 
   it('does not resume a strict backend under a different account', async () => {

@@ -25,6 +25,7 @@
 // server reopening a stored session; any other id is a 404. With
 // `MOCK_OPENCODE_PROMPTS_FILE=<path>` every prompt text is appended (one JSON
 // string per line) so a test can assert exactly what reached the session.
+// `MOCK_OPENCODE_SESSIONS_GONE=1` answers every session lookup with a 404.
 import { appendFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
@@ -91,7 +92,7 @@ const server = createServer((req, res) => {
         // the conversation with a fresh one.
         res.writeHead(500, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ name: 'InternalServerError', data: { message: 'storage unavailable' } }));
-      } else if (id === SESSION_ID) {
+      } else if (id === SESSION_ID && process.env.MOCK_OPENCODE_SESSIONS_GONE !== '1') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ id: SESSION_ID, title: 'cezar task' }));
       } else if (id.startsWith('ses_')) {

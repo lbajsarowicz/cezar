@@ -14,7 +14,7 @@ import {
   type AskRequest,
 } from '../core/ask.ts';
 import { AUTO_END_DELAY_MS, type AgentSession } from '../core/claude-cli-runner.ts';
-import { interruptAfterGrace, MISSING_SESSION_NOTE, ResumeFallback, trackFallbackOutcome } from './resume-fallback.ts';
+import { interruptAfterGrace, isMissingSessionError, MISSING_SESSION_NOTE, ResumeFallback, trackFallbackOutcome } from './resume-fallback.ts';
 import {
   loadPrivateMcp,
   PRIVATE_MCP_FILE,
@@ -5993,12 +5993,13 @@ export class RunManager {
     let turnText = '';
     let sessionError: string | undefined;
     const sink = this.makeUiSink(runId, step.id);
-    const guardResume = (resuming: boolean) => new ResumeFallback(
+    const guardResume = (resuming: boolean, retry: boolean) => new ResumeFallback(
       resuming,
       (event) => emit({ ...event, stepId: step.id }),
       (event) => this.handleRunnerUiEvent(runId, state, sink, event),
+      retry ? isMissingSessionError : undefined,
     );
-    let resumeGuard = guardResume(resumeFrom !== undefined || graphHooks?.resumeSessionId !== undefined);
+    let resumeGuard = guardResume(resumeFrom !== undefined || graphHooks?.resumeSessionId !== undefined, resumeFrom !== undefined);
     const onEvent = (event: AgentEvent) => {
       if (state.cancelled || this.active.get(runId) !== state) return;
       if (resumeGuard.hold(event)) {
@@ -6301,7 +6302,7 @@ export class RunManager {
       resumeFrom = undefined;
       sessionId = randomUUID();
       this.store.updateStep(runId, step.id, { sessionId, backend, sessionConfirmed: backend === 'claude' });
-      resumeGuard = guardResume(false);
+      resumeGuard = guardResume(false, false);
     }
     if (resumeFrom) {
       emit({ type: 'note', stepId: step.id, message: `retrying in this step's previous session — sending only the failure` });
