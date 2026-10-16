@@ -702,6 +702,55 @@ describe('global tasks page', () => {
     expect(chip.getAttribute('href')).toBe('https://github.com/acme/api/pull/5127')
   })
 
+  it('paints no issue chip for a number another repo demonstrably owns (#819)', async () => {
+    // The reported record, on the surface that has a repo for every row: the auto-namer seeded
+    // `issueNumber` from a transcript working on open-mercato, so rebuilding it against this
+    // project's repo would link `acme/api/issues/4143` — a confident 404. The candidate carrying
+    // 4143 under another repo is the proof, and no chip beats a wrong chip.
+    stubFetch({
+      runs: [
+        {
+          ...RUNS[0]!,
+          pullRequestUrl: undefined,
+          referencedPullRequestUrl: undefined,
+          referencedIssueUrl: undefined,
+          markerRefs: undefined,
+          issueNumber: 4143,
+          referencedIssueCandidates: ['https://github.com/open-mercato/open-mercato/issues/4143'],
+        },
+      ],
+    })
+    renderPage()
+    await screen.findByText('Add checkout endpoint')
+
+    expect(document.querySelector('[data-slot="issue-chip"]')).toBeNull()
+    expect(screen.queryByText(/4143/)).toBeNull()
+  })
+
+  it('paints no PR chip for a number another repo demonstrably owns (#854)', async () => {
+    // Same record, PR half: an `om-auto-fix-pr` task driving open-mercato's #1977 from inside the
+    // cezar project seeds that number here, and this is the surface that has a repo for every row
+    // — so without the guard it is the one that would link `acme/api/pull/1977` and 404.
+    stubFetch({
+      runs: [
+        {
+          ...RUNS[0]!,
+          pullRequestUrl: undefined,
+          referencedPullRequestUrl: undefined,
+          referencedIssueUrl: undefined,
+          markerRefs: undefined,
+          prNumber: 1977,
+          referencedPrCandidates: ['https://github.com/open-mercato/open-mercato/pull/1977'],
+        },
+      ],
+    })
+    renderPage()
+    await screen.findByText('Add checkout endpoint')
+
+    expect(document.querySelector('[data-slot="pr-chip"]')).toBeNull()
+    expect(screen.queryByText(/1977/)).toBeNull()
+  })
+
   it('leaves a number-only reference inert when its project has no known repo', async () => {
     // Inert text beats a link that goes somewhere invented.
     stubFetch({
@@ -1031,7 +1080,7 @@ describe('global tasks page', () => {
       expect(sent.find((request) => request.method === 'POST')).toEqual({
         method: 'POST',
         path: '/api/v1/p/infra/runs/i1/archive',
-        body: { archived: true },
+        body: { archived: true, surface: 'all_tasks' },
       }),
     )
     await waitFor(() => expect(rowIds()).toEqual(['a1', 'w1']))
@@ -1047,7 +1096,7 @@ describe('global tasks page', () => {
 
     fireEvent.click(document.querySelector<HTMLButtonElement>('[data-action="unarchive-run"]')!)
     await waitFor(() =>
-      expect(sent.find((request) => request.method === 'POST')?.body).toEqual({ archived: false }),
+      expect(sent.find((request) => request.method === 'POST')?.body).toEqual({ archived: false, surface: 'all_tasks' }),
     )
     await waitFor(() => expect(rowIds()).toEqual([]))
   })

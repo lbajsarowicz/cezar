@@ -27,7 +27,7 @@ import { Link, useNavigate } from '@/lib/project-router'
 
 import { archiveFinished, markAllRunsSeen, patchRun } from '@/api/client'
 import { useRunUsage } from '@/api/global-events'
-import { queryKeys, useHealth, usePinRun, useReferenceProjectId, useRuns, writePatchedRunToCaches } from '@/api/queries'
+import { queryKeys, useHealth, usePinRun, useReferenceProjectId, useRepo, useRuns, writePatchedRunToCaches } from '@/api/queries'
 import type { RunRecord } from '@open-mercato/cezar-api-client'
 import { CenteredState } from '@/components/centered-state'
 import { DiffStatLabel } from '@/components/diff-stat'
@@ -43,6 +43,7 @@ import { Segmented } from '@/components/segmented'
 import { StatusDot } from '@/components/status-dot'
 import { SubtaskToggle } from '@/components/subtask-toggle'
 import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import { toast } from '@/components/ui/toaster'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { UnreadMarker } from '@/components/unread-marker'
@@ -68,7 +69,7 @@ import {
   type TaskFacetId,
   type TaskTableFilters,
 } from '@/lib/task-filters'
-import { listCounts, queuePositions, runTitle, sortRuns, type ListView } from '@/lib/task-groups'
+import { listCounts, queuePositions, runTitle, sortRuns, taskSections, type ListView } from '@/lib/task-groups'
 import { TASK_ORIGIN_OPTIONS, useTaskOrigin, type TaskOrigin } from '@/lib/task-origin'
 import { dispatchKindLabel, subtaskLabel, taskTreeRows } from '@/lib/task-tree'
 import {
@@ -124,6 +125,7 @@ export function TasksOverview({
   origin = 'all',
   onOriginChange = () => undefined,
   automationNames,
+  gitRepo = true,
 }: {
   /** Undefined while `/api/runs` has not answered: the header renders, the body stays empty —
    *  an empty state before we know there are no runs would be a lie. */
@@ -145,6 +147,10 @@ export function TasksOverview({
   /** Presentation capability; defaults visible for older health responses and direct renders. */
   showTokens?: boolean
   showCost?: boolean
+  /** Whether this project is a git repository. In-place runs of a non-git project never get a
+   *  branch, so the forking skeleton must not wait for one (review finding on
+   *  spec 2026-10-11-branch-naming-instructions). Defaults to true for direct renders. */
+  gitRepo?: boolean
   /** Workspace-global desktop column choices; absent ids use registry defaults. */
   expandedColumns?: NormalizedExpandedColumns
   onToggleColumn?: (id: TaskColumnId) => void
@@ -198,9 +204,28 @@ export function TasksOverview({
   // and the cards are the same rows at two widths, and a tree that disagreed between them would
   // be two trees — which is also why the accordion state feeds the derivation here rather than
   // either layout hiding rows on its own.
-  const rows = React.useMemo(
-    () => taskTreeRows(visible, isSubtasksExpanded),
-    [visible, isSubtasksExpanded],
+  // Pinned rows get their own section (#935), divided by a header row rather than a second table
+  // so the columns stay one set. Each section builds its own tree — the sidebar's per-bucket rule:
+  // a child pinned apart from its parent is a root of its section, not hidden under an unpinned one.
+  const sections = React.useMemo(
+    () =>
+      taskSections(visible, view).map((section) => ({
+        ...section,
+        rows: taskTreeRows(section.runs, isSubtasksExpanded),
+        // Tasks, not rows: a folded parent's subtasks are not on screen, so they are not counted.
+        taskCount: taskTreeRows(section.runs, () => false).length,
+      })),
+    [visible, view, isSubtasksExpanded],
+  )
+  // Section headers and task rows as one flat list: the table window and the card list both count
+  // and slice it, so a header scrolls out of the DOM with the rows around it.
+  const items = React.useMemo(
+    () =>
+      sections.flatMap((section) => [
+        ...(section.label ? [{ kind: 'section' as const, section }] : []),
+        ...section.rows.map((node) => ({ kind: 'row' as const, node })),
+      ]),
+    [sections],
   )
   // Positions come from the full list, never the filtered one: a search must not renumber the
   // queue the engine is actually going to drain.
@@ -212,7 +237,7 @@ export function TasksOverview({
     [showTokens, showCost],
   )
   const unread = React.useMemo(() => unreadDoneCount(all), [all])
-  const tableWindow = useWindowedRows<HTMLTableSectionElement>(rows.length)
+  const tableWindow = useWindowedRows<HTMLTableSectionElement>(items.length)
   // The archived view withholds the pin, the same call `runActionFlags` makes for the thread
   // header (`pin: !run.archived`): `sortRuns` skips the pin comparator there and `bucketOf`
   // answers `Archived` before it ever reads `run.pinned`, so the button would be an action with
@@ -344,17 +369,34 @@ export function TasksOverview({
                   </thead>
                   <tbody ref={tableWindow.anchorRef} className="[&>tr:last-child>td]:border-b-0">
                     <RowSpacer height={tableWindow.padTop} colSpan={columns.length} />
-                    {rows.slice(tableWindow.start, tableWindow.end).map((node, index) => (
+                    {items.slice(tableWindow.start, tableWindow.end).map((item, index) =>
+                      item.kind === 'section' ? (
+                        <tr
+                          key={`section-${item.section.key}`}
+                          data-slot="tasks-section"
+                          data-section={item.section.key}
+                          aria-rowindex={tableWindow.ariaRowIndex(tableWindow.start + index)}
+                        >
+                          <th
+                            scope="rowgroup"
+                            colSpan={columns.length}
+                            className={cn(SECTION_LABEL_CLASS, 'border-b border-border bg-muted/40 px-3.5 py-1.5 text-left')}
+                          >
+                            {item.section.label} · {item.section.taskCount}
+                          </th>
+                        </tr>
+                      ) : (
                       <TableRow
-                        key={node.run.id}
+                        key={item.node.run.id}
                         ariaRowIndex={tableWindow.ariaRowIndex(tableWindow.start + index)}
-                        run={node.run}
-                        depth={node.depth}
-                        childCount={node.childCount}
-                        subtasksExpanded={isSubtasksExpanded(node.run.id)}
+                        gitRepo={gitRepo}
+                        run={item.node.run}
+                        depth={item.node.depth}
+                        childCount={item.node.childCount}
+                        subtasksExpanded={isSubtasksExpanded(item.node.run.id)}
                         onToggleSubtasks={toggleSubtasks}
                         queuePosition={
-                          node.run.status === 'queued' ? (positions.get(node.run.id) ?? null) : null
+                          item.node.run.status === 'queued' ? (positions.get(item.node.run.id) ?? null) : null
                         }
                         onRename={onRename}
                         onTogglePin={pinToggle}
@@ -370,20 +412,31 @@ export function TasksOverview({
 
             {/* <md: the same runs as stacked cards. */}
             <TaskCardList
-              cards={rows.map((node) => (
+              cards={items.map((item) =>
+                item.kind === 'section' ? (
+                  <h2
+                    key={`section-${item.section.key}`}
+                    data-slot="tasks-section"
+                    data-section={item.section.key}
+                    className={cn(SECTION_LABEL_CLASS, 'px-1 pt-1')}
+                  >
+                    {item.section.label} · {item.section.taskCount}
+                  </h2>
+                ) : (
                 <TaskCard
-                  key={node.run.id}
-                  run={node.run}
-                  depth={node.depth}
-                  childCount={node.childCount}
-                  subtasksExpanded={isSubtasksExpanded(node.run.id)}
+                  key={item.node.run.id}
+                  run={item.node.run}
+                  depth={item.node.depth}
+                  childCount={item.node.childCount}
+                  subtasksExpanded={isSubtasksExpanded(item.node.run.id)}
                   onToggleSubtasks={toggleSubtasks}
                   queuePosition={
-                    node.run.status === 'queued' ? (positions.get(node.run.id) ?? null) : null
+                    item.node.run.status === 'queued' ? (positions.get(item.node.run.id) ?? null) : null
                   }
                   showTokens={showTokens}
                   showCost={showCost}
                   onTogglePin={pinToggle}
+                  gitRepo={gitRepo}
                 />
               ))}
             />
@@ -836,6 +889,9 @@ function TaskColumnIconView({ icon }: { icon?: TaskColumnIcon }) {
   }
 }
 
+/** A section header's label — the sidebar's bucket header, so `Pinned` reads the same in both. */
+const SECTION_LABEL_CLASS = 'text-[11px] font-semibold tracking-[0.04em] text-soft-foreground uppercase'
+
 const TD_BASE = 'h-11 border-b border-border px-2.5 whitespace-nowrap first:pl-4 last:pr-4'
 
 /**
@@ -848,6 +904,7 @@ const TD_BASE = 'h-11 border-b border-border px-2.5 whitespace-nowrap first:pl-4
  */
 const TableRow = React.memo(function TableRow({
   ariaRowIndex,
+  gitRepo,
   run,
   depth,
   childCount,
@@ -873,6 +930,7 @@ const TableRow = React.memo(function TableRow({
   onTogglePin?: (run: RunRecord, pinned: boolean) => void
   columns: readonly TaskColumnDefinition[]
   expandedColumns: NormalizedExpandedColumns
+  gitRepo: boolean
 }) {
   const navigate = useNavigate()
   const attention = deriveAttention(run)
@@ -925,6 +983,7 @@ const TableRow = React.memo(function TableRow({
         return (
           <TaskTableCell
             key={column.id}
+            gitRepo={gitRepo}
             column={column}
             expanded={isColumnExpanded(column.id, expandedColumns)}
             run={run}
@@ -947,6 +1006,7 @@ const TableRow = React.memo(function TableRow({
 })
 
 function TaskTableCell({
+  gitRepo,
   column,
   expanded,
   run,
@@ -976,6 +1036,7 @@ function TaskTableCell({
   to: string
   onRename: (id: string, title: string) => void
   onTogglePin?: (run: RunRecord, pinned: boolean) => void
+  gitRepo: boolean
 }) {
   if (!expanded) return <FoldedTd column={column.id} />
 
@@ -1015,7 +1076,7 @@ function TaskTableCell({
     case 'branch':
       return (
         <td data-column-id={column.id} className={TD_BASE}>
-          {run.branch ? <BranchChip branch={run.branch} /> : <Dash />}
+          {run.branch ? <BranchChip branch={run.branch} /> : branchPending(run, gitRepo) ? <BranchSkeleton /> : <Dash />}
         </td>
       )
     case 'diff':
@@ -1173,8 +1234,7 @@ function TitleCell({
         <PencilIcon className="size-3" aria-hidden="true" />
       </button>
       {/* The pin (#935), beside the pencil and revealed the same way — except when the row IS
-          pinned, where it stays lit: this table has no `Pinned` header, so the filled pin is the
-          whole explanation for why the row sorted to the top.
+          pinned, where it stays lit as the row's visible unpin handle under the `Pinned` header.
 
           `no-hover:` covers the device this table still reaches without a pointer: it is hidden
           below `md`, where the cards take over, but a tablet in landscape is ≥md and cannot
@@ -1245,6 +1305,7 @@ const TaskCard = React.memo(function TaskCard({
   showTokens,
   showCost,
   onTogglePin,
+  gitRepo,
 }: {
   run: RunRecord
   /** Nesting level under the task that dispatched this one; 0 for a top-level card. */
@@ -1257,6 +1318,7 @@ const TaskCard = React.memo(function TaskCard({
   showTokens: boolean
   showCost: boolean
   onTogglePin?: (run: RunRecord, pinned: boolean) => void
+  gitRepo: boolean
 }) {
   const navigate = useNavigate()
   const attention = deriveAttention(run)
@@ -1348,6 +1410,11 @@ const TaskCard = React.memo(function TaskCard({
                 <Sep />
                 <span>{run.branch}</span>
               </>
+            ) : branchPending(run, gitRepo) ? (
+              <>
+                <Sep />
+                <BranchSkeleton />
+              </>
             ) : null}
             {/* Branch · ±diff · IN/OUT · cost — the compact card's meta order. */}
             {run.diffStat ? (
@@ -1399,6 +1466,24 @@ function BranchChip({ branch }: { branch: string }) {
   )
 }
 
+/** A started isolated run with no branch yet is forking — possibly waiting for its generated
+ *  name (spec 2026-10-11-branch-naming-instructions). Queued runs, explicit in-place runs and
+ *  every run of a non-git project (always in place, never flagged) keep the dash. */
+function branchPending(run: RunRecord, gitRepo: boolean): boolean {
+  return gitRepo && run.status === 'running' && !run.branch && run.worktree !== false
+}
+
+function BranchSkeleton() {
+  return (
+    <Skeleton
+      data-slot="branch-skeleton"
+      role="status"
+      aria-label="naming branch"
+      className="inline-block h-4 w-24 align-middle"
+    />
+  )
+}
+
 /**
  * The overview wired to live data: `useRuns()` (kept fresh by the global SSE stream), the shared
  * Active/Archived context (the sidebar's tabs and these are one state), and the archive-finished
@@ -1409,6 +1494,10 @@ export function TasksOverviewRoute() {
   const runs = useRuns()
   const health = useHealth()
   const metricVisibility = usageMetricVisibility(health.data)
+  // Project-scoped, unlike health. Unknown (still loading) counts as git so a fresh task's
+  // forking skeleton is not withheld; a known non-git project disables it.
+  const repo = useRepo()
+  const gitRepo = repo.data ? repo.data.info !== null : true
   const [view, setView] = useListView()
   const queryClient = useQueryClient()
   const archive = useMutation({
@@ -1433,7 +1522,7 @@ export function TasksOverviewRoute() {
     onError: (error: Error) => toast(error.message, { tone: 'danger' }),
   })
   // Pinning (#935) — this page is the scoped project's own table, so no explicit project id.
-  const pin = usePinRun()
+  const pin = usePinRun('tasks_table')
   // Stable across renders so the memoized rows they reach only re-render for their own run.
   const renameMutate = rename.mutate
   const onRename = React.useCallback(
@@ -1498,6 +1587,7 @@ export function TasksOverviewRoute() {
         columnsPending={taskTableColumns.isPending}
         origin={origin}
         onOriginChange={setOrigin}
+        gitRepo={gitRepo}
         automationNames={automationNames}
       />
     </ReferenceStatusProvider>
