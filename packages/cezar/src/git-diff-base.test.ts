@@ -491,6 +491,37 @@ describe('resolveTaskDiffBase — memoization', () => {
     expect(calls.slice(afterFirst)).toContainEqual(['merge-base', 'origin/main', 'HEAD']);
   });
 
+  it('recomputes when the base remote is not origin and its tip moves under an unchanged HEAD', async () => {
+    clearTaskDiffBaseCache?.();
+    const answers: Record<string, { ok: boolean; stdout: string; code?: number }> = {
+      'config --get-regexp ^remote\\.': {
+        ok: true,
+        stdout: [
+          'remote.origin.url https://github.com/me/shop.git',
+          'remote.upstream.url https://github.com/acme/shop.git',
+          'remote.upstream.gh-resolved base',
+        ].join('\n') + '\n',
+      },
+      // The fork's `origin/main` started at the same tip and stays put, so a memo
+      // that re-read it instead of `upstream/main` would serve the stale anchor.
+      [HAS_REMOTE]: { ok: true, stdout: 'tipone...\n' },
+      'rev-parse --verify --quiet upstream/main^{commit}': { ok: true, stdout: 'tipone...\n' },
+      'merge-base --is-ancestor upstream/main main': { ok: false, stdout: '', code: 1 },
+      [HEAD_BRANCH]: headRef('review/pr-694'),
+      'merge-base upstream/main HEAD': { ok: true, stdout: 'anchoranchoranchor' },
+      [BASELINE]: { ok: true, stdout: 'baselinebaseline' },
+      'diff --shortstat baselinebaseline': { ok: true, stdout: ' 1 file changed, 1 insertion(+)\n' },
+      'diff --shortstat anchoranchoranchor': { ok: true, stdout: ' 1 file changed, 2 insertions(+)\n' },
+    };
+    const { run, calls } = stubGit(answers);
+    const opts = { taskBranch: 'cez/ab12cd34', runStartedAt: STARTED_AT, cacheKey: '/wt/f' };
+    await resolveTaskDiffBase(run, 'main', opts);
+    const afterFirst = calls.length;
+    answers['rev-parse --verify --quiet upstream/main^{commit}'] = { ok: true, stdout: 'tiptwo...\n' };
+    await resolveTaskDiffBase(run, 'main', opts);
+    expect(calls.slice(afterFirst)).toContainEqual(['merge-base', 'upstream/main', 'HEAD']);
+  });
+
   it('recomputes once HEAD moves under the same worktree key', async () => {
     clearTaskDiffBaseCache?.();
     const answers = { ...CACHE_SETUP };
