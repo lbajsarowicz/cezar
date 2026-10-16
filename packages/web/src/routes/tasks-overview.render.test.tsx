@@ -97,6 +97,16 @@ describe('tasks table — cost of a long list', () => {
     expect(tableRows()[0]?.getAttribute('aria-rowindex')).toBe('2')
   })
 
+  it('numbers a pinned section header and the rows after it inside the full table', () => {
+    const list = runs(300)
+    list[5] = { ...list[5]!, pinned: true }
+    render(overview(list))
+    const table = document.querySelector('[data-slot="tasks-table"] table')
+    expect(table?.getAttribute('aria-rowcount')).toBe('303')
+    expect(table?.querySelector('tr[data-slot="tasks-section"][data-section="pinned"]')?.getAttribute('aria-rowindex')).toBe('2')
+    expect(tableRows()[0]?.getAttribute('aria-rowindex')).toBe('3')
+  })
+
   it('mounts every row under the threshold', () => {
     render(overview(runs(60)))
     expect(tableRows()).toHaveLength(60)

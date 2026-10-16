@@ -48,6 +48,34 @@ describe('useWindowedRows', () => {
     expect(latest?.ariaRowIndex(150)).toBe(152)
   })
 
+  it('samples the row height from task rows, not from a row marked unsampled', () => {
+    const heights = new Map<string, number>([['header', 29], ['task', 45]])
+    function Sampled() {
+      const rows = useWindowedRows<HTMLTableSectionElement>(300)
+      latest = rows
+      const rect = (key: string) => (node: HTMLTableRowElement | null) => {
+        if (node) node.getBoundingClientRect = () => ({ height: heights.get(key) }) as DOMRect
+      }
+      return (
+        <div data-slot="main">
+          <table>
+            <tbody
+              ref={(node) => {
+                rows.anchorRef.current = node
+                if (node) node.getBoundingClientRect = () => ({ top: 0 }) as DOMRect
+              }}
+            >
+              <tr data-row-unsampled="" ref={rect('header')} />
+              <tr ref={rect('task')} />
+            </tbody>
+          </table>
+        </div>
+      )
+    }
+    render(<Sampled />)
+    expect(latest?.padBottom).toBe((300 - (latest?.end ?? 0)) * 45)
+  })
+
   it('leaves the row count to the browser while every row is mounted', () => {
     render(<Table count={60} />)
     expect(latest?.ariaRowCount).toBeUndefined()

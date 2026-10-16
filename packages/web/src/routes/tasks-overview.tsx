@@ -375,6 +375,7 @@ export function TasksOverview({
                           key={`section-${item.section.key}`}
                           data-slot="tasks-section"
                           data-section={item.section.key}
+                          data-row-unsampled=""
                           aria-rowindex={tableWindow.ariaRowIndex(tableWindow.start + index)}
                         >
                           <th

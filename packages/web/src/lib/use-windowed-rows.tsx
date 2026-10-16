@@ -58,7 +58,7 @@ export function useWindowedRows<T extends HTMLElement>(count: number, rowHeight 
       const viewTop = scroller ? scroller.getBoundingClientRect().top : 0
       const viewHeight = scroller ? scroller.clientHeight : window.innerHeight
       const offset = anchor.getBoundingClientRect().top - viewTop
-      const sample = anchor.querySelector(':scope > tr:not([data-row-spacer])')?.getBoundingClientRect().height
+      const sample = anchor.querySelector(':scope > tr:not([data-row-spacer]):not([data-row-unsampled])')?.getBoundingClientRect().height
       const height = sample !== undefined && sample > 0 ? sample : rowHeight
       const first = Math.floor(Math.max(0, -offset) / height)
       const last = Math.ceil(Math.max(0, viewHeight - offset) / height)
