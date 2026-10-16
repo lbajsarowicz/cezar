@@ -8,6 +8,8 @@ import {
   ApiError,
   browseFs,
   checkoutProject,
+  createProject,
+  getGithubOwners,
   connectProvider,
   continueRun,
   continueProjectRun,
@@ -80,6 +82,8 @@ import {
   patchRun,
   pinProjectRun,
   pinRun,
+  archiveProjectRun,
+  archiveRun,
   removeQueuedMessage,
   registerProject,
   openAgentAccountFile,
@@ -102,6 +106,7 @@ import { normalizeTagsForDisplay } from '@/lib/project-tags'
 import type { ContinueOptions } from './client'
 import type {
   CheckoutProjectInput,
+  CreateProjectInput,
   CreateAgentProfileInput,
   ApiRun,
   HealthResponse,
@@ -118,6 +123,7 @@ import type {
   RunRecord,
   SelectAgentProfileInput,
   SetAgentConfigInput,
+  TaskActionSurface,
   UpdateAgentProfileInput,
   UpdateProjectInput,
   TrackerAssociation,
@@ -406,6 +412,8 @@ export const workspaceQueryKeys = {
   models: (runner: string) => ['workspace', 'models', runner] as const,
   providerStatus: ['workspace', 'providers', 'status'] as const,
   projects: ['workspace', 'projects'] as const,
+  /** `GET /api/projects/github-owners` — the new-project dialog's owner picker. */
+  githubOwners: ['workspace', 'github-owners'] as const,
   /** The cross-project task index behind ⌘K. Workspace-led for the same reason the registry is:
    *  it answers for every project at once, so no scope owns it. */
   runsIndex: ['workspace', 'runs-index'] as const,
@@ -859,6 +867,29 @@ export function useCheckoutProject() {
   })
 }
 
+/** Create a new project (`POST /api/projects/create`). Same invalidation and no-retry rule as
+ *  `useCheckoutProject`: a retry would race the server's cleanup and land on the 409, or worse,
+ *  try to create the GitHub repository twice. */
+export function useCreateProject() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: CreateProjectInput) => createProject(input),
+    retry: false,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: workspaceQueryKeys.projects }),
+  })
+}
+
+/** The GitHub accounts (login + orgs) a new repo may belong to. Cached for the session: org
+ *  membership does not change while a dialog is open, and each probe is two `gh api` calls. */
+export function useGithubOwners() {
+  return useQuery({
+    queryKey: workspaceQueryKeys.githubOwners,
+    queryFn: ({ signal }) => getGithubOwners({ signal }),
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+}
+
 /**
  * The ONE session-long `health` topic subscription. Call it exactly once, at the app root
  * (`GlobalEventsProvider`) — never from `useHealth`.
@@ -949,7 +980,7 @@ export function useProjectRepoBase(): string | undefined {
   const registered = scopedId === undefined ? undefined : projects?.find((project) => project.id === scopedId)
   if (registered?.repoUrl) return registered.repoUrl
   const isBootProject = projectId === null || projectId === health?.bootProject
-  return isBootProject ? githubRepoBase(health?.repo?.remote) : undefined
+  return isBootProject ? githubRepoBase(health?.repo?.remote, health?.forge?.kind === 'github') : undefined
 }
 
 /** The local "Open in…" targets (#open-in). Machine-level and stable, so it caches broadly;
@@ -1775,13 +1806,31 @@ function withoutReceipt(run: RunRecord): RunRecord {
  *    project id: `useProjectRuns` caches the boot project under `'default'`, because that is the
  *    scope it mounts unscoped under, and invalidating `[<bootId>, 'runs']` would leave the
  *    sidebar's boot group showing the pre-pin order.
+ *
+ * `surface` names the button for telemetry (`task_pinned`'s label).
  */
-export function usePinRun(projectId?: string, cacheScope?: string) {
+export function usePinRun(surface: TaskActionSurface, projectId?: string, cacheScope?: string) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      projectId === undefined ? pinRun(id, pinned) : pinProjectRun(projectId, id, pinned),
+      projectId === undefined ? pinRun(id, pinned, surface) : pinProjectRun(projectId, id, pinned, surface),
     // Hierarchical keys: this covers the list AND the open thread's own record.
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: cacheScope === undefined ? queryKeys.runs.all : ([cacheScope, 'runs'] as const),
+      }),
+  })
+}
+
+/** Archive or restore one run from a list row — `usePinRun`'s twin, same two parameters and the
+ *  same invalidate-rather-than-patch rule (the answer moves the row between views). */
+export function useArchiveRun(surface: TaskActionSurface, projectId?: string, cacheScope?: string) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, archived }: { id: string; archived: boolean }) =>
+      projectId === undefined
+        ? archiveRun(id, archived, surface)
+        : archiveProjectRun(projectId, id, archived, surface),
     onSuccess: () =>
       queryClient.invalidateQueries({
         queryKey: cacheScope === undefined ? queryKeys.runs.all : ([cacheScope, 'runs'] as const),
