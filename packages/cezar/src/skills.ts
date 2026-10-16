@@ -214,7 +214,8 @@ async function skillEntryPaths(
     entries = await readdir(dir, { withFileTypes: true });
     stamps.push([dir, mtime]);
   } catch {
-    // Unreadable now: -1 never matches a later stat, so the next call scans it again.
+    // Unreadable: stamped -1, which a stat of the dir returns only while it is missing, so the
+    // memo is reused while it stays missing and rescans once it exists and can be read.
     stamps.push([dir, -1]);
     return [];
   }

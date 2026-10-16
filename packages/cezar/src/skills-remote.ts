@@ -526,7 +526,7 @@ async function loadTeamSkills(repoRoot: string, refresh: boolean, startedAt: num
         const { bareDir, created } = await ensureBareClone(src.repo);
         if (!created) await fetchAll(bareDir);
         cloneAttempted.add(src.repo);
-        lastFetchByRepo.set(src.repo, startedAt);
+        lastFetchByRepo.set(src.repo, Math.max(lastFetchByRepo.get(src.repo) ?? 0, startedAt));
       } else if (
         shouldPassiveFetch({
           attempted: cloneAttempted.has(src.repo),
@@ -540,7 +540,7 @@ async function loadTeamSkills(repoRoot: string, refresh: boolean, startedAt: num
         // A clone left by an earlier run is very likely behind origin; fetch it
         // so worktree reviews never read a stale skills template.
         if (!created) await fetchAll(bareDir);
-        lastFetchByRepo.set(src.repo, startedAt);
+        lastFetchByRepo.set(src.repo, Math.max(lastFetchByRepo.get(src.repo) ?? 0, startedAt));
       }
     } catch {
       // offline / no access — list whatever an older clone has (or nothing)

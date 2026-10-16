@@ -4258,9 +4258,11 @@ export class RunManager {
     // The owning step's skill as well as a leading `/skill`: a reclaimed worktree is re-created
     // without its provisioned entries, and the resumed agent loads the step's skill by name through
     // its native loader (and, on Codex and OpenCode, through the path the session's first user
-    // message named). An entry that already carries it needs no reinstall and no team-skill wait.
+    // message named). An on-disk skill whose entry already carries it needs no reinstall and no
+    // team-skill wait; a team skill is always materialized again, so a fetched update lands.
     const ownedSkill = toolsStep?.skill ? state.skills?.find((s) => s.name === toolsStep.skill) : undefined;
-    const ownedSkillReady = ownedSkill !== undefined && provisionedSkillFile(state.cwd, ownedSkill) !== undefined;
+    const ownedSkillReady =
+      ownedSkill !== undefined && ownedSkill.source !== 'team' && provisionedSkillFile(state.cwd, ownedSkill) !== undefined;
     await this.provisionTaskSkills(state, {
       stepSkill: ownedSkillReady ? undefined : toolsStep?.skill,
       slash: leadingSlashSkillName(prompt),

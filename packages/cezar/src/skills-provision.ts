@@ -87,7 +87,11 @@ async function ignoreProvisioned(cwd: string, skillsDir: string, name: string): 
   await writeFile(file, [...lines, `/${name}`].join('\n') + '\n', 'utf8');
 }
 
-/** One skill into one skills dir. An existing entry (tracked, or the user's own) is never touched. */
+/**
+ * One skill into one skills dir. A team directory skill is (re)materialized from the clone every
+ * time, over whatever entry holds its name; any other existing entry (tracked, or the user's own)
+ * is never touched.
+ */
 async function provisionOne(cwd: string, skillsDir: string, skill: Skill): Promise<boolean> {
   // The name is frontmatter verbatim; it becomes a path segment, so it must be exactly one.
   if (!SAFE_SKILL_NAME.test(skill.name)) return false;
@@ -172,11 +176,12 @@ function declaresSkill(raw: string, file: string, name: string): boolean {
 /**
  * The `SKILL.md` inside `cwd` that carries exactly `skill`, for naming it to the agent instead of
  * inlining the body. Native loaders pick a skill by NAME, so every `<dir>/<name>` entry in `cwd`
- * must carry the selected skill: one that differs (a tracked or user-owned skill of the same name,
- * which `provisionOne` leaves in place) means the agent may load other instructions, and the body
- * is inlined instead. On-disk skills compare against their source file; a team skill against the
- * blob this process materialized there, so a stale or foreign copy never counts. An in-place
- * run's own installed `SKILL.md` counts as itself. Built-in skills return undefined.
+ * must carry the selected skill. One that differs means the agent may load other instructions, and
+ * the body is inlined instead: a tracked or user-owned skill of the same name, which `provisionOne`
+ * leaves in place for an on-disk skill, or what a failed team materialization left behind.
+ * On-disk skills compare against their source file; a team skill against the blob this process
+ * materialized there, so a stale or foreign copy never counts. An in-place run's own installed
+ * `SKILL.md` counts as itself. Built-in skills return undefined.
  */
 export function provisionedSkillFile(
   cwd: string,

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { mock } from 'node:test';
@@ -255,9 +255,16 @@ test('a passive touch reloads team skills in the background once the last load i
   assert.deepEqual((await waitForTeamSkills(root)).map((s) => s.name), ['first-skill']);
   addSkill('second-skill');
 
+  // A reload reads config.json again; with the source gone it would empty the list.
+  const config = join(root, '.ai/cezar/config.json');
+  const sources = readFileSync(config, 'utf8');
+  writeFileSync(config, JSON.stringify({ skillsRepos: [] }));
   mock.timers.tick(HOUR);
   getTeamSkillsCached(root);
-  assert.deepEqual((await waitForTeamSkills(root)).map((s) => s.name), ['first-skill'], 'still fresh: no reload');
+  assert.deepEqual((await waitForTeamSkills(root)).map((s) => s.name), ['first-skill']);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(names(), ['first-skill'], 'still fresh: no reload');
+  writeFileSync(config, sources);
 
   mock.timers.tick(5 * HOUR + 1);
   // The TTL reload never blocks a waiter: it answers with the list already held.
@@ -298,5 +305,21 @@ test('a team skill path is named only after this process materialized it, and wh
 
   // Edited after materialization: no longer the team blob.
   writeFileSync(file, '---\nname: first-skill\n---\nedited\n');
+  assert.equal(provisionedSkillFile(cwd, skill), undefined);
+});
+
+test('a failed re-materialization over an earlier success inlines the team skill', async (t) => {
+  const { root, names, until } = ttlFixture(t);
+  await waitForTeamSkills(root);
+  await until(() => names().includes('first-skill'));
+  const skill = getTeamSkillsCached(root).find((s) => s.name === 'first-skill')!;
+  const cwd = mkdtempSync(join(tmpdir(), 'cez-team-cwd-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  assert.deepEqual(await provisionSkills(cwd, [skill], [skill]), ['first-skill']);
+  assert.equal(provisionedSkillFile(cwd, skill), join(cwd, '.claude/skills/first-skill/SKILL.md'));
+
+  // A pinned commit the clone does not have: the copy on disk is unchanged, but this materialization failed.
+  const gone = { ...skill, team: { ...skill.team!, ref: 'f'.repeat(40) } };
+  assert.deepEqual(await provisionSkills(cwd, [gone], [gone]), []);
   assert.equal(provisionedSkillFile(cwd, skill), undefined);
 });

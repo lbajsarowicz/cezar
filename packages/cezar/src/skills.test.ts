@@ -200,17 +200,22 @@ describe('discoverSkills memo', () => {
     expect((await find(repoRoot, 'flat'))?.body).toBe('Flat');
   }, 30_000);
 
-  it('scans a skill directory again once it becomes readable, though its mtime never changed', async () => {
-    const { repoRoot } = await repoWithSkill();
-    const dir = join(repoRoot, '.agents/skills/om-example');
-    await chmod(dir, 0o000);
-    try {
-      expect(await find(repoRoot)).toBeUndefined();
-    } finally {
-      await chmod(dir, 0o755);
-    }
-    expect((await find(repoRoot))?.body).toBe('Body v1');
-  }, 30_000);
+  // Mode 000 does not stop root, and win32 ignores POSIX modes.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'scans a skill directory again once it becomes readable, though its mtime never changed',
+    async () => {
+      const { repoRoot } = await repoWithSkill();
+      const dir = join(repoRoot, '.agents/skills/om-example');
+      await chmod(dir, 0o000);
+      try {
+        expect(await find(repoRoot)).toBeUndefined();
+      } finally {
+        await chmod(dir, 0o755);
+      }
+      expect((await find(repoRoot))?.body).toBe('Body v1');
+    },
+    30_000,
+  );
 
   it('re-reads disk after an explicit invalidation', async () => {
     const { repoRoot } = await repoWithSkill();
