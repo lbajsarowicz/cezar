@@ -1,13 +1,14 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { afterAll, describe, expect, it, vi } from 'vitest';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync as realpathOf, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AgentEvent } from './agent-runner.ts';
 import { createRunner } from './runner-factory.ts';
 import {
+  cursorLaunch,
   buildCursorArgs,
   CursorAgentRunner,
   mockCursorAgentPath,
@@ -152,5 +153,38 @@ describe('backend child exit', () => {
     if (heldOpen) expect(events).toContainEqual({ type: 'text', text: 'buffered final text' });
     expect(failure).toEqual(new Error('cursor agent exited with code 1'));
     expect(child.kill).not.toHaveBeenCalled();
+  });
+});
+
+describe('cursorLaunch', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cez-cursor-launch-'));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  const write = (path: string, body: string) => {
+    writeFileSync(join(dir, path), body);
+    chmodSync(join(dir, path), 0o755);
+  };
+  mkdirSync(join(dir, 'v1'));
+  mkdirSync(join(dir, 'bin'));
+  write('v1/node', '');
+  write('v1/index.js', '');
+  write('v1/cursor-agent', '#!/usr/bin/env bash\nexec -a "$0" "$NODE_BIN" --use-system-ca "$SCRIPT_DIR/index.js" "$@"\n');
+  symlinkSync(join(dir, 'v1', 'cursor-agent'), join(dir, 'bin', 'agent'));
+  write('trampoline', '');
+  const desktop = { platform: 'darwin' as const, hostEnv: { CEZ_DISCLAIM_EXEC: join(dir, 'trampoline') } };
+  const env = { PATH: join(dir, 'bin'), NODE_COMPILE_CACHE: '/cache' };
+
+  it("starts the launcher's own node in the desktop app, as the launcher would", () => {
+    const real = join(realpathOf(dir), 'v1');
+    expect(cursorLaunch('agent', ['-p'], env, desktop)).toEqual({
+      program: join(real, 'node'),
+      args: ['--use-system-ca', join(real, 'index.js'), '-p'],
+      env: { ...env, CURSOR_INVOKED_AS: 'agent' },
+    });
+  });
+
+  it('leaves the launcher alone outside the desktop app or when it is not the known one', () => {
+    expect(cursorLaunch('agent', ['-p'], env, { platform: 'darwin', hostEnv: {} })).toEqual({ program: 'agent', args: ['-p'], env });
+    write('v1/cursor-agent', '#!/usr/bin/env bash\nexec node elsewhere.js "$@"\n');
+    expect(cursorLaunch('agent', ['-p'], env, desktop)).toEqual({ program: 'agent', args: ['-p'], env });
   });
 });

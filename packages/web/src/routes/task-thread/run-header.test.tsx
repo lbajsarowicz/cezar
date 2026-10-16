@@ -802,7 +802,7 @@ describe('actions hit their endpoints', () => {
     renderHeader(run('done', { archived: true }))
     fireEvent.click(itemActions().getByRole('button', { name: 'Unarchive' }))
     await waitFor(() => {
-      expect(sent.find((r) => r.path === '/api/v1/runs/r1/archive')?.body).toEqual({ archived: false })
+      expect(sent.find((r) => r.path === '/api/v1/runs/r1/archive')?.body).toEqual({ archived: false, surface: 'task_view' })
     })
   })
 
@@ -811,7 +811,7 @@ describe('actions hit their endpoints', () => {
     renderHeader(run('done'))
     fireEvent.click(itemActions().getByRole('button', { name: 'Pin' }))
     await waitFor(() => {
-      expect(sent.find((r) => r.path === '/api/v1/runs/r1/pin')?.body).toEqual({ pinned: true })
+      expect(sent.find((r) => r.path === '/api/v1/runs/r1/pin')?.body).toEqual({ pinned: true, surface: 'task_view' })
     })
 
     cleanup()
@@ -821,7 +821,7 @@ describe('actions hit their endpoints', () => {
     expect(unpin.getAttribute('aria-pressed')).toBe('true')
     fireEvent.click(unpin)
     await waitFor(() => {
-      expect(unpinning.find((r) => r.path === '/api/v1/runs/r1/pin')?.body).toEqual({ pinned: false })
+      expect(unpinning.find((r) => r.path === '/api/v1/runs/r1/pin')?.body).toEqual({ pinned: false, surface: 'task_view' })
     })
   })
 
@@ -975,6 +975,28 @@ describe('Terminal — the copy-command 409 fallback', () => {
     renderHeader(run('done'))
     await clickTerminalResume()
     expect((await screen.findByRole('status')).textContent).toBe('no agent session to resume')
+  })
+})
+
+describe('Terminal — hosted mode (telemetry f179cc7d)', () => {
+  const hostedHealth = () => jsonResponse({ capabilities: { localHandoff: false } })
+
+  it('a hosted cockpit offers no Terminal resume, so it never POSTs a refused open-in-cli', async () => {
+    const sent = stubFetch({ '/api/v1/health': hostedHealth })
+    renderHeader(run('done'))
+    await waitFor(() => expect(sent.some((r) => r.path === '/api/v1/health')).toBe(true))
+    await waitFor(() => expect(actionBar().queryByRole('button', { name: 'Open in…' })).toBeNull())
+    expect(sent.some((r) => r.path === '/api/v1/runs/r1/open-in-cli')).toBe(false)
+  })
+
+  it('the phone kebab drops Terminal too', async () => {
+    const sent = stubFetch({ '/api/v1/health': hostedHealth })
+    renderHeader(run('done'))
+    await waitFor(() => expect(sent.some((r) => r.path === '/api/v1/health')).toBe(true))
+    await waitFor(() => expect(actionBar().queryByRole('button', { name: 'Open in…' })).toBeNull())
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Run actions' }))
+    const menu = within(await screen.findByRole('menu'))
+    expect(menu.queryByRole('menuitem', { name: 'Terminal' })).toBeNull()
   })
 })
 
