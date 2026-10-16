@@ -216,14 +216,20 @@ describe('skillDelivery — which skills travel as a path', () => {
     expect(skillDelivery({ name: 'b', path: 'builtin:b', source: 'builtin' }, 'claude', cwd)).toEqual({ mode: 'inline' });
   });
 
-  it('uses a materialized team skill, and inlines one that was not materialized', () => {
+  it('inlines a team skill whose entry this process never materialized, even when it declares the name', () => {
+    // The materialized case is pinned against a real bare clone in test/unit/skills-remote.test.ts.
     const team = { name: 'team-skill', path: 'o/r@main:team-skill/SKILL.md', source: 'team' as const };
-    const cwd = cwdWith('.claude/skills', 'team-skill');
-    expect(skillDelivery(team, 'claude', cwd)).toEqual({
-      mode: 'path',
-      file: join(cwd, '.claude/skills/team-skill/SKILL.md'),
-    });
+    expect(skillDelivery(team, 'claude', cwdWith('.claude/skills', 'team-skill'))).toEqual({ mode: 'inline' });
     expect(skillDelivery(team, 'claude', cwdWith())).toEqual({ mode: 'inline' });
+  });
+
+  it('inlines when another same-named entry in a native skills dir differs, though one entry matches', () => {
+    // Native loaders pick by name: a tracked `.claude/skills/<name>` is what Claude would load.
+    const cwd = cwdWith('.agents/skills');
+    mkdirSync(join(cwd, '.claude/skills/om-code-review'), { recursive: true });
+    writeFileSync(join(cwd, '.claude/skills/om-code-review/SKILL.md'), '---\nname: om-code-review\n---\ntracked\n');
+    expect(skillDelivery(dirSkill, 'claude', cwd)).toEqual({ mode: 'inline' });
+    expect(skillDelivery(dirSkill, 'codex', cwd)).toEqual({ mode: 'inline' });
   });
 
   it('names the entry provisionSkills installed in the worktree', async () => {

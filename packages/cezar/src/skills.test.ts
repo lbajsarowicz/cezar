@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -198,6 +198,18 @@ describe('discoverSkills memo', () => {
     await writeFile(join(repoRoot, '.ai/skills/flat.md'), 'Flat');
     expect((await find(repoRoot, 'om-added'))?.body).toBe('Added');
     expect((await find(repoRoot, 'flat'))?.body).toBe('Flat');
+  }, 30_000);
+
+  it('scans a skill directory again once it becomes readable, though its mtime never changed', async () => {
+    const { repoRoot } = await repoWithSkill();
+    const dir = join(repoRoot, '.agents/skills/om-example');
+    await chmod(dir, 0o000);
+    try {
+      expect(await find(repoRoot)).toBeUndefined();
+    } finally {
+      await chmod(dir, 0o755);
+    }
+    expect((await find(repoRoot))?.body).toBe('Body v1');
   }, 30_000);
 
   it('re-reads disk after an explicit invalidation', async () => {

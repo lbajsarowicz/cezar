@@ -210,9 +210,12 @@ async function skillEntryPaths(
 
   let entries;
   try {
-    stamps.push([dir, await mtimeOf(dir)]);
+    const mtime = await mtimeOf(dir);
     entries = await readdir(dir, { withFileTypes: true });
+    stamps.push([dir, mtime]);
   } catch {
+    // Unreadable now: -1 never matches a later stat, so the next call scans it again.
+    stamps.push([dir, -1]);
     return [];
   }
   const skillEntry = entries.find((entry) => entry.name === 'SKILL.md');

@@ -4255,6 +4255,16 @@ export class RunManager {
 
     const runner = createRunner(continueBackend);
     const continueMcp = await this.privateMcpForLaunch(continueBackend, onEvent);
+    // The owning step's skill as well as a leading `/skill`: a reclaimed worktree is re-created
+    // without its provisioned entries, and the resumed agent loads the step's skill by name through
+    // its native loader (and, on Codex and OpenCode, through the path the session's first user
+    // message named). An entry that already carries it needs no reinstall and no team-skill wait.
+    const ownedSkill = toolsStep?.skill ? state.skills?.find((s) => s.name === toolsStep.skill) : undefined;
+    const ownedSkillReady = ownedSkill !== undefined && provisionedSkillFile(state.cwd, ownedSkill) !== undefined;
+    await this.provisionTaskSkills(state, {
+      stepSkill: ownedSkillReady ? undefined : toolsStep?.skill,
+      slash: leadingSlashSkillName(prompt),
+    });
     if (state.cancelled) return;
     state.currentStepId = stepId;
     this.beginUsageInvocation(runId, state, stepId);
@@ -4262,9 +4272,6 @@ export class RunManager {
     // through `deliverMessage`, so it needs the SAME delivery-only `/skill` rewrite the
     // live path applies (#811). Delivery-only: the `user-message` event above already
     // persisted the user's original text, and the transcript must keep showing that.
-    // The owning step's skill too: the resumed session's system prompt names its provisioned
-    // path, and a reclaimed worktree is re-created without it.
-    await this.provisionTaskSkills(state, { stepSkill: toolsStep?.skill, slash: leadingSlashSkillName(prompt) });
     const continueTools = toolsStep?.allowedTools ?? DEFAULT_ALLOWED_TOOLS;
     const expandedPrompt = expandRegistrySlashSkillText(prompt, state.skills ?? [], {
       backend: continueBackend,

@@ -346,6 +346,7 @@ export async function materializeSkillDir(
   /** Keeps the copy out of git; defaults to the shared `info/exclude`. */
   ignore: () => Promise<void> = () => excludeFromGit(repoRoot, `${skillsDir}/${skill.name}/`),
 ): Promise<boolean> {
+  materializedSkillFiles.delete(join(repoRoot, skillsDir, skill.name, 'SKILL.md'));
   if (!skill.team?.dir || !skill.team.path.endsWith('SKILL.md')) return false;
   const bareDir = bareDirFor(skill.team.repo);
   if (!existsSync(join(bareDir, 'HEAD'))) return false;
@@ -357,6 +358,7 @@ export async function materializeSkillDir(
 
   const destDir = join(repoRoot, skillsDir, skill.name);
   let wrote = 0;
+  let skillFile: { path: string; content: string } | undefined;
   for (const file of ls.stdout.split('\n').filter(Boolean)) {
     const rel = file.slice(srcDir.length + 1);
     // git paths are repo-relative and normalized, but never trust them blindly.
@@ -366,11 +368,26 @@ export async function materializeSkillDir(
     const target = join(destDir, rel);
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, show.stdout, 'utf8');
+    if (rel === 'SKILL.md') skillFile = { path: target, content: show.stdout };
     wrote++;
   }
   if (wrote === 0) return false;
   await ignore();
+  if (skillFile) rememberMaterialized(skillFile.path, skillFile.content);
   return true;
+}
+
+const MAX_MATERIALIZED = 1_000;
+const materializedSkillFiles = new Map<string, string>();
+
+function rememberMaterialized(file: string, content: string): void {
+  if (materializedSkillFiles.size >= MAX_MATERIALIZED) materializedSkillFiles.clear();
+  materializedSkillFiles.set(file, content);
+}
+
+/** The team `SKILL.md` blob this process last materialized at `file`, if any. */
+export function materializedSkillContent(file: string): string | undefined {
+  return materializedSkillFiles.get(file);
 }
 
 /** Append a pattern to git's `info/exclude` (idempotent, non-fatal). */
@@ -448,7 +465,7 @@ const loadByRoot = new Map<string, TeamSkillsLoad>();
  */
 function startTeamSkillsLoad(repoRoot: string, refresh: boolean): Promise<Skill[]> {
   const load: TeamSkillsLoad = { promise: Promise.resolve([]), startedAt: Date.now(), settled: false };
-  load.promise = loadTeamSkills(repoRoot, refresh)
+  load.promise = loadTeamSkills(repoRoot, refresh, load.startedAt)
     .catch(() => teamSkillsByRoot.get(repoRoot) ?? [])
     .then((skills) => {
       load.settled = true;
@@ -485,9 +502,13 @@ export function getTeamSkillsCached(repoRoot: string): Skill[] {
  * Wait for the same non-refreshing load kicked off by `getTeamSkillsCached`.
  * The normal catalog read stays immediate; callers use this only for a
  * background convergence read after they have already rendered local skills.
+ * Only the first load is ever awaited: once a list has settled, a TTL reload
+ * runs in the background and this answers with the list already held.
  */
 export function waitForTeamSkills(repoRoot: string): Promise<Skill[]> {
-  return initialTeamSkillsLoad(repoRoot);
+  const load = initialTeamSkillsLoad(repoRoot);
+  const settled = teamSkillsByRoot.get(repoRoot);
+  return settled ? Promise.resolve(settled) : load;
 }
 
 /** Refresh: clone missing sources, `git fetch` existing ones, reload the list. */
@@ -495,7 +516,7 @@ export async function refreshTeamSkills(repoRoot: string): Promise<Skill[]> {
   return startTeamSkillsLoad(repoRoot, true);
 }
 
-async function loadTeamSkills(repoRoot: string, refresh: boolean): Promise<Skill[]> {
+async function loadTeamSkills(repoRoot: string, refresh: boolean, startedAt: number): Promise<Skill[]> {
   const config = await loadConfig(repoRoot);
   const out: Skill[] = [];
   const seen = new Set<string>();
@@ -505,12 +526,12 @@ async function loadTeamSkills(repoRoot: string, refresh: boolean): Promise<Skill
         const { bareDir, created } = await ensureBareClone(src.repo);
         if (!created) await fetchAll(bareDir);
         cloneAttempted.add(src.repo);
-        lastFetchByRepo.set(src.repo, Date.now());
+        lastFetchByRepo.set(src.repo, startedAt);
       } else if (
         shouldPassiveFetch({
           attempted: cloneAttempted.has(src.repo),
           fetchedAt: lastFetchByRepo.get(src.repo) ?? 0,
-          now: Date.now(),
+          now: startedAt,
           ttlMs: PASSIVE_FETCH_TTL_MS,
         })
       ) {
@@ -519,7 +540,7 @@ async function loadTeamSkills(repoRoot: string, refresh: boolean): Promise<Skill
         // A clone left by an earlier run is very likely behind origin; fetch it
         // so worktree reviews never read a stale skills template.
         if (!created) await fetchAll(bareDir);
-        lastFetchByRepo.set(src.repo, Date.now());
+        lastFetchByRepo.set(src.repo, startedAt);
       }
     } catch {
       // offline / no access — list whatever an older clone has (or nothing)

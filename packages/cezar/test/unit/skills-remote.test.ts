@@ -14,6 +14,7 @@ import {
   safeRemoteFor,
   waitForTeamSkills,
 } from '../../src/skills-remote.js';
+import { provisionedSkillFile, provisionSkills } from '../../src/skills-provision.js';
 
 // ---- safeRemoteFor: repo/URL injection guard (#428) --------------------------
 
@@ -208,7 +209,8 @@ test('team-skills cache is keyed by repoRoot — projects never see each other\'
 
 // ---- passive refresh after the TTL (B19) -------------------------------------
 
-test('a passive touch reloads team skills once the last load is older than the six-hour TTL', async (t) => {
+/** A local skills repo, a project root pointing at it, and a mocked `Date`; all undone after `t`. */
+function ttlFixture(t: { after: (fn: () => void) => void }) {
   const home = mkdtempSync(join(tmpdir(), 'cez-home-'));
   const src = mkdtempSync(join(tmpdir(), 'cez-src-ttl-'));
   const root = mkdtempSync(join(tmpdir(), 'cez-root-ttl-'));
@@ -221,7 +223,6 @@ test('a passive touch reloads team skills once the last load is older than the s
     else process.env.HOME = prevHome;
     for (const d of [home, src, root]) rmSync(d, { recursive: true, force: true });
   });
-
   const g = (args: string[]) => execFileSync('git', args, { cwd: src, encoding: 'utf8' });
   const addSkill = (name: string) => {
     mkdirSync(join(src, name));
@@ -235,16 +236,67 @@ test('a passive touch reloads team skills once the last load is older than the s
   addSkill('first-skill');
   mkdirSync(join(root, '.ai/cezar'), { recursive: true });
   writeFileSync(join(root, '.ai/cezar', 'config.json'), JSON.stringify({ skillsRepos: [{ repo: src, ref: 'main' }] }));
+  const names = () => getTeamSkillsCached(root).map((s) => s.name);
+  /** Real timers still run: `Date` is the only mocked API. */
+  const until = async (predicate: () => boolean) => {
+    const deadline = performance.now() + 15_000;
+    while (!predicate()) {
+      if (performance.now() > deadline) throw new Error('condition not met in time');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+  return { root, addSkill, names, until };
+}
 
+const HOUR = 60 * 60 * 1_000;
+
+test('a passive touch reloads team skills in the background once the last load is older than the six-hour TTL', async (t) => {
+  const { root, addSkill, names, until } = ttlFixture(t);
   assert.deepEqual((await waitForTeamSkills(root)).map((s) => s.name), ['first-skill']);
   addSkill('second-skill');
 
-  mock.timers.tick(60 * 60 * 1_000);
+  mock.timers.tick(HOUR);
   getTeamSkillsCached(root);
   assert.deepEqual((await waitForTeamSkills(root)).map((s) => s.name), ['first-skill'], 'still fresh: no reload');
 
-  mock.timers.tick(5 * 60 * 60 * 1_000 + 1);
+  mock.timers.tick(5 * HOUR + 1);
+  // The TTL reload never blocks a waiter: it answers with the list already held.
+  assert.deepEqual((await waitForTeamSkills(root)).map((s) => s.name), ['first-skill']);
+  await until(() => names().includes('second-skill'));
+  assert.deepEqual(names(), ['first-skill', 'second-skill']);
+});
+
+test('the TTL and the fetch time share one clock, so a slow load does not stretch the interval', async (t) => {
+  const { root, addSkill, names, until } = ttlFixture(t);
+  const first = waitForTeamSkills(root);
+  // The first load is still cloning when a minute passes.
+  mock.timers.tick(60 * 1_000);
+  assert.deepEqual((await first).map((s) => s.name), ['first-skill']);
+  addSkill('second-skill');
+
+  mock.timers.tick(6 * HOUR);
   getTeamSkillsCached(root);
-  assert.deepEqual((await waitForTeamSkills(root)).map((s) => s.name), ['first-skill', 'second-skill']);
-  assert.deepEqual(getTeamSkillsCached(root).map((s) => s.name), ['first-skill', 'second-skill']);
+  await until(() => names().includes('second-skill'));
+});
+
+test('a team skill path is named only after this process materialized it, and while it holds that blob', async (t) => {
+  const { root, names, until } = ttlFixture(t);
+  await waitForTeamSkills(root);
+  await until(() => names().includes('first-skill'));
+  const skill = getTeamSkillsCached(root).find((s) => s.name === 'first-skill')!;
+  const cwd = mkdtempSync(join(tmpdir(), 'cez-team-cwd-'));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const file = join(cwd, '.claude/skills/first-skill/SKILL.md');
+
+  // A same-named entry cezar did not write: never named.
+  mkdirSync(join(cwd, '.claude/skills/first-skill'), { recursive: true });
+  writeFileSync(file, '---\nname: first-skill\n---\nsomething else\n');
+  assert.equal(provisionedSkillFile(cwd, skill), undefined);
+
+  assert.deepEqual(await provisionSkills(cwd, [skill], [skill]), ['first-skill']);
+  assert.equal(provisionedSkillFile(cwd, skill), file);
+
+  // Edited after materialization: no longer the team blob.
+  writeFileSync(file, '---\nname: first-skill\n---\nedited\n');
+  assert.equal(provisionedSkillFile(cwd, skill), undefined);
 });
