@@ -19,15 +19,17 @@ import { StreamRedaction } from './stream-redaction.ts';
 import { collectSecretValues, redactDeep, redactSecrets } from '../core/secret-redaction.ts';
 // Sibling module, files only — a draft belongs to a run and is deleted with it (#939).
 import { deleteRunDrafts } from './drafts.ts';
+import { deleteRunLayouts, pruneOrphanLayouts } from './layouts.ts';
 import { failureKind, taskFailedLabel } from './failure-kind.ts';
 import { track } from '../telemetry.ts';
+import { reportAgentError } from './agent-error-telemetry.ts';
 // Pure, dependency-free reference helpers — the same sanity bound the marker parser applies.
 import { MAX_REF } from './task-refs.ts';
 // Type-only module (zod + nothing else), so this cannot cycle back into the store.
 import { workflowDefSchema } from '../workflows/types.ts';
 // A contract VALUE, like `workspaceUiStateSchema` in `workspace/migrations.ts`: the persisted
 // `dispatch` object and its wire half are literally the same schema, so they cannot drift.
-import { dispatchSchema, trackerAssociationSchema, trackerAutomationEventSchema } from '@open-mercato/cezar-contract';
+import { dispatchSchema, trackerAssociationSchema, trackerAutomationEventSchema, worktreeLifecycleProjectionSchema } from '@open-mercato/cezar-contract';
 
 import { RUNNER_IDS } from '../core/agent-runner.ts';
 
@@ -373,6 +375,7 @@ export const runRecordSchema = z.object({
   worktree: z.literal(false).optional(),
   /** Task worktree (spec 006) — absent for in-place runs and after explicit cleanup. */
   worktreePath: z.string().optional(),
+  worktreeLifecycle: worktreeLifecycleProjectionSchema.optional(),
   /** The task's own branch, created off `baseBranch`: `cez/<id8>` unless branch naming
    *  instructions named it (spec 2026-10-11-branch-naming-instructions) — read it, never recompute it. */
   branch: z.string().optional(),
@@ -464,6 +467,8 @@ export interface RunEvent {
   [key: string]: unknown;
 }
 
+/** A layout file this young may belong to a run another process has not saved to the index yet. */
+const ORPHAN_LAYOUT_GRACE_MS = 10 * 60_000;
 const MAX_RUNS_KEPT = 300;
 /** Every save rewrites the whole index, and a live run touches its record at event rate. */
 const SAVE_DEBOUNCE_MS = 1_000;
@@ -916,6 +921,8 @@ export function reconcileLoadedRun(run: RunRecord, opts?: { keepLive?: boolean }
  */
 export class RunStore extends EventEmitter {
   private runs = new Map<string, RunRecord>();
+  /** The backend of each run's latest session (`session.started`), naming its agent errors. */
+  private sessionBackends = new Map<string, string>();
   /** Ids this process removed on purpose — see `forget`, which is the only thing that writes it. */
   private forgotten = new Set<string>();
   private saveTimer: NodeJS.Timeout | null = null;
@@ -948,6 +955,8 @@ export class RunStore extends EventEmitter {
           for (const run of parsed.data) {
             store.runs.set(run.id, reconcileLoadedRun(run, opts));
           }
+          // Only behind an index that actually loaded — an unreadable one would orphan every layout.
+          pruneOrphanLayouts(dataDir, new Set(store.runs.keys()), ORPHAN_LAYOUT_GRACE_MS);
         } else {
           store.indexReadHealth = { state: 'unavailable', omittedRuns: Array.isArray(raw) ? raw.length : 0, reason: 'Task index could not be loaded by this server' };
         }
@@ -1389,6 +1398,10 @@ export class RunStore extends EventEmitter {
     // appends at agent-event rates are effectively free.
     appendFileSync(this.eventsPath(runId), `${JSON.stringify(full)}\n`, 'utf8');
     this.emit('event', { runId, event: full });
+    if (full.type === 'session.started' && typeof full.backend === 'string') this.sessionBackends.set(runId, full.backend);
+    if ((full.type === 'error' || full.type === 'session.error') && typeof full.message === 'string') {
+      reportAgentError(this.sessionBackends.get(runId) ?? run.runner, { type: full.type, message: full.message, fatal: full.fatal });
+    }
     if (this.janitorSettled(run)) return full;
 
     // The janitor trick: agents print the PR URL after `gh pr create` — the
@@ -1794,6 +1807,7 @@ export class RunStore extends EventEmitter {
    *  which is exactly how long a deletion has to outlive its own index entry. */
   private forget(id: string): boolean {
     this.forgotten.add(id);
+    this.sessionBackends.delete(id);
     return this.runs.delete(id);
   }
 
@@ -1810,6 +1824,7 @@ export class RunStore extends EventEmitter {
         rmSync(this.handoffPath(stale.id), { force: true });
         rmSync(this.imagesDir(stale.id), { recursive: true, force: true });
         deleteRunDrafts(this.dataDir, stale.id);
+        deleteRunLayouts(this.dataDir, stale.id); // spec 2026-10-07-task-workspace §5.3
       } catch {
         // best effort
       }

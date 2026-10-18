@@ -60,6 +60,9 @@ import {
   urlStateFromSearchParams,
   urlStateToSearchParams,
   groupGlobalTasks,
+  sortGlobalTasks,
+  sortTimestamp,
+  SORT_OPTIONS,
   hasActiveFilters,
   tagValuesOf,
   tasksExcludingFacet,
@@ -73,11 +76,12 @@ import {
   type GlobalTaskFilters,
   type GlobalTasksUrlState,
   type GroupBy,
+  type SortBy,
 } from '@/lib/global-tasks'
 import { scopeTo } from '@/lib/project-router'
 import { allProjectTags } from '@/lib/project-tags'
 import { canBeUnread, isReadDoneItem, isUnread } from '@/lib/read-state'
-import { runTitle, type ListView } from '@/lib/task-groups'
+import { runTitle, sortTimeLabel, type ListView } from '@/lib/task-groups'
 import { TASK_ORIGIN_OPTIONS, useTaskOrigin, type TaskOrigin } from '@/lib/task-origin'
 import { usageMetricVisibility } from '@/lib/token-metrics'
 import { LiveNowProvider, RelativeAge } from '@/lib/live-now'
@@ -246,7 +250,7 @@ export function GlobalTasksRoute() {
   // source of truth means a refresh, a pasted link and the Back button all land on the same
   // filtered view, with no effect syncing two copies that can disagree.
   const [searchParams, setSearchParams] = useSearchParams()
-  const { filters, groupBy, view } = React.useMemo(
+  const { filters, groupBy, sortBy, view } = React.useMemo(
     () => urlStateFromSearchParams(searchParams),
     [searchParams],
   )
@@ -275,6 +279,7 @@ export function GlobalTasksRoute() {
   const setFilters = (next: (current: GlobalTaskFilters) => GlobalTaskFilters) =>
     commit((state) => ({ ...state, filters: next(state.filters) }))
   const setGroupBy = (groupBy: GroupBy) => commit((state) => ({ ...state, groupBy }))
+  const setSortBy = (sortBy: SortBy) => commit((state) => ({ ...state, sortBy }))
   const setView = (nextView: ListView) => commit((state) => ({ ...state, view: nextView }))
 
   /**
@@ -355,8 +360,8 @@ export function GlobalTasksRoute() {
     return { regular: count('regular'), automation: count('automation'), all: count('all') }
   }, [allTasks, automations, filters, view])
   const visible = React.useMemo(
-    () => filterGlobalTasks(tasks, filters, view),
-    [tasks, filters, view],
+    () => sortGlobalTasks(filterGlobalTasks(tasks, filters, view), sortBy),
+    [tasks, filters, view, sortBy],
   )
   const groups = React.useMemo(() => groupGlobalTasks(visible, groupBy), [visible, groupBy])
   /**
@@ -462,6 +467,8 @@ export function GlobalTasksRoute() {
           }}
           groupBy={groupBy}
           onGroupByChange={setGroupBy}
+          sortBy={sortBy}
+          onSortByChange={setSortBy}
           projects={registry}
           tasks={tasks}
           view={view}
@@ -472,7 +479,7 @@ export function GlobalTasksRoute() {
 
         {truncated.length > 0 ? (
           <p data-slot="global-tasks-truncated" className="text-[11.5px] text-soft-foreground">
-            Showing the newest {index.data?.perProjectLimit} tasks per project — older ones in{' '}
+            Showing the {index.data?.perProjectLimit} most recently active tasks per project — older ones in{' '}
             {truncated.join(', ')} are only in that project&rsquo;s own Tasks page.
           </p>
         ) : null}
@@ -515,6 +522,7 @@ export function GlobalTasksRoute() {
                 )}
                 <TaskTable
                   tasks={group.tasks}
+                  sortBy={sortBy}
                   isSubtasksExpanded={isSubtasksExpanded}
                   onToggleSubtasks={toggleSubtasks}
                   showProject={groupBy !== 'project'}
@@ -589,6 +597,8 @@ function FilterBar({
   onClearAll,
   groupBy,
   onGroupByChange,
+  sortBy,
+  onSortByChange,
   projects,
   tasks,
   view,
@@ -602,6 +612,8 @@ function FilterBar({
   onClearAll: () => void
   groupBy: GroupBy
   onGroupByChange: (next: GroupBy) => void
+  sortBy: SortBy
+  onSortByChange: (next: SortBy) => void
   projects: readonly ProjectListEntry[]
   tasks: readonly GlobalTask[]
   view: ListView
@@ -678,6 +690,16 @@ function FilterBar({
           options={GROUP_BY_OPTIONS}
           onChange={(picked) => onGroupByChange(toggleGroupBy(groupBy, picked))}
         />
+        {/* Same labelled-segmented grammar as Group by beside it. */}
+        <span className="mx-1 h-5 w-px bg-border" aria-hidden="true" />
+        <span className="text-[11px] font-medium text-soft-foreground">Sort by</span>
+        <Segmented
+          slot="sort-by"
+          label="Sort tasks by"
+          value={sortBy}
+          options={SORT_OPTIONS}
+          onChange={onSortByChange}
+        />
         {canReset({ filters, groupBy }) ? (
           <button
             type="button"
@@ -748,6 +770,7 @@ const dispatchOf = (run: RunIndexEntry): TaskTreeInput['dispatch'] =>
  *  floating above a shared one that would scroll away from it. */
 function TaskTable({
   tasks,
+  sortBy,
   isSubtasksExpanded,
   onToggleSubtasks,
   showProject,
@@ -757,6 +780,8 @@ function TaskTable({
   showCost,
 }: {
   tasks: readonly GlobalTask[]
+  /** Picks the time column's heading and timestamp, so it always reads in row order. */
+  sortBy: SortBy
   /** The page-level accordion (#1110): whether a parent's dispatched rows are unfolded. */
   isSubtasksExpanded: (id: string) => boolean
   onToggleSubtasks: (id: string) => void
@@ -793,7 +818,7 @@ function TaskTable({
     showCost ? <Th key="cost" className="hidden w-[64px] text-right lg:table-cell">Cost</Th> : null,
     <Th key="cpu" className="hidden w-[56px] text-right xl:table-cell">CPU</Th>,
     <Th key="mem" className="hidden w-[84px] text-right xl:table-cell">Mem</Th>,
-    <Th key="age" className="w-[56px] text-right">Age</Th>,
+    <Th key="age" className="w-[72px] text-right">{sortTimeLabel(sortBy)}</Th>,
     <Th key="actions" className="w-[64px] text-right">
       <span className="sr-only">Actions</span>
     </Th>,
@@ -824,6 +849,7 @@ function TaskTable({
                 childCount={node.childCount}
                 subtasksExpanded={isSubtasksExpanded(node.run.id)}
                 onToggleSubtasks={onToggleSubtasks}
+                sortBy={sortBy}
                 showProject={showProject}
                 onArchive={onArchive}
                 onSetRead={onSetRead}
@@ -872,6 +898,7 @@ interface TaskRowProps {
   /** Whether this row's dispatched children are unfolded beneath it (#1110). */
   subtasksExpanded: boolean
   onToggleSubtasks: (id: string) => void
+  sortBy: SortBy
   showProject: boolean
   onArchive: (task: GlobalTask, archived: boolean) => void
   onSetRead: (task: GlobalTask, read: boolean) => void
@@ -886,6 +913,7 @@ const TaskRow = React.memo(function TaskRow({
   childCount,
   subtasksExpanded,
   onToggleSubtasks,
+  sortBy,
   showProject,
   onArchive,
   onSetRead,
@@ -1020,7 +1048,7 @@ const TaskRow = React.memo(function TaskRow({
       <UsageTd column="cpu" cell={usage.cpu} />
       <UsageTd column="memory" cell={usage.mem} />
       <td className={cn(TD_BASE, 'text-right text-xs text-soft-foreground tabular-nums')}>
-        <RelativeAge at={run.startedAt ?? run.createdAt} />
+        <RelativeAge at={sortTimestamp(run, sortBy)} />
       </td>
       <td className={cn(TD_BASE, 'text-right')}>
         <span className="inline-flex items-center gap-0.5">

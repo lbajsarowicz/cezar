@@ -69,7 +69,19 @@ import {
   type TaskFacetId,
   type TaskTableFilters,
 } from '@/lib/task-filters'
-import { listCounts, queuePositions, runTitle, sortRuns, taskSections, type ListView } from '@/lib/task-groups'
+import {
+  SORT_OPTIONS,
+  listCounts,
+  queuePositions,
+  runTitle,
+  sortRuns,
+  sortTableRuns,
+  sortTimeLabel,
+  sortTimestamp,
+  taskSections,
+  type ListView,
+  type SortBy,
+} from '@/lib/task-groups'
 import { TASK_ORIGIN_OPTIONS, useTaskOrigin, type TaskOrigin } from '@/lib/task-origin'
 import { dispatchKindLabel, subtaskLabel, taskTreeRows } from '@/lib/task-tree'
 import {
@@ -181,6 +193,8 @@ export function TasksOverview({
   )
   // The facets are session-local, like the search text; only the origin is remembered.
   const [filters, setFilters] = React.useState<TaskTableFilters>(NO_TASK_FILTERS)
+  // Session-local like the facets; Recent on every fresh visit.
+  const [sortBy, setSortBy] = React.useState<SortBy>('recent')
   const all = runs ?? NO_RUNS
   const automations = React.useMemo(() => automationIndex(all), [all])
   // Origin and facets narrow BEFORE everything else, so the tab counts, the queue-free rows and
@@ -191,7 +205,7 @@ export function TasksOverview({
   )
   const counts = React.useMemo(() => listCounts(narrowed), [narrowed])
   const matching = React.useMemo(() => filterRuns(narrowed, query), [narrowed, query])
-  const visible = React.useMemo(() => sortRuns(matching, view), [matching, view])
+  const visible = React.useMemo(() => sortTableRuns(matching, view, sortBy), [matching, view, sortBy])
   // A live search overrides the fold wholesale: `filterRuns` keeps a child whose parent also
   // matched NESTED under it, and a match the accordion then hid would read as a search miss.
   const searching = query.trim() !== ''
@@ -232,9 +246,13 @@ export function TasksOverview({
   const positions = React.useMemo(() => queuePositions(all), [all])
   const strips = React.useMemo(() => compareGroups(matching, view), [matching, view])
   const finished = React.useMemo(() => finishedRunCount(all), [all])
+  // The time column is headed for what it prints, which follows the sort.
   const columns = React.useMemo(
-    () => taskColumnsForCapabilities({ tokens: showTokens, cost: showCost }),
-    [showTokens, showCost],
+    () =>
+      taskColumnsForCapabilities({ tokens: showTokens, cost: showCost }).map((column) =>
+        column.id === 'started' ? { ...column, label: sortTimeLabel(sortBy) } : column,
+      ),
+    [showTokens, showCost, sortBy],
   )
   const unread = React.useMemo(() => unreadDoneCount(all), [all])
   const tableWindow = useWindowedRows<HTMLTableSectionElement>(items.length)
@@ -317,6 +335,8 @@ export function TasksOverview({
             onFiltersChange={setFilters}
             automations={automations}
             automationNames={automationNames}
+            sortBy={sortBy}
+            onSortByChange={setSortBy}
           />
         ) : null}
         {runs === undefined ? null : visible.length === 0 ? (
@@ -401,6 +421,7 @@ export function TasksOverview({
                         }
                         onRename={onRename}
                         onTogglePin={pinToggle}
+                        sortBy={sortBy}
                         columns={columns}
                         expandedColumns={expandedColumns}
                       />
@@ -434,6 +455,7 @@ export function TasksOverview({
                   queuePosition={
                     item.node.run.status === 'queued' ? (positions.get(item.node.run.id) ?? null) : null
                   }
+                  sortBy={sortBy}
                   showTokens={showTokens}
                   showCost={showCost}
                   onTogglePin={pinToggle}
@@ -652,6 +674,8 @@ function TasksFilterBar({
   onFiltersChange,
   automations,
   automationNames,
+  sortBy,
+  onSortByChange,
 }: {
   runs: readonly RunRecord[]
   view: ListView
@@ -661,6 +685,8 @@ function TasksFilterBar({
   onFiltersChange: (update: (current: TaskTableFilters) => TaskTableFilters) => void
   automations: ReadonlyMap<string, string | undefined>
   automationNames?: ReadonlyMap<string, string>
+  sortBy: SortBy
+  onSortByChange: (next: SortBy) => void
 }) {
   const inView = React.useMemo(
     () => runs.filter((run) => (view === 'archived' ? run.archived : !run.archived)),
@@ -744,6 +770,10 @@ function TasksFilterBar({
           Clear ({active})
         </button>
       ) : null}
+      {/* The all-projects bar's labelled-segmented grammar (its Group by and Sort by). */}
+      <span className="mx-1 h-5 w-px bg-border" aria-hidden="true" />
+      <span className="text-[11px] font-medium text-soft-foreground">Sort by</span>
+      <Segmented slot="sort-by" label="Sort tasks by" value={sortBy} options={SORT_OPTIONS} onChange={onSortByChange} />
     </div>
   )
 }
@@ -914,6 +944,7 @@ const TableRow = React.memo(function TableRow({
   queuePosition,
   onRename,
   onTogglePin,
+  sortBy,
   columns,
   expandedColumns,
 }: {
@@ -929,6 +960,7 @@ const TableRow = React.memo(function TableRow({
   queuePosition: number | null
   onRename: (id: string, title: string) => void
   onTogglePin?: (run: RunRecord, pinned: boolean) => void
+  sortBy: SortBy
   columns: readonly TaskColumnDefinition[]
   expandedColumns: NormalizedExpandedColumns
   gitRepo: boolean
@@ -999,6 +1031,7 @@ const TableRow = React.memo(function TableRow({
             to={to}
             onRename={onRename}
             onTogglePin={onTogglePin}
+            sortBy={sortBy}
           />
         )
       })}
@@ -1022,6 +1055,7 @@ function TaskTableCell({
   to,
   onRename,
   onTogglePin,
+  sortBy,
 }: {
   column: TaskColumnDefinition
   expanded: boolean
@@ -1037,6 +1071,7 @@ function TaskTableCell({
   to: string
   onRename: (id: string, title: string) => void
   onTogglePin?: (run: RunRecord, pinned: boolean) => void
+  sortBy: SortBy
   gitRepo: boolean
 }) {
   if (!expanded) return <FoldedTd column={column.id} />
@@ -1115,7 +1150,7 @@ function TaskTableCell({
     case 'started':
       return (
         <td data-column-id={column.id} className={cn(TD_BASE, 'text-right text-xs text-soft-foreground tabular-nums')}>
-          <RelativeAge at={run.startedAt ?? run.createdAt} />
+          <RelativeAge at={sortTimestamp(run, sortBy)} />
         </td>
       )
     case 'cpu':
@@ -1303,6 +1338,7 @@ const TaskCard = React.memo(function TaskCard({
   subtasksExpanded,
   onToggleSubtasks,
   queuePosition,
+  sortBy,
   showTokens,
   showCost,
   onTogglePin,
@@ -1316,6 +1352,7 @@ const TaskCard = React.memo(function TaskCard({
   subtasksExpanded: boolean
   onToggleSubtasks: (id: string) => void
   queuePosition: number | null
+  sortBy: SortBy
   showTokens: boolean
   showCost: boolean
   onTogglePin?: (run: RunRecord, pinned: boolean) => void
@@ -1385,7 +1422,7 @@ const TaskCard = React.memo(function TaskCard({
           />
         ) : null}
         <span className="mt-0.5 shrink-0 text-[11.5px] text-soft-foreground tabular-nums">
-          <RelativeAge at={run.finishedAt ?? run.createdAt} />
+          <RelativeAge at={sortTimestamp(run, sortBy)} />
         </span>
         {/* Always visible here, not hover-revealed: a card has no hover to speak of on the
             device it exists for, and it is the only place a pin can be set or seen on mobile. */}
