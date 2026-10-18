@@ -106,6 +106,7 @@ export async function rematerializeReclaimedWorktree(
 export interface ReclaimOptions {
   /** Timestamp source for the stamp — injectable for deterministic tests. */
   now?: () => string;
+  lifecycle?: { requiresGate(runId: string): Promise<boolean>; reclaim(runId: string): Promise<boolean> };
   /** Directory reclaimer — defaults to the real `removeWorktree` (branch kept).
    *  Injectable so tests can exercise the "removal failed" branch without brittle
    *  filesystem-permission tricks. */
@@ -142,6 +143,10 @@ export async function reclaimWorktrees(
     if (!live || !isReclaimable(live) || live.worktreePath !== candidate.worktreePath) continue;
     if (live.steps.length !== candidate.stepCount) continue;
     try {
+      if (opts.lifecycle && await opts.lifecycle.requiresGate(candidate.id)) {
+        await opts.lifecycle.reclaim(candidate.id);
+        continue;
+      }
       await remove(repoRoot, candidate.worktreePath);
       if (existsSync(candidate.worktreePath)) continue; // reclaim failed; retry next pass
       store.updateRun(candidate.id, { worktreeReclaimedAt: now() });

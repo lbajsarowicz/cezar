@@ -92,7 +92,10 @@ export class ProjectContextError extends Error {
  */
 export class ProjectContexts {
   private readonly contexts = new Map<string, ProjectContext>();
+  private shutdownPromise?: Promise<void>;
   private readonly building = new Map<string, Promise<ProjectContext>>();
+  /** Startup worktree sweeps still running; shutdown waits for them. */
+  private readonly sweeps = new Set<Promise<void>>();
   /** Live store-created subscribers; invoked before RunManager recovery. */
   private readonly storeListeners = new Set<(store: RunStore) => void>();
   /** Live `onContextBuilt` subscribers (workspace SSE, step 2.8). */
@@ -108,6 +111,7 @@ export class ProjectContexts {
   /** The built context for `projectId`, building it on first access.
    *  Throws `ProjectContextError` for unknown ids and missing roots. */
   async context(projectId: string): Promise<ProjectContext> {
+    if (this.shutdownPromise) throw new Error('Project contexts are shutting down');
     const existing = this.contexts.get(projectId);
     if (existing) return existing;
     const inFlight = this.building.get(projectId);
@@ -199,6 +203,24 @@ export class ProjectContexts {
     for (const id of this.ids()) this.dispose(id);
   }
 
+  /** Drain every opened project, including builds already in flight, before disposal. */
+  shutdownAll(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shutdownPromise = (async () => {
+      // Abort existing scripts immediately; slow project discovery must not delay them.
+      const opened = new Set(this.contexts.values());
+      const existing = Promise.allSettled([...opened].map(ctx => ctx.manager.lifecycle.shutdown()));
+      await Promise.allSettled([...this.building.values()]);
+      const newlyBuilt = [...this.contexts.values()].filter(ctx => !opened.has(ctx));
+      const results = [...await existing, ...await Promise.allSettled(newlyBuilt.map(ctx => ctx.manager.lifecycle.shutdown()))];
+      await Promise.all([...this.sweeps]);
+      this.disposeAll();
+      const failure = results.find(result => result.status === 'rejected');
+      if (failure?.status === 'rejected') throw failure.reason;
+    })();
+    return this.shutdownPromise;
+  }
+
   private async build(projectId: string): Promise<ProjectContext> {
     const projects = await this.deps.listProjects();
     const project = projects.find((p) => p.id === projectId);
@@ -229,9 +251,21 @@ export class ProjectContexts {
       // Startup reconcile (spec 006) + count-based retention (#483) — the same best-effort sweep
       // serveCommand runs for the boot project, gated on the root actually being a git repo.
       // Deliberately off the build path: the first request that opened this project must not wait
-      // on a disk-only sweep. `sweepStartupWorktrees` never throws; the catch is a floor.
-      if (await getRepoInfo(project.root)) {
-        void sweepStartupWorktrees(project.root, store).catch(() => {});
+      // on a disk-only sweep. `sweepStartupWorktrees` never throws; the catch is a floor. The
+      // coordinator starts only once the sweep settles: its orphan pass and the sweep's
+      // `pruneOrphans` must not act on the same worktree at once.
+      const isRepo = Boolean(await getRepoInfo(project.root));
+      if (!this.shutdownPromise) {
+        const sweep = isRepo
+          ? sweepStartupWorktrees(project.root, store, manager.lifecycle).then(() => undefined, () => undefined)
+          : Promise.resolve();
+        this.sweeps.add(sweep);
+        void sweep.then(() => {
+          this.sweeps.delete(sweep);
+          setImmediate(() => {
+            if (!this.shutdownPromise && this.contexts.get(project.id)?.manager === manager) manager.lifecycle.start();
+          });
+        });
       }
       return { id: project.id, root: project.root, dataDir, store, manager, automationStore, launchKey };
     } catch (err) {

@@ -1,4 +1,20 @@
+import type { z } from 'zod'
+import type {
+  lifecycleListResponseSchema, lifecycleDetailResponseSchema, lifecycleOperationResponseSchema,
+  lifecyclePreviewInputSchema, lifecycleListQuerySchema, LifecycleOutputResponse,
+  LifecyclePreviewResponse, LifecycleActionInput, StartLifecycleRemovalInput,
+} from '@open-mercato/cezar-api-client'
 import { trackerReadScope, resolveApiUrl, workspaceBrandingLogoResponseSchema } from '@open-mercato/cezar-api-client'
+import type {
+  DetectedUrlsResponse,
+  DiscoveredCommandsResponse,
+  TerminalCreateInput,
+  TerminalOutput,
+  TerminalSession,
+  TerminalState,
+  WorkspaceLayouts,
+  WorkspaceLayoutsResponse,
+} from '@open-mercato/cezar-api-client'
 import type { TaskActionSurface, TrackerAutomationOptions } from '@open-mercato/cezar-api-client'
 import { trackerWatchHandleSchema, trackerWatchSnapshotSchema, type TrackerWatchInput } from "@open-mercato/cezar-api-client"
 import type {
@@ -85,6 +101,7 @@ import type {
   PickVariantResponse,
   PlanResponse,
   ProviderConnectResponse,
+  ProviderUpdateResponse,
   ProviderId,
   ProviderStatusResponse,
   ProjectsResponse,
@@ -106,6 +123,8 @@ import type {
   RunRecord,
   RunsIndexResponse,
   StarCountPayload,
+  DesignProxyRequest,
+  DesignProxyResponse,
   SetTelemetryConsentInput,
   TelemetryConsentPayload,
   WorktreeEntry,
@@ -453,6 +472,15 @@ export async function getHealth(opts?: ReadOptions): Promise<HealthResponse> {
  *  answer and the chip renders nothing for it. */
 export async function getStarCount(opts?: ReadOptions): Promise<StarCountPayload> {
   return unwrap(await cez.api.v1['star-count'].$get({}, init(opts)), '/star-count')
+}
+
+/**
+ * The Design Mode proxy origin for a loopback dev server (`POST /api/v1/preview/design-proxy`).
+ * Idempotent, so the Preview tab asks before every load instead of tracking whether its proxy is
+ * still alive. Workspace-level — the dev server belongs to the machine, not to the project.
+ */
+export async function openDesignProxy(input: DesignProxyRequest): Promise<DesignProxyResponse> {
+  return unwrap(await cez.api.v1.preview['design-proxy'].$post({ json: input }), '/preview/design-proxy')
 }
 
 /** The opt-in telemetry answer (`~/.cezar/config.json`), behind the consent bar and
@@ -1250,6 +1278,15 @@ export async function connectProvider(
       json: { provider, ...(profileId ? { profileId } : {}) },
     }),
     '/providers/connect',
+  )
+}
+
+/** Opens a terminal running the agent CLI's own update (`opencode upgrade`). A 409 carries
+ *  `command` for the clipboard fallback, or none when the CLI cannot update itself. */
+export async function updateProvider(provider: ProviderId): Promise<ProviderUpdateResponse> {
+  return unwrap(
+    await cez.api.v1.providers[':provider'].update.$post({ param: { provider } }),
+    `/providers/${encodeURIComponent(provider)}/update`,
   )
 }
 
@@ -2598,4 +2635,154 @@ export async function readTrackerWatch(projectId: string, watchId: string, signa
 export async function refreshTrackerWatch(projectId: string, watchId: string, signal: AbortSignal) {
   return trackerWatchSnapshotSchema.parse(await unwrap(await cez.api.v1.p[':projectId'].tracker.watch[':watchId'].$post(
     { param: { projectId, watchId } }, { init: { signal } }), '/tracker/watch'))
+}
+
+/** Worktree lifecycle reads/actions share the existing scope and authenticated transport. */
+export async function getWorktreeLifecycle(query: z.output<typeof lifecycleListQuerySchema> = { limit: 50 }, opts?: ReadOptions): Promise<z.infer<typeof lifecycleListResponseSchema>> {
+  return unwrap(await cez.api.v1.p[':projectId']['worktree-lifecycle'].$get({
+    param: { projectId: queryScope() },
+    query: { cursor: query.cursor, limit: query.limit, attentionOnly: query.attentionOnly === undefined ? undefined : query.attentionOnly ? 'true' : 'false' },
+  }, init(opts)), '/worktree-lifecycle')
+}
+export async function getWorktreeLifecycleDetail(worktreeId: string, opts?: ReadOptions): Promise<z.infer<typeof lifecycleDetailResponseSchema>> {
+  return unwrap(await cez.api.v1.p[':projectId']['worktree-lifecycle'][':worktreeId'].$get({ param: { projectId: queryScope(), worktreeId } }, init(opts)), '/worktree-lifecycle')
+}
+export async function getLifecycleOperation(operationId: string, opts?: ReadOptions): Promise<z.infer<typeof lifecycleOperationResponseSchema>> {
+  return unwrap(await cez.api.v1.p[':projectId']['worktree-lifecycle'].operations[':operationId'].$get({ param: { projectId: queryScope(), operationId } }, init(opts)), '/worktree-lifecycle/operations')
+}
+export async function getLifecycleOutput(operationId: string, afterSeq = 0, opts?: ReadOptions): Promise<LifecycleOutputResponse> {
+  return unwrap(await cez.api.v1.p[':projectId']['worktree-lifecycle'].operations[':operationId'].output.$get({ param: { projectId: queryScope(), operationId }, query: { afterSeq, limit: 100 } }, init(opts)), '/worktree-lifecycle/operations/output')
+}
+export async function startLifecycleRemoval(input: StartLifecycleRemovalInput): Promise<z.infer<typeof lifecycleOperationResponseSchema>> {
+  return unwrap(await cez.api.v1.p[':projectId']['worktree-lifecycle'].operations.$post({ param: { projectId: queryScope() }, json: input }), '/worktree-lifecycle/operations')
+}
+export async function actOnLifecycleOperation(operationId: string, input: LifecycleActionInput): Promise<z.infer<typeof lifecycleOperationResponseSchema>> {
+  return unwrap(await cez.api.v1.p[':projectId']['worktree-lifecycle'].operations[':operationId'].actions.$post({ param: { projectId: queryScope(), operationId }, json: input }), '/worktree-lifecycle/operations/actions')
+}
+export async function previewLifecycleCommand(input: z.infer<typeof lifecyclePreviewInputSchema>): Promise<LifecyclePreviewResponse> {
+  return unwrap(await cez.api.v1.p[':projectId']['worktree-lifecycle'].preview.$post({ param: { projectId: queryScope() }, json: input }), '/worktree-lifecycle/preview')
+}
+
+/** Hand the session off to a real terminal (spec 003), in the run's worktree when it still
+ *  exists. On 409 the ApiError's `command` carries the manual `cd … && <resume>` to copy. */
+/* ── The workspace terminal (spec `2026-10-07-task-workspace` §6) ──────────────────────────────
+ *
+ * Output is read with a CURSOR rather than streamed: the same call serves a local cockpit (woken
+ * by the session's WebSocket topic, which carries only the cursor) and a hosted one (polling,
+ * because a browser WebSocket cannot carry reverse-proxy credentials). One format, one replay
+ * rule, and terminal bytes never touch the workspace-level socket bus.
+ */
+
+export async function getRunTerminal(id: string): Promise<TerminalState> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].terminal.$get({
+      param: { projectId: queryScope(), id: encodeURIComponent(id) },
+    }),
+    runPath(id, '/terminal'),
+  )
+}
+
+export async function createRunTerminal(id: string, body: TerminalCreateInput): Promise<TerminalSession> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].terminal.$post({
+      param: { projectId: queryScope(), id: encodeURIComponent(id) },
+      json: body,
+    }),
+    runPath(id, '/terminal'),
+  )
+}
+
+export async function readRunTerminal(id: string, sessionId: string, cursor: number): Promise<TerminalOutput> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].terminal[':sessionId'].output.$get({
+      param: { projectId: queryScope(), id: encodeURIComponent(id), sessionId },
+      query: { cursor: String(cursor) },
+    }),
+    runPath(id, `/terminal/${sessionId}/output`),
+  )
+}
+
+export async function writeRunTerminal(id: string, sessionId: string, data: string): Promise<void> {
+  await unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].terminal[':sessionId'].input.$post({
+      param: { projectId: queryScope(), id: encodeURIComponent(id), sessionId },
+      json: { data },
+    }),
+    runPath(id, `/terminal/${sessionId}/input`),
+  )
+}
+
+export async function resizeRunTerminal(id: string, sessionId: string, cols: number, rows: number): Promise<void> {
+  await unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].terminal[':sessionId'].resize.$post({
+      param: { projectId: queryScope(), id: encodeURIComponent(id), sessionId },
+      json: { cols, rows },
+    }),
+    runPath(id, `/terminal/${sessionId}/resize`),
+  )
+}
+
+export async function stopRunTerminal(id: string, sessionId: string): Promise<void> {
+  await unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].terminal[':sessionId'].$delete({
+      param: { projectId: queryScope(), id: encodeURIComponent(id), sessionId },
+    }),
+    runPath(id, `/terminal/${sessionId}`),
+  )
+}
+
+/** Addresses this task's terminals printed, each probed for whether anything is listening
+ *  (spec §7). Nothing is opened by reading this — that is the user's click. */
+export async function getRunTerminalUrls(id: string): Promise<DetectedUrlsResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].terminal.urls.$get({
+      param: { projectId: queryScope(), id: encodeURIComponent(id) },
+    }),
+    runPath(id, '/terminal/urls'),
+  )
+}
+
+/** Commands the task's own project defines, each with the file it came from (spec §6). */
+export async function getRunTerminalCommands(id: string): Promise<DiscoveredCommandsResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].terminal.commands.$get({
+      param: { projectId: queryScope(), id: encodeURIComponent(id) },
+    }),
+    runPath(id, '/terminal/commands'),
+  )
+}
+
+/**
+ * A task's saved workspace layouts, from the cezar that owns the task (spec
+ * `.ai/specs/2026-10-07-task-workspace.md` §5.3). `layouts: null` means the task has never been
+ * opened — distinct from an empty list, which is a workspace the user emptied on purpose.
+ */
+export async function getRunLayouts(id: string): Promise<WorkspaceLayoutsResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].layouts.$get({
+      param: { projectId: queryScope(), id: encodeURIComponent(id) },
+    }),
+    runPath(id, '/layouts'),
+  )
+}
+
+export async function putRunLayouts(
+  id: string,
+  body: WorkspaceLayouts,
+  // The pagehide flush, as for `putRunDraft` — and with the same fallback: a body over the
+  // keepalive allowance is REJECTED by the browser, so it goes as an ordinary request instead.
+  opts?: { keepalive?: boolean },
+): Promise<WorkspaceLayoutsResponse> {
+  const keepalive =
+    opts?.keepalive === true && new TextEncoder().encode(JSON.stringify(body)).length <= KEEPALIVE_BODY_MAX
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id'].layouts.$put(
+      {
+        param: { projectId: queryScope(), id: encodeURIComponent(id) },
+        json: body,
+      },
+      { init: { keepalive } },
+    ),
+    runPath(id, '/layouts'),
+  )
 }

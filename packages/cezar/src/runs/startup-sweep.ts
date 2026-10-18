@@ -2,6 +2,7 @@ import { DEFAULT_WORKTREE_RETENTION, resolveWorktreeRetention } from '../config.
 import { pruneOrphans } from '../git-worktree.ts';
 import { reclaimWorktrees } from './retention.ts';
 import type { RunStore } from './store.ts';
+import type { WorktreeLifecycleCoordinator } from '../worktree-lifecycle/coordinator.ts';
 
 /**
  * Boot-time worktree sweep for one project: orphan pruning (spec 006) and count-based
@@ -9,11 +10,13 @@ import type { RunStore } from './store.ts';
  * a run created mid-sweep must count as live: this process's runs are read from the store per
  * entry, and the persisted index is consulted for runs another cockpit owns. Memory alone is not
  * enough — a second cockpit's live run has no record in this process's map, and pruning its
- * worktree would delete a running task's tree and its `cez/<id8>` branch.
+ * worktree would delete a running task's tree and its `cez/<id8>` branch. With `lifecycle`, a
+ * worktree whose removal must run lifecycle scripts goes through the coordinator instead.
  */
 export async function sweepStartupWorktrees(
   repoRoot: string,
   store: RunStore,
+  lifecycle?: Pick<WorktreeLifecycleCoordinator, 'allowOrphanPrune' | 'requiresGate' | 'reclaim'>,
 ): Promise<{ orphans: string[]; reclaimed: string[] }> {
   let persisted: ReadonlySet<string>;
   try {
@@ -24,12 +27,12 @@ export async function sweepStartupWorktrees(
   }
   const orphans = await pruneOrphans(repoRoot, {
     has: (id) => store.getRun(id) !== undefined || persisted.has(id),
-  }).catch(
+  }, lifecycle && ((id) => lifecycle.allowOrphanPrune(id))).catch(
     () => [] as string[],
   );
   // Reclaims finished worktrees beyond the keep-limit (directory only — `cez/<id8>` branch kept,
   // so recoverable).
   const keep = await resolveWorktreeRetention(repoRoot).catch(() => DEFAULT_WORKTREE_RETENTION);
-  const reclaimed = await reclaimWorktrees(repoRoot, store, keep).catch(() => [] as string[]);
+  const reclaimed = await reclaimWorktrees(repoRoot, store, keep, { lifecycle }).catch(() => [] as string[]);
   return { orphans, reclaimed };
 }

@@ -65,6 +65,31 @@ describe('sweepStartupWorktrees', () => {
     expect(existsSync(liveDir)).toBe(true);
   }, 30_000);
 
+  it('leaves an orphan worktree in place when the lifecycle coordinator gates its id', async () => {
+    const root = await fixtureRepo();
+    const store = RunStore.open(join(root, '.ai/cezar'));
+    stores.push(store);
+    const gatedDir = join(root, WORKTREES_DIR, 'gated-run-id');
+    const freeDir = join(root, WORKTREES_DIR, 'free-run-id');
+    mkdirSync(gatedDir, { recursive: true });
+    mkdirSync(freeDir, { recursive: true });
+    const asked: string[] = [];
+    const lifecycle = {
+      allowOrphanPrune: async (id: string) => {
+        asked.push(id);
+        return id !== 'gated-run-id';
+      },
+      requiresGate: async (id: string) => id === 'gated-run-id',
+      reclaim: async () => false,
+    };
+
+    const { orphans } = await sweepStartupWorktrees(root, store, lifecycle);
+    expect(asked.sort()).toEqual(['free-run-id', 'gated-run-id']);
+    expect(orphans).toEqual(['free-run-id']);
+    expect(existsSync(gatedDir)).toBe(true);
+    expect(existsSync(freeDir)).toBe(false);
+  }, 30_000);
+
   it('reclaims over-limit finished worktrees and leaves the newest one in place', async () => {
     const root = await fixtureRepo();
     const store = RunStore.open(join(root, '.ai/cezar'));

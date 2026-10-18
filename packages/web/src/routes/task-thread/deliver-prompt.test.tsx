@@ -5,8 +5,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createQueryClient } from '@/api/query-client'
 import type { ApiRun, RunStatus } from '@open-mercato/cezar-api-client'
 
+import { trackMessageSent } from '@/lib/telemetry'
+
 import { SESSION_GAP_RETRY_DELAYS_MS, deliveryPath, useDeliverPrompt } from './deliver-prompt'
 import { useContinueAction } from './follow-up-engine'
+
+vi.mock('@/lib/telemetry', () => ({ trackMessageSent: vi.fn() }))
 
 /**
  * The composer's delivery recovery (deliver-prompt.ts).
@@ -78,13 +82,14 @@ async function renderDeliver(
   record: ApiRun,
   overrides: Record<string, () => Response> = {},
   wait: (delayMs: number) => Promise<void> = async () => {},
+  surface?: 'existing_session' | 'review' | null,
 ) {
   const sent = stubFetch(overrides)
   const client = createQueryClient()
   const view = renderHook(
     () => {
       const action = useContinueAction(record)
-      return { action, deliver: useDeliverPrompt(record, action, wait) }
+      return { action, deliver: useDeliverPrompt(record, action.continueWith, surface === undefined ? { wait } : { wait, surface }) }
     },
     {
       wrapper: ({ children }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>,
@@ -101,6 +106,7 @@ const posts = (sent: SentRequest[], path: string) =>
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+  vi.mocked(trackMessageSent).mockClear()
 })
 
 describe('deliveryPath', () => {
@@ -170,15 +176,21 @@ describe('useDeliverPrompt', () => {
     expect(posts(sent, '/api/v1/runs/r1/continue')).toHaveLength(1)
   })
 
-  it('an empty submit is a Continue, and a run that is already live has nothing to continue', async () => {
-    const { sent, deliver } = await renderDeliver(run('done'), {
+  it('telemetry 77117b95: an empty one-click Continue on a run that is already live succeeds silently', async () => {
+    const { sent, client, deliver } = await renderDeliver(run('done'), {
       'POST /api/v1/runs/r1/continue': () => jsonResponse({ error: 'run is still active' }, 409),
       'GET /api/v1/runs/r1': () => jsonResponse(run('running')),
     })
 
-    await expect(deliver('')).rejects.toThrow('run is still active')
-    // An empty message is not a message: nothing is delivered on the live path either.
+    // Nothing to continue: the run the click asked for is ALREADY live, so this is the state the
+    // user wanted, not a failure. Resolving (rather than throwing "run is still active") is what
+    // stops the cockpit toasting an error for a task that is simply already under way.
+    await expect(deliver('')).resolves.toBeUndefined()
+    // Nothing was delivered on the live path either — an empty message is not a message.
     expect(posts(sent, '/api/v1/runs/r1/messages')).toHaveLength(0)
+    // The refetch ran and healed the cache the thread reads.
+    expect(sent.filter((r) => r.method === 'GET' && r.path === '/api/v1/runs/r1')).toHaveLength(1)
+    expect(client.getQueryData<ApiRun>(['default', 'runs', 'detail', 'r1'])?.status).toBe('running')
   })
 
   it('a fresh record with no session to resume keeps the original error', async () => {
@@ -272,5 +284,24 @@ describe('useDeliverPrompt', () => {
     await expect(deliver('carry on')).rejects.toThrow('agent crashed')
     expect(sent.filter((r) => r.method === 'GET' && r.path === '/api/v1/runs/r1')).toHaveLength(0)
     expect(posts(sent, '/api/v1/runs/r1/messages')).toHaveLength(1)
+  })
+
+  it('counts a landed delivery under its surface, and nothing when the caller opts out (#1473 review)', async () => {
+    const counted = await renderDeliver(run('waiting'))
+    await counted.deliver('hello')
+    expect(trackMessageSent).toHaveBeenCalledWith('existing_session')
+
+    vi.mocked(trackMessageSent).mockClear()
+    cleanup()
+    const review = await renderDeliver(run('waiting'), {}, undefined, 'review')
+    await review.deliver('notes')
+    expect(trackMessageSent).toHaveBeenCalledWith('review')
+
+    vi.mocked(trackMessageSent).mockClear()
+    cleanup()
+    // The footer's one-click Continue: delivered, but never a `message_sent`.
+    const footer = await renderDeliver(run('done'), {}, undefined, null)
+    await footer.deliver('')
+    expect(trackMessageSent).not.toHaveBeenCalled()
   })
 })
