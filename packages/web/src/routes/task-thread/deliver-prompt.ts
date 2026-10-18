@@ -3,7 +3,7 @@ import { useCallback } from 'react'
 
 import { ApiError } from '@/api/client'
 import { runQueryOptions, useSendMessage } from '@/api/queries'
-import type { ApiRun, AttachmentEntry, RunStatus } from '@open-mercato/cezar-api-client'
+import type { ApiRun, AttachmentEntry, MessageSurface, RunStatus } from '@open-mercato/cezar-api-client'
 
 import type { ContinueAction } from './follow-up-engine'
 import { lastSessionId } from './run-actions'
@@ -32,8 +32,10 @@ import { trackMessageSent } from '@/lib/telemetry'
  *    resume), and re-posting it would only turn one honest error into two. The one exception is
  *    the live path's `session closed`: a `running` run between sessions, retried on a bounded
  *    backoff (`SESSION_GAP_RETRY_DELAYS_MS`);
- *  - reopen a session for an EMPTY draft. Submitting nothing is the one-click Continue, and a
- *    run that turns out to be live has nothing to continue — there is no message to deliver;
+ *  - reopen a session for an EMPTY draft that a fresh record AGREES is settled — a genuine
+ *    refusal. But an EMPTY draft whose refusal is `run is still active` is the opposite: the
+ *    refetch proves the run is live already, which is the state the one-click Continue asked
+ *    for, so nothing is delivered and nothing failed (telemetry 77117b95);
  *  - retry beyond that bound. The last answer is reported as it comes.
  */
 
@@ -60,21 +62,27 @@ function isSessionClosed(error: unknown): error is ApiError {
 
 export function useDeliverPrompt(
   run: ApiRun,
-  continueAction: ContinueAction,
-  wait: (delayMs: number) => Promise<void> = delaySessionGapRetry,
+  continueWith: ContinueAction['continueWith'],
+  opts: {
+    wait?: (delayMs: number) => Promise<void>
+    /** The `message_sent` label for a delivery that landed through this seam. Every caller of one
+     *  thread's composer is `existing_session`; the review gate's notes are `review`. `null` counts
+     *  nothing — the footer's one-click Continue was never a `message_sent` (#1473 review). */
+    surface?: Exclude<MessageSurface, 'cli'> | null
+  } = {},
 ): DeliverPrompt {
+  const { wait = delaySessionGapRetry, surface = 'existing_session' } = opts
   const queryClient = useQueryClient()
   // `mutateAsync` is referentially stable (the mutation RESULT is not — see the thread's `edit`
   // memo for the same rule), so this callback is stable across the streaming re-renders a live
   // thread does constantly.
   const { mutateAsync: sendMessageAsync } = useSendMessage(run.id)
-  const { continueWith } = continueAction
 
   return useCallback(
     async (text: string, images: AttachmentEntry[]) => {
       const deliver = async (path: DeliveryPath) => {
         const result = await (path === 'live' ? sendMessageAsync({ text, images }) : continueWith(text, images))
-        trackMessageSent('existing_session')
+        if (surface) trackMessageSent(surface)
         return result
       }
       const attempted = deliveryPath(run.status)
@@ -108,9 +116,11 @@ export function useDeliverPrompt(
             }
           }
           // Nothing to say and the run is already live: the empty submit was "reopen the session",
-          // and it is open. The 409 says exactly that, and the refetch above has already put the
-          // truth in the cache.
-          if (path === 'live' && text.trim() === '' && images.length === 0) throw refusal
+          // and it is already open — the very state the one-click Continue asked for. The refetch
+          // above has already put the truth in the cache, so the thread redraws live instead of
+          // lying. Nothing was meant to be delivered, so this is a success, not the false failure
+          // the toast made of it (telemetry 77117b95).
+          if (path === 'live' && text.trim() === '' && images.length === 0) return undefined
           // A record with no session to resume cannot take this prompt either — `POST /continue`
           // would answer its own 409, which would read as the new failure rather than the real one.
           // Judged on the FRESH record: `continueAction.available` was computed from the stale one,
@@ -120,6 +130,6 @@ export function useDeliverPrompt(
         }
       }
     },
-    [continueWith, queryClient, run.id, run.status, sendMessageAsync, wait],
+    [continueWith, queryClient, run.id, run.status, sendMessageAsync, surface, wait],
   )
 }

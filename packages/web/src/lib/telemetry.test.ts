@@ -33,6 +33,8 @@ describe('isCanonicalRoute', () => {
     expect(isCanonicalRoute('/settings/global/appearance')).toBe(true)
     expect(isCanonicalRoute('/')).toBe(false)
     expect(isCanonicalRoute('/settings/agents')).toBe(false)
+    // A redirect to the first global section, not a page — counting it double-counts every visit.
+    expect(isCanonicalRoute('/settings/global')).toBe(false)
     expect(isCanonicalRoute('/inbox')).toBe(false)
   })
 })
@@ -157,6 +159,20 @@ describe('scrubToastMessage', () => {
     expect(scrubToastMessage("branch 'feature/login' already exists", [])).toBe('branch <value> already exists')
     expect(scrubToastMessage('cannot push cez/1a2b3c4d to acme/shop', [])).toBe('cannot push <path> to <path>')
     expect(scrubToastMessage("can't open /Users/me/code/shop/README.md", [])).toBe("can't open <path>")
+  })
+
+  /** Telemetry 0f1255b6: a refused attachment's name split one error into a group per file. */
+  it('masks file names, so every refusal of one kind is one error group', () => {
+    const scrub = (m: string) => scrubToastMessage(m, [])
+    expect(scrub('“Screenshot 2026-10-15 at 00.29.50.png” skipped — max 20 attachments per message')).toBe(
+      '<value> skipped — max 20 attachments per message',
+    )
+    expect(scrub('“image.png” skipped — max 20 attachments per message')).toBe(
+      '<value> skipped — max 20 attachments per message',
+    )
+    expect(scrub('image.png skipped — max 4 attachments per message')).toBe('<file> skipped — max 4 attachments per message')
+    expect(scrub('notes.v2.MD is too large (max 5 MB)')).toBe('<file> is too large (max 5 MB)')
+    expect(scrub('cezar 0.15.2 is out')).toBe('cezar 0.15.2 is out')
   })
 
   it('masks the names and ids of known projects, longest first and whole words only', () => {
