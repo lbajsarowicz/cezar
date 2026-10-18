@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { worktreeLifecycleConfigSchema } from '@open-mercato/cezar-contract';
 import { loadWorkspaceConfig, type WorkspaceConfig } from './workspace/config.ts';
 import { RUNNER_IDS } from './core/agent-runner.ts';
 
@@ -31,6 +32,8 @@ export const DEFAULT_WORKTREE_RETENTION = 10;
 const worktreeRetentionSchema = z.number().int().min(0).max(1000);
 
 const configSchema = z.object({
+  // Runtime lifecycle gates use the strict reader, never this boot-safe fallback.
+  worktreeLifecycle: worktreeLifecycleConfigSchema.optional().catch(undefined),
   skillsRepos: z.array(skillsRepoSchema).default(DEFAULT_SKILLS_REPOS),
   /** How many tasks may run at once (spec 006). Non-git dirs always run 1. */
   maxParallel: z.number().int().min(1).max(16).default(2),
@@ -83,6 +86,12 @@ const configSchema = z.object({
    * bad value degrades to unset without discarding the rest of the config.
    */
   systemPrompt: z.string().trim().min(1).max(20_000).optional().catch(undefined),
+  /**
+   * Free-text branch naming instructions (spec 2026-10-11-branch-naming-instructions): the
+   * creation-time namer derives the task branch from the first prompt under these rules.
+   * Absent = `cez/<id8>`. `.catch(undefined)` keeps it additive-safe like `systemPrompt`.
+   */
+  branchNaming: z.string().trim().min(1).max(4_000).optional().catch(undefined),
   /**
    * Per-runner default model preset (Settings → Agents, redesign R6 1.5): the
    * model id the composer preselects for that runner. Missing = auto (the
