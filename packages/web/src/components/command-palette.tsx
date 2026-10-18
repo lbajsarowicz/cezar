@@ -1,4 +1,4 @@
-import { CheckIcon, FolderOpenIcon, LayersIcon, MoonIcon, PlusIcon } from 'lucide-react'
+import { CheckIcon, FolderOpenIcon, LayersIcon, MoonIcon, PlusIcon, SettingsIcon } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate as useRouterNavigate } from 'react-router'
 import { useHealth, useProjects, useRunsForProject, useRunsIndex, useSkills, useUiState } from '@/api/queries'
@@ -22,7 +22,7 @@ import { shortAge } from '@/lib/format'
 import { orderProjects as orderRegistry } from '@/lib/project-order'
 import { isUnread } from '@/lib/read-state'
 import { orderSkillsByUsage } from '@/lib/skills'
-import { runTitle } from '@/lib/task-groups'
+import { lastActivityAt, runTitle } from '@/lib/task-groups'
 import { useCommandShortcut, useKeyShortcut } from '@/lib/use-command-shortcut'
 import { useProjectOrder } from '@/lib/use-project-order'
 
@@ -138,6 +138,7 @@ export function mergeTasks(
     workflow: run.workflow,
     branch: run.branch,
     startedAt: run.startedAt,
+    lastActivityAt: lastActivityAt(run),
   }))
   const live = new Set(mine.map(taskKey))
   const theirs = (indexed ?? [])
@@ -474,6 +475,18 @@ function PaletteContent({ close }: { close: () => void }) {
               </CommandItem>
             )
           })}
+          {/* Global settings sit OUTSIDE every project (`/settings/global`, unified settings spec
+              2026-10-13) — the one view the scoped nav items cannot express, so it is its own
+              row, through the unscoped navigate. */}
+          <CommandItem
+            value="view global settings"
+            data-slot="palette-view"
+            data-nav-to="/settings/global"
+            onSelect={() => goGlobal('/settings/global')}
+          >
+            <SettingsIcon aria-hidden="true" />
+            Global settings
+          </CommandItem>
         </CommandGroup>
 
         {orderedProjects.length > 0 ? (
