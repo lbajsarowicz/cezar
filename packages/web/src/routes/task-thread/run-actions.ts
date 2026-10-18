@@ -1,6 +1,7 @@
 import type { RunRecord, RunStatus, Runner } from '@open-mercato/cezar-api-client'
 import { cliTargetRunner } from '@/components/open-in-menu'
 import { canBeUnread, isUnread } from '@/lib/read-state'
+import { isRunActive } from '@/lib/run-status'
 
 export { cliTargetRunner }
 
@@ -12,12 +13,8 @@ export { cliTargetRunner }
  * table test can pin it per status.
  */
 
-/** "Active" in the legacy sense: the engine still owns the run (a queued run is parked but
- *  claimed). `review` is deliberately NOT active — a parked review can be continued, archived
- *  or deleted like any finished run. */
-export function isRunActive(status: RunStatus): boolean {
-  return status === 'running' || status === 'queued' || status === 'waiting'
-}
+// Lives in `lib/` so shared components can use it without importing a route module.
+export { isRunActive }
 
 /** The latest agent session across steps — what Continue/Terminal resume. */
 export function lastSessionId(run: RunRecord): string | undefined {
@@ -66,7 +63,7 @@ export function resumeCommand(runner: Runner | undefined, sessionId: string): st
  *  has its own worktree, because the resume only makes sense from in there. Absent for an id
  *  `resumeCommand` refuses (#431), exactly as for a run that never recorded a session. */
 export function resumeHint(run: RunRecord): string | undefined {
-  if (isRunActive(run.status)) return undefined
+  if (isRunActive(run.status) || run.worktreeLifecycle?.activeOperationId) return undefined
   const sessionId = lastSessionId(run)
   if (sessionId === undefined) return undefined
   const command = resumeCommand(run.runner, sessionId)
@@ -86,7 +83,7 @@ export function resumeHint(run: RunRecord): string | undefined {
 export function cliTargetResumes(run: RunRecord, targetId: string): boolean {
   const runner = cliTargetRunner(targetId)
   if (!runner) return false
-  if (isRunActive(run.status)) return false
+  if (isRunActive(run.status) || run.worktreeLifecycle?.activeOperationId) return false
   return runner === (run.runner ?? 'claude') && lastSessionId(run) !== undefined
 }
 
@@ -125,17 +122,18 @@ export interface RunActionFlags {
 export function runActionFlags(run: RunRecord): RunActionFlags {
   const active = isRunActive(run.status)
   const hasSession = lastSessionId(run) !== undefined
+  const gated = !!run.worktreeLifecycle?.activeOperationId
   return {
-    finish: run.status === 'waiting' || run.status === 'review',
-    continueRun: !active && hasSession,
-    terminal: !active && hasSession,
+    finish: !gated && (run.status === 'waiting' || run.status === 'review'),
+    continueRun: !gated && !active && hasSession,
+    terminal: !gated && !active && hasSession,
     notes: true,
     archive: !active,
     pin: !run.archived,
     markUnread: canBeUnread(run) && !isUnread(run),
     markRead: canBeUnread(run) && isUnread(run),
-    cancel: active,
-    deleteRun: !active,
+    cancel: !gated && active,
+    deleteRun: !gated && !active,
   }
 }
 

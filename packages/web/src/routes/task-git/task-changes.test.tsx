@@ -46,7 +46,7 @@ const HEALTH: HealthResponse = {
   checks: [],
   defaultRunner: 'claude',
   forge: { kind: 'github', available: true },
-  capabilities: { localHandoff: true, tokenMetrics: true, tokenUsageMetrics: true, costMetrics: true, followups: false, singleProject: false, automations: false, dispatch: false },
+  capabilities: { localHandoff: true, terminal: false, designMode: false, tokenMetrics: true, tokenUsageMetrics: true, costMetrics: true, followups: false, singleProject: false, automations: false, dispatch: false },
 }
 
 /** The PROJECT-scoped `/repo` answer. The remote that gates Push is read from here rather than
@@ -56,6 +56,7 @@ const REPO: RepoResponse = {
   status: [],
   log: [],
   branches: ['main'],
+  checkedOutElsewhere: {},
   baseBranch: null,
 }
 
@@ -223,6 +224,7 @@ describe('the Changes tab route', () => {
       { text: 'Commits', href: '/tasks/r1/commits', current: null },
       { text: 'Files', href: '/tasks/r1/files', current: null },
       { text: 'Notes', href: '/tasks/r1/notes', current: null },
+      { text: 'Preview', href: '/tasks/r1/preview', current: null },
     ])
   })
 
