@@ -144,6 +144,7 @@ export function ChangesView({
   const changesRefused = changes.isError && changes.error instanceof ApiError && changes.error.status === 409
 
   const files = changes.data?.files ?? NO_FILES
+  const baseSha = changes.data?.baseSha
   // The toolbar, totals and tree are cheap and paint at once; the diff renders in the background
   // as a deferred value, which React interrupts for anything urgent — a click on Chat never waits
   // for a big diff to finish rendering. Until its first pass lands the pane says so.
@@ -311,6 +312,7 @@ export function ChangesView({
                 preview={desktop && hasMarkdown && preview}
                 loadFileText={(path) => loadWorktreeText(run.id, path)}
                 imageSrc={(path) => runFileRawUrl(run.id, path)}
+                oldImageSrc={baseSha ? (path) => runFileRawUrl(run.id, path, baseSha) : undefined}
                 onOpenInApp={
                   health.data?.capabilities.localHandoff ? (path) => openImage.mutate(path) : undefined
                 }

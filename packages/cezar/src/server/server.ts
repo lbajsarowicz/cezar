@@ -159,6 +159,7 @@ import { getTeamSkillsCached, refreshTeamSkills, waitForTeamSkills } from '../sk
 import { appendHandoffHeartbeat, handoffProgressExcerpt, readHandoff } from '../handoff.ts';
 import { markStarted, onTodosChanged, readTodos, removeTodo, todoTaskText, type TodoItem } from '../todos.ts';
 import type { RunEvent, RunRecord, RunStatus, RunStore } from '../runs/store.ts';
+import { onRunFrames } from './run-frames.ts';
 import {
   HistoryCursorError,
   deriveRunContextEvents,
@@ -211,6 +212,8 @@ import {
   imageMimeType,
   isOsOpenableImage,
   listRepoPaths,
+  isCommitSha,
+  readImageAtRev,
   pushCurrentBranch,
   worktreeGitStatus,
   readWorktreePath,
@@ -5433,7 +5436,7 @@ export function createApp(deps: ServerDeps) {
     // An `Accept` that asks for images reaches the same raw branch without the flag — which is
     // what an `<img>` sends — while the flag still wins whenever it is present and `*<slash>*`
     // (every `fetch`) still gets the JSON listing. See `negotiate`.
-    .get('/runs/:id/files', queryZodValidator(z.object({ path: queryValue, raw: queryValue })), async (c) => {
+    .get('/runs/:id/files', queryZodValidator(z.object({ path: queryValue, raw: queryValue, rev: queryValue.refine((v) => v === undefined || isCommitSha(v), 'rev must be a full commit sha') })), async (c) => {
       const { root: repoRoot, store } = c.get('project');
       const query = c.req.valid('query');
       c.header('vary', 'Accept');
@@ -5445,6 +5448,20 @@ export function createApp(deps: ServerDeps) {
       if (!run) return c.json({ error: 'not found' }, 404);
       const workingDirectory = workingDirectoryOf(run, repoRoot);
       if (!workingDirectory) return c.json({ error: NO_WORKTREE }, 409);
+      // `rev` (a full sha, the changes payload's `baseSha`) serves an image's OLD side from git —
+      // the before of a modified image, the only picture of a deleted one. Bytes only.
+      if (query.rev !== undefined) {
+        if (!wantsRaw) return c.json({ error: 'rev is only served as raw image bytes' }, 409);
+        const old = await readImageAtRev(workingDirectory, query.rev, query.path ?? '');
+        if (old.kind === 'refused') return c.json({ error: old.error }, 409);
+        return c.body(new Uint8Array(old.bytes).buffer as ArrayBuffer, 200, {
+          'content-type': old.mime,
+          'x-content-type-options': 'nosniff',
+          'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+          // Addressed by content: the same sha and path are the same bytes forever.
+          'cache-control': 'private, max-age=31536000, immutable',
+        });
+      }
       const result = await readWorktreePath(workingDirectory, query.path ?? '');
       if (result.kind === 'invalid' || result.kind === 'missing') {
         return c.json({ error: result.error }, 409);
@@ -6204,15 +6221,14 @@ export function createApp(deps: ServerDeps) {
           if (replaying) buffered.push(event);
           else void writeEvent(event);
         };
-        const onRun = (run: RunRecord) => {
-          if (run.id !== id) return;
-          void stream.writeSSE({ event: 'run', data: JSON.stringify(run) });
-        };
         const offEvent = onRunEvent(store, id, onEvent);
-        store.on('run', onRun);
+        const offRun = onRunFrames(store, (run, frames) => {
+          if (run.id !== id) return;
+          void stream.writeSSE({ event: 'run', data: frames.record() });
+        });
         stream.onAbort(() => {
           offEvent();
-          store.off('run', onRun);
+          offRun();
         });
 
         const replay = query.cursor
@@ -6248,7 +6264,6 @@ export function createApp(deps: ServerDeps) {
     .get('/events', (c) => {
       const { dataDir, store } = c.get('project');
       return streamSSENoBuffer(c, async (stream) => {
-        const onRun = (run: RunRecord) => void stream.writeSSE({ event: 'run', data: JSON.stringify(run) });
         const onDeleted = (id: string) =>
           void stream.writeSSE({
             event: 'run-deleted',
@@ -6277,10 +6292,10 @@ export function createApp(deps: ServerDeps) {
           }
           void stream.writeSSE({ event: 'usage', data: JSON.stringify(owned) });
         });
-        store.on('run', onRun);
+        const offRun = onRunFrames(store, (_run, frames) => void stream.writeSSE({ event: 'run', data: frames.record() }));
         const offDeleted = onRunDeleted(store, onDeleted);
         stream.onAbort(() => {
-          store.off('run', onRun);
+          offRun();
           offDeleted();
           offTodos();
           offUsage();
@@ -6302,11 +6317,6 @@ export function createApp(deps: ServerDeps) {
         const attach = (project: string, ctx: Pick<ProjectContext, 'store' | 'dataDir' | 'manager'>): void => {
           if (attached.has(project)) return;
           const { store, dataDir } = ctx;
-          const onRun = (run: RunRecord) =>
-            void stream.writeSSE({
-              event: 'run',
-              data: JSON.stringify({ ...run, project }),
-            });
           const onDeleted = (id: string) =>
             void stream.writeSSE({
               event: 'run-deleted',
@@ -6322,16 +6332,18 @@ export function createApp(deps: ServerDeps) {
           // Same opt-in gate as the per-project stream (#471): no capability, no
           // watcher — and each subscription is scoped to its own dataDir (2.3).
           const offTodos = capabilities().followups ? onTodosChanged(dataDir, () => void sendTodos()) : () => undefined;
+          const offRun = onRunFrames(store, (_run, frames) =>
+            void stream.writeSSE({ event: 'run', data: frames.workspace(project) }),
+          );
           const offLifecycle = ctx.manager.lifecycle?.onChange(event => {
             const payload: WorktreeLifecycleInvalidation = { ...event, projectId: project };
             void stream.writeSSE({ event: 'worktree-lifecycle', data: JSON.stringify(payload) });
           });
-          store.on('run', onRun);
           const offDeleted = onRunDeleted(store, onDeleted);
           attached.set(project, {
             store,
             detach: () => {
-              store.off('run', onRun);
+              offRun();
               offDeleted();
               offTodos();
               offLifecycle?.();

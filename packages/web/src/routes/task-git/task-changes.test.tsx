@@ -327,6 +327,36 @@ describe('the Changes tab route', () => {
     )
   })
 
+  describe('image old sides', () => {
+    const SHA = 'a'.repeat(40)
+    const IMAGES: ChangesPayload = {
+      files: [
+        { path: 'gone.png', status: 'deleted', adds: 0, dels: 0, binary: true, image: true, patch: '' },
+        { path: 'new.png', oldPath: 'old.png', status: 'renamed', adds: 0, dels: 0, binary: true, image: true, patch: '' },
+      ],
+      stat: { adds: 0, dels: 0, files: 2 },
+    }
+    const srcs = () => [...document.querySelectorAll('[data-slot="diff-image-side"] img')].map((img) => img.getAttribute('src'))
+
+    it('loads them at the payload’s baseSha — a rename from its old path', async () => {
+      stubFetch({ 'GET /api/v1/runs/r1/changes': () => jsonResponse({ ...IMAGES, baseSha: SHA }) })
+      renderChangesRoute()
+      await waitFor(() => expect(srcs()).toHaveLength(3))
+      expect(srcs()).toEqual([
+        `/api/v1/runs/r1/files?path=gone.png&raw=1&rev=${SHA}`,
+        `/api/v1/runs/r1/files?path=old.png&raw=1&rev=${SHA}`,
+        '/api/v1/runs/r1/files?path=new.png&raw=1',
+      ])
+    })
+
+    it('without a baseSha, wires no old side', async () => {
+      stubFetch({ 'GET /api/v1/runs/r1/changes': () => jsonResponse(IMAGES) })
+      renderChangesRoute()
+      await waitFor(() => expect(screen.getByText(/only the new side can be previewed/)).not.toBeNull())
+      expect(srcs()).toEqual(['/api/v1/runs/r1/files?path=new.png&raw=1'])
+    })
+  })
+
   it('a 409 ("no worktree") renders the server reason and offers no git step', async () => {
     const noWorktree = () => jsonResponse({ error: 'no worktree — this task ran directly in the repo working tree' }, 409)
     stubFetch({ 'GET /api/v1/runs/r1/changes': noWorktree, 'GET /api/v1/runs/r1/git/status': noWorktree })

@@ -1266,8 +1266,9 @@ export async function getRunFile(id: string, path: string, opts?: ReadOptions): 
 /** The same-origin URL an `<img>` can load an image file's bytes from (R5 Files tab). The
  *  server serves raw ONLY for image extensions within the size cap — everything else 409s.
  *  Scoped here rather than in send() — this URL is handed to an `<img>`, never fetched. */
-export function runFileRawUrl(id: string, path: string): string {
-  return apiPath(runPath(id, `/files?path=${encodeURIComponent(path)}&raw=1`))
+export function runFileRawUrl(id: string, path: string, rev?: string): string {
+  const at = rev ? `&rev=${encodeURIComponent(rev)}` : ''
+  return apiPath(runPath(id, `/files?path=${encodeURIComponent(path)}&raw=1${at}`))
 }
 
 /** The variant-compare data (spec 010): one entry per variant of the group, with the legacy
