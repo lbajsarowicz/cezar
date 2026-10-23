@@ -30,6 +30,9 @@
 // `MOCK_OPENCODE_PROMPTS_FILE=<path>` every prompt text is appended (one JSON
 // string per line) so a test can assert exactly what reached the session.
 // `MOCK_OPENCODE_SESSIONS_GONE=1` answers every session lookup with a 404.
+// `MOCK_START=silent` never prints the URL line; `MOCK_START=stderr` prints it on
+// stderr. `MOCK_PATH_DIR` overrides the `directory` `GET /path` reports.
+// `MOCK_API=v2` answers every non-`/api/` POST with 405, as OpenCode 2.x does.
 import { appendFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
@@ -73,6 +76,11 @@ const info = (extra) => ({
 
 const server = createServer((req, res) => {
   const url = req.url ?? '';
+  if (req.method === 'GET' && url === '/path') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ directory: process.env.MOCK_PATH_DIR ?? process.cwd() }));
+    return;
+  }
   if (req.method === 'GET' && url.startsWith('/event')) {
     if (process.env.MOCK_NO_EVENT_BUS === '1') {
       res.writeHead(404, { 'content-type': 'text/plain' });
@@ -87,6 +95,12 @@ const server = createServer((req, res) => {
   let body = '';
   req.on('data', (chunk) => (body += chunk));
   req.on('end', () => {
+    // OpenCode 2.x serves its API under `/api` and answers the 1.x routes with 405.
+    if (process.env.MOCK_API === 'v2' && !url.startsWith('/api/')) {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
     if (req.method === 'POST' && url === '/session') {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: SESSION_ID, title: 'cezar task' }));
@@ -327,6 +341,8 @@ const server = createServer((req, res) => {
 
 server.listen(port, hostname, () => {
   // The runner reads the bound URL back from stdout, like the real server.
-  console.log(`opencode server listening on http://${hostname}:${server.address().port}`);
+  const line = `opencode server listening on http://${hostname}:${server.address().port}`;
+  if (process.env.MOCK_START === 'stderr') console.error(line);
+  else if (process.env.MOCK_START !== 'silent') console.log(line);
 });
 process.on('SIGTERM', () => process.exit(0));
