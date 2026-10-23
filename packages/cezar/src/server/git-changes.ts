@@ -2,7 +2,8 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, open, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
-import { resolveTaskDiffBase } from '../git-diff-base.ts';
+import { CEZAR_DATA_EXCLUDE } from '../data-gitignore.ts';
+import { resolveTaskDiffBase, type RepointedHead } from '../git-diff-base.ts';
 import { isSafeGitRef } from '../git-refs.ts';
 import type { ChangedFile, ChangesPayload } from '@open-mercato/cezar-contract';
 import { resolveTaskRemotes, splitRemoteRef } from '../git-remotes.ts';
@@ -251,11 +252,13 @@ export async function collectChanges(
     patchCap?: number;
     taskBranch?: string;
     runStartedAt?: string;
+    /** Leave cezar's own `.ai/cezar/` out — an in-place task's Changes show what would land. */
+    excludeCezarData?: boolean;
   } = {},
 ): Promise<ChangesResult> {
   if (!isSafeGitRef(baseBranch)) return { ok: false, error: 'refusing option-like base ref' };
   const patchCap = opts.patchCap ?? PATCH_CAP;
-  const key = JSON.stringify([dir, baseBranch, opts.taskBranch ?? null, opts.runStartedAt ?? null, patchCap]);
+  const key = JSON.stringify([dir, baseBranch, opts.taskBranch ?? null, opts.runStartedAt ?? null, patchCap, opts.excludeCezarData ?? false]);
   const fingerprint = await changesFingerprint(dir, baseBranch);
   if (fingerprint === undefined) return computeChanges(dir, baseBranch, patchCap, opts);
   const cached = changesCache.get(key);
@@ -361,7 +364,7 @@ async function computeChanges(
   dir: string,
   baseBranch: string,
   patchCap: number,
-  opts: { taskBranch?: string; runStartedAt?: string },
+  opts: { taskBranch?: string; runStartedAt?: string; excludeCezarData?: boolean },
 ): Promise<ChangesResult> {
   return withScratchIntentToAddIndex(dir, async (env) => {
     // Which ref anchors this task's diff — merge-base normally, the checked-out branch's
@@ -379,12 +382,20 @@ async function computeChanges(
       },
     );
 
-    const nameStatus = await git(dir, ['diff', '--name-status', '-z', '-M', base], env);
-    if (!nameStatus.ok) return { ok: false, error: gitReason(nameStatus, 'git diff failed') };
-    const numstat = await git(dir, ['diff', '--numstat', '-z', '-M', base], env);
-    if (!numstat.ok) return { ok: false, error: gitReason(numstat, 'git diff failed') };
-    const patchOut = await git(dir, ['diff', '--patch', '-M', '--no-color', base], env);
-    if (!patchOut.ok) return { ok: false, error: gitReason(patchOut, 'git diff failed') };
+    // Three independent read-only listings, run concurrently. `GIT_OPTIONAL_LOCKS=0` keeps them
+    // from racing each other for `index.lock` over the opportunistic stat refresh `git diff` writes,
+    // so that refresh is written once here instead — else every poll re-reads each stat-dirty file.
+    await git(dir, ['update-index', '-q', '--refresh'], env);
+    const readEnv = { ...env, GIT_OPTIONAL_LOCKS: '0' };
+    const scope = opts.excludeCezarData ? ['--', '.', CEZAR_DATA_EXCLUDE] : [];
+    const [nameStatus, numstat, patchOut] = await Promise.all([
+      git(dir, ['diff', '--name-status', '-z', '-M', base, ...scope], readEnv),
+      git(dir, ['diff', '--numstat', '-z', '-M', base, ...scope], readEnv),
+      git(dir, ['diff', '--patch', '-M', '--no-color', base, ...scope], readEnv),
+    ]);
+    for (const listing of [nameStatus, numstat, patchOut]) {
+      if (!listing.ok) return { ok: false, error: gitReason(listing, 'git diff failed') };
+    }
 
     return {
       ok: true,
