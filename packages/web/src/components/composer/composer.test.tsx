@@ -120,6 +120,24 @@ describe('submit shortcuts', () => {
     expect(classes).toContain('md:text-sm')
   })
 
+  it('autosizing while typing keeps the surrounding scroller where it was', () => {
+    const { textarea } = renderComposer()
+    const scroller = textarea.parentElement!
+    let top = 500
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => top, set: (v: number) => { top = v } })
+    // The browser's clamp: measuring the collapsed `auto` box shrinks the scroller's content.
+    Object.defineProperty(textarea, 'scrollHeight', {
+      configurable: true,
+      get: () => {
+        if (textarea.style.height === 'auto') top = 0
+        return 120
+      },
+    })
+    type(textarea, 'line one\nline two')
+    expect(textarea.style.height).toBe('120px')
+    expect(top).toBe(500)
+  })
+
   it('Enter sends the trimmed text and clears optimistically', async () => {
     const { onSubmit, textarea } = renderComposer()
     type(textarea, '  hello agent  ')
@@ -300,17 +318,15 @@ describe('attachments — attach, paste, thumbnails, caps (legacy parity)', () =
     )
   })
 
-  it('a dropped PDF is taken, and an unsupported file is refused out loud', async () => {
+  it('a dropped PDF and a ZIP are both taken (telemetry 48850f4a)', async () => {
     const { textarea } = renderComposer()
     paste(textarea, [
       textFile('report.pdf', 'application/pdf', '%PDF'),
       textFile('payload.zip', 'application/zip', 'PK'),
     ])
     await screen.findByLabelText('Remove report.pdf')
-    expect(
-      await screen.findByText('“payload.zip” is not a supported attachment (images, PDF and text files such as TXT, MD, HTML or source code)'),
-    ).toBeTruthy()
-    expect(screen.queryByLabelText('Remove payload.zip')).toBeNull()
+    expect(await screen.findByLabelText('Remove payload.zip')).toBeTruthy()
+    expect(screen.queryByText(/not a supported attachment/)).toBeNull()
   })
 
   it('an oversized image is refused with the 5 MB toast', async () => {
@@ -521,6 +537,28 @@ describe('/ skills autocomplete (#380)', () => {
     expect(textarea.value).toBe('/om')
     fireEvent.keyDown(textarea, { key: 'Enter' })
     expect(onSubmit).toHaveBeenCalledWith('/om', [])
+  })
+
+  it('Escape with no menu open unfocuses the composer and keeps the draft', async () => {
+    const { textarea } = renderComposer()
+    textarea.focus()
+    type(textarea, '/om')
+    await screen.findByText('om-fix')
+    // First Escape is the menu's…
+    fireEvent.keyDown(textarea, { key: 'Escape' })
+    await waitFor(() => expect(document.querySelector('[data-slot="composer-menu"]')).toBeNull())
+    expect(document.activeElement).toBe(textarea)
+    // …the next gives the keyboard back to the page.
+    fireEvent.keyDown(textarea, { key: 'Escape' })
+    expect(document.activeElement).not.toBe(textarea)
+    expect(textarea.value).toBe('/om')
+  })
+
+  it('Escape mid-IME composition only cancels the composition', () => {
+    const { textarea } = renderComposer()
+    textarea.focus()
+    fireEvent.keyDown(textarea, { key: 'Escape', isComposing: true })
+    expect(document.activeElement).toBe(textarea)
   })
 
   it('a completed token (trailing space) closes the menu', async () => {

@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest'
 
 import {
   appendAttachment,
-  ATTACHMENT_ACCEPT,
   attachmentMediaType,
   fileToPendingAttachment,
   MAX_ATTACHMENT_BYTES,
@@ -52,12 +51,15 @@ describe('screenFiles — the caps, mirrored from the server zod', () => {
     expect(intake.rejected).toEqual([])
   })
 
-  it('refuses an unsupported file out loud, naming it', () => {
-    const intake = screenFiles([fakeFile({ type: 'application/zip', name: 'payload.zip' })], 0)
-    expect(intake.accepted).toEqual([])
-    expect(intake.rejected).toEqual([
-      '“payload.zip” is not a supported attachment (images, PDF and text files such as TXT, MD, HTML or source code)',
-    ])
+  /** Telemetry 48850f4a: a `.zip` was refused — any file is taken now, as a binary attachment. */
+  it('takes a file of any type, as a binary attachment', () => {
+    const zip = fakeFile({ type: 'application/zip', name: 'spec v2.zip' })
+    const typeless = fakeFile({ type: '', name: 'model.xlsx' })
+    const intake = screenFiles([zip, typeless], 0)
+    expect(intake.accepted).toEqual([zip, typeless])
+    expect(intake.rejected).toEqual([])
+    expect(attachmentMediaType(zip)).toBe('application/octet-stream')
+    expect(attachmentMediaType(typeless)).toBe('application/octet-stream')
   })
 
   it('names an oversized file in the rejection', () => {
@@ -93,11 +95,8 @@ describe('screenFiles — the caps, mirrored from the server zod', () => {
       ],
       0,
     )
-    expect(intake.accepted.map((f: File) => f.name)).toEqual(['ok.png', 'brief.md'])
-    expect(intake.rejected).toEqual([
-      '“big.png” is too large (max 5 MB)',
-      '“payload.zip” is not a supported attachment (images, PDF and text files such as TXT, MD, HTML or source code)',
-    ])
+    expect(intake.accepted.map((f: File) => f.name)).toEqual(['ok.png', 'brief.md', 'payload.zip'])
+    expect(intake.rejected).toEqual(['“big.png” is too large (max 5 MB)'])
   })
 
   it('an unnamed paste still reads humanly in the rejection', () => {
@@ -153,10 +152,10 @@ describe('attachmentMediaType', () => {
     expect(attachmentMediaType(fakeFile({ type: 'application/octet-stream', name: 'a.pdf' }))).toBe('application/pdf')
   })
 
-  it('answers null for a file cezar will not take, whatever it is called', () => {
-    expect(attachmentMediaType(fakeFile({ type: 'application/zip', name: 'a.zip' }))).toBeNull()
-    expect(attachmentMediaType(fakeFile({ type: '', name: 'Makefile' }))).toBeNull()
-    expect(attachmentMediaType(fakeFile({ type: 'application/octet-stream', name: 'a.bin' }))).toBeNull()
+  it('sends any other file as a binary attachment, whatever it is called (telemetry 48850f4a)', () => {
+    expect(attachmentMediaType(fakeFile({ type: 'application/zip', name: 'a.zip' }))).toBe('application/octet-stream')
+    expect(attachmentMediaType(fakeFile({ type: '', name: 'Makefile' }))).toBe('application/octet-stream')
+    expect(attachmentMediaType(fakeFile({ type: 'application/octet-stream', name: 'a.bin' }))).toBe('application/octet-stream')
   })
 
   /** Telemetry 6c4b3066: an `.html` was refused. Text formats go as `text/plain`, never `text/html`
@@ -168,13 +167,6 @@ describe('attachmentMediaType', () => {
     expect(attachmentMediaType(fakeFile({ type: '', name: 'main.ts' }))).toBe('text/plain')
     expect(attachmentMediaType(fakeFile({ type: 'video/mp2t', name: 'main.ts' }))).toBe('text/plain')
     expect(attachmentMediaType(fakeFile({ type: 'text/x-python', name: 'run' }))).toBe('text/plain')
-  })
-})
-
-describe('ATTACHMENT_ACCEPT', () => {
-  it('offers every extension the typeless fallback recognises', () => {
-    const accepted = ATTACHMENT_ACCEPT.split(',')
-    for (const ext of ['.md', '.log', '.pdf', '.png', '.jpeg', '.webp', '.html']) expect(accepted).toContain(ext)
   })
 })
 
@@ -293,9 +285,9 @@ describe('untyped clipboard images', () => {
   })
 
   it('does not guess formats the backends cannot decode, nor answer from the prototype', () => {
-    expect(attachmentMediaType(fakeFile({ type: '', name: 'logo.svg' }))).toBeNull()
-    expect(attachmentMediaType(fakeFile({ type: '', name: 'constructor' }))).toBeNull()
-    expect(attachmentMediaType(fakeFile({ type: '', name: 'x.toString' }))).toBeNull()
+    expect(attachmentMediaType(fakeFile({ type: '', name: 'logo.svg' }))).toBe('application/octet-stream')
+    expect(attachmentMediaType(fakeFile({ type: '', name: 'constructor' }))).toBe('application/octet-stream')
+    expect(attachmentMediaType(fakeFile({ type: '', name: 'x.toString' }))).toBe('application/octet-stream')
   })
 
   it('screenFiles accepts an untyped screenshot instead of rejecting it', () => {
