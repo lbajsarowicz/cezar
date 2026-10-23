@@ -34,6 +34,8 @@ import {
 } from './server/provider-action-gate.ts';
 import { printSkillsBanner, printStarBanner } from './skills-banner.ts';
 import { SelfUpdateService } from './self-update/service.ts';
+import { runsFromCheckout } from './self-update/layout.ts';
+import { devVersion } from './self-update/semver.ts';
 import { isSupervised, restartProcess } from './self-update/restart.ts';
 import { runSelfUpdateCommand } from './self-update/cli.ts';
 import { writeLaunchers } from './self-update/launcher.ts';
@@ -294,9 +296,11 @@ async function serveCommand(
   const providerRuntimeAuth = new ProviderRuntimeAuthObserver(providerAuth, (status) => {
     workspaceEvents.emit('provider-status', status);
   });
-  const version = readOwnVersion();
+  // Shown on health and the banner; update checks compare the raw version.
+  const version = shownVersion();
   // Opt-in telemetry: every send below is a no-op until the user agreed (docs/telemetry.md).
-  await initTelemetry({ version });
+  // It gets the raw version (`build.version_full`) and derives `-dev` itself.
+  await initTelemetry({ version: readOwnVersion() });
   installCrashReporter();
   track('app_start');
   startDailyPing();
@@ -340,7 +344,8 @@ async function serveCommand(
   const pkgName = readOwnName();
   const update: { latest?: string } = {};
   const selfUpdate = buildSelfUpdateService({
-    activeRuns: () => store.listRuns().filter((r) => ['queued', 'waiting', 'running'].includes(r.status)).length,
+    // Workspace-wide, every project's manager — not the boot repo's store (#1524).
+    runs: semaphore,
     // The server's own predicate, not a second spelling of it: the `/apply` guard decides hosted
     // mode through `resolveCapabilities`, and the two must never disagree (they did, on 127.0.0.2).
     trimPaths: () => !resolveCapabilities(process.env, bindHost).localHandoff,
@@ -869,13 +874,14 @@ function openStore(repoRoot: string, opts?: { keepLive?: boolean }): RunStore {
 
 /** The self-update service over THIS process: its package, version and entry file. */
 function buildSelfUpdateService(
-  overrides: Partial<Pick<ConstructorParameters<typeof SelfUpdateService>[0], 'restart' | 'activeRuns' | 'trimPaths'>> & {
+  overrides: Partial<Pick<ConstructorParameters<typeof SelfUpdateService>[0], 'restart' | 'runs' | 'trimPaths'>> & {
     restart: () => void;
   },
 ): SelfUpdateService {
   return new SelfUpdateService({
     pkgName: readOwnName(),
     version: readOwnVersion(),
+    displayVersion: shownVersion(),
     entry: resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
     supervised: isSupervised(),
     ...overrides,
@@ -891,6 +897,12 @@ function readOwnName(): string {
   } catch {
     return '@open-mercato/cezar';
   }
+}
+
+/** The running version as shown: `-dev` when the code is a source checkout, linked or not. */
+function shownVersion(): string {
+  const version = readOwnVersion();
+  return runsFromCheckout(resolve(process.argv[1] ?? fileURLToPath(import.meta.url))) ? devVersion(version) : version;
 }
 
 function readOwnVersion(): string {

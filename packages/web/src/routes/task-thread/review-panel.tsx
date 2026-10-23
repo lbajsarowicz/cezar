@@ -6,6 +6,7 @@ import {
   ExternalLinkIcon,
   EyeIcon,
   GitPullRequestIcon,
+  LoaderCircleIcon,
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -21,6 +22,8 @@ import { Link } from '@/lib/project-router'
 import { isSubmitShortcut } from '@/lib/use-submit-shortcut'
 import { isHttpUrl } from '@/lib/utils'
 
+import { GIT_ACTION_PENDING_LABELS } from '../task-git/git-toolbar'
+import { useRunGitStep } from '../task-git/run-git-step'
 import { finishTitle } from './run-actions'
 import { useContinuationProvider } from './continuation-provider'
 import { useDeliverPrompt } from './deliver-prompt'
@@ -115,6 +118,9 @@ function ReviewActions({ run, diffComments }: { run: ApiRun; diffComments?: Diff
     onError: (error: Error) => toast(error.message, { tone: 'danger' }),
   })
 
+  // Draft PR is the header's Create draft PR, by the same path: the agent opens it (exact target,
+  // adopted after its turn) — the server only when no agent can be reached.
+  const git = useRunGitStep(run)
   const draftPr = useMutation({
     mutationFn: () => createRunPr(run.id),
     onSuccess: (result) => {
@@ -126,6 +132,9 @@ function ReviewActions({ run, diffComments }: { run: ApiRun; diffComments?: Diff
       toast(error.message, { tone: 'danger' })
     },
   })
+
+  const draftPrBusy = draftPr.isPending || git.pending !== null
+  const openDraftPr = () => (git.byAgent ? git.onAction('create-draft-pr') : draftPr.mutate())
 
   const commentCount = diffComments?.comments.length ?? 0
   const submitNotes = () => {
@@ -226,12 +235,17 @@ function ReviewActions({ run, diffComments }: { run: ApiRun; diffComments?: Diff
             data-slot="review-draft-pr"
             variant="outline"
             size="sm"
-            title="Push the branch and open a draft PR"
-            disabled={draftPr.isPending}
-            onClick={() => draftPr.mutate()}
+            title={git.byAgent ? 'Ask the agent to push the branch and open a draft PR' : 'Push the branch and open a draft PR'}
+            disabled={draftPrBusy}
+            aria-busy={draftPrBusy || undefined}
+            onClick={openDraftPr}
           >
-            <GitPullRequestIcon aria-hidden="true" />
-            Draft PR
+            {draftPrBusy ? (
+              <LoaderCircleIcon aria-hidden="true" className="motion-safe:animate-spin" />
+            ) : (
+              <GitPullRequestIcon aria-hidden="true" />
+            )}
+            {draftPrBusy ? GIT_ACTION_PENDING_LABELS['create-draft-pr'] : 'Draft PR'}
           </Button>
         )}
         <Button
