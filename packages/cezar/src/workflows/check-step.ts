@@ -92,21 +92,19 @@ export interface CheckResult {
 }
 
 /**
- * Exit 127 is bash's "command not found". A check sees neither the host's full environment nor a
- * login profile, so a PATH entry only a shell profile adds (nvm, asdf, a GUI-launched cezar) is
- * the usual cause.
+ * Exit 127 is bash's "command not found". A check runs in a login shell, so the PATH is the one
+ * the user's profile builds; a tool installed elsewhere is not found.
  */
 export const COMMAND_NOT_FOUND_HINT =
-  'exit code 127 means a command was not found: checks run without login profiles and with a scrubbed environment, so start cezar from a shell whose PATH has the tool, or forward a missing variable with CEZ_ENV_PASSTHROUGH';
+  'exit code 127 means a command was not found: make sure the tool is on the PATH your login shell profile sets up';
 
 /**
- * Any non-zero exit may be the scrubbed environment: a check that reads a variable the host has
- * (a test database URL, a registry token) fails with a tool's own error, which never names the
- * dropped variable. The hint is attached to every failure so the cause is visible then, not only
- * on the rare exit 127.
+ * Any non-zero exit may be a credential the check needed: a check that reads a registry or cloud
+ * token from the host fails with a tool's own error, which never names the removed variable. The
+ * hint is attached to every failure so the cause is visible then, not only on the rare exit 127.
  */
 export const ENV_PASSTHROUGH_HINT =
-  'checks run with a scrubbed environment (no login profile, no backend credentials): if this failed because a variable was missing, forward it with CEZ_ENV_PASSTHROUGH=NAME (or restore everything with CEZ_AGENT_ENV_FULL=1)';
+  'checks run without the host\'s credential variables (names like *_TOKEN, *_SECRET, *_PASSWORD, *_API_KEY): if this failed because one was missing, forward it with CEZ_ENV_PASSTHROUGH=NAME (or keep them all with CEZ_AGENT_ENV_FULL=1)';
 
 export function checkExitHint(result: CheckResult): string | undefined {
   if (result.timedOut || result.exitCode === 0) return undefined;
@@ -155,7 +153,7 @@ export interface CheckProcess {
 }
 
 /**
- * Runs `command` under `bash -c` in its own process group, so a timeout or a cancel reaches every
+ * Runs `command` under `bash -lc` in its own process group, so a timeout or a cancel reaches every
  * process the command started, not only bash: a backgrounded server or a watcher left by the
  * check would otherwise outlive the step.
  */
@@ -167,7 +165,7 @@ export function runCheckCommand(opts: {
 }): CheckProcess {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS;
   const posix = process.platform !== 'win32';
-  const child = spawn('bash', ['-c', opts.command], {
+  const child = spawn('bash', ['-lc', opts.command], {
     cwd: opts.cwd,
     env: opts.env,
     detached: posix,

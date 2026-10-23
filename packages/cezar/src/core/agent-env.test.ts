@@ -390,14 +390,52 @@ describe('buildCheckEnv', () => {
     NODE_AUTH_TOKEN: 'npm',
   };
 
-  it('keeps the shell and toolchain base, CI, CEZ_* and gh auth, and drops everything else', () => {
+  it('keeps the host environment and drops only its credentials', () => {
     expect(Object.keys(buildCheckEnv(host)).sort()).toEqual(
-      ['CEZ_DRY_RUN', 'CI', 'GITHUB_TOKEN', 'HOME', 'LANG', 'LC_ALL', 'NODE_OPTIONS', 'PATH', 'TERM'].sort(),
+      ['CEZ_DRY_RUN', 'CI', 'DATABASE_URL', 'GITHUB_TOKEN', 'HOME', 'LANG', 'LC_ALL', 'NODE_OPTIONS', 'PATH', 'TERM'].sort(),
     );
   });
 
-  it('honours CEZ_ENV_PASSTHROUGH and CEZ_AGENT_ENV_FULL', () => {
-    expect(buildCheckEnv({ ...host, CEZ_ENV_PASSTHROUGH: 'database_url' }).DATABASE_URL).toBe(host.DATABASE_URL);
+  it('keeps host settings outside the agent allowlist: a profile PATH, connection URLs, cloud profiles', () => {
+    const env = buildCheckEnv({
+      PATH: '/home/u/.nvm/versions/node/v20/bin:/usr/bin',
+      NVM_DIR: '/home/u/.nvm',
+      REDIS_URL: 'redis://localhost:6379',
+      AWS_PROFILE: 'dev',
+      AWS_REGION: 'eu-central-1',
+      MY_APP_MODE: 'test',
+    });
+    expect(Object.keys(env).sort()).toEqual(['AWS_PROFILE', 'AWS_REGION', 'MY_APP_MODE', 'NVM_DIR', 'PATH', 'REDIS_URL']);
+  });
+
+  it('drops every credential-shaped name, in any spelling, but not the non-secret names the pattern catches', () => {
+    const env = buildCheckEnv({
+      NPM_TOKEN: 'npm',
+      aws_secret_access_key: 'aws',
+      AWS_ACCESS_KEY_ID: 'akia',
+      AWS_SESSION_TOKEN: 'sess',
+      POSTGRES_PASSWORD: 'pw',
+      STRIPE_API_KEY: 'sk',
+      SENTRY_AUTH: 'auth',
+      SIGNING_PRIVATE_KEY: 'pk',
+      GOOGLE_APPLICATION_CREDENTIALS: '/k.json',
+      SSH_AUTH_SOCK: '/tmp/ssh.sock',
+      XDG_SESSION_TYPE: 'wayland',
+      CEZ_HANDOFF_TOKEN: 'cez',
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'safe.directory',
+      GIT_CONFIG_VALUE_0: '*',
+    });
+    expect(Object.keys(env).sort()).toEqual(
+      ['CEZ_HANDOFF_TOKEN', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'SSH_AUTH_SOCK', 'XDG_SESSION_TYPE'],
+    );
+  });
+
+  it('honours CEZ_ENV_PASSTHROUGH and CEZ_AGENT_ENV_FULL for credentials', () => {
+    const pass = buildCheckEnv({ ...host, CEZ_ENV_PASSTHROUGH: 'node_auth_token, AWS_SECRET_ACCESS_KEY' });
+    expect(pass.NODE_AUTH_TOKEN).toBe('npm');
+    expect(pass.AWS_SECRET_ACCESS_KEY).toBe('aws');
+    expect(pass.ANTHROPIC_API_KEY).toBeUndefined();
     expect(buildCheckEnv({ ...host, CEZ_AGENT_ENV_FULL: '1' })).toEqual({ ...host, CEZ_AGENT_ENV_FULL: '1' });
   });
 

@@ -244,10 +244,11 @@ for follow-ups.
 
 ## What cezar gives the check, and what it does not
 
-- **cwd** is the task's worktree, and the command runs under `bash -c`, without login profiles.
-- **Environment** is the least-privilege set agents get, not the cezar
-  server's own `process.env` (a variable the host has but the check needs is
-  forwarded with `CEZ_ENV_PASSTHROUGH=NAME` when starting cezar), plus the
+- **cwd** is the task's worktree, and the command runs under `bash -lc`.
+- **Environment** is the cezar server's own `process.env` minus its
+  credential-shaped variables (`*_TOKEN`, `*_SECRET`, `*_PASSWORD`,
+  `*_API_KEY`, …; `gh` auth stays — forward another one with
+  `CEZ_ENV_PASSTHROUGH=NAME` when starting cezar), plus the
   **secrets** the step may read (below). There is no per-step `env:` — workflow files are
   committed, and a secret's value does not belong in them; a step names the
   secrets it needs instead. Tests with no agent step need no model at all.

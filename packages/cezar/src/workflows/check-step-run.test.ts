@@ -1,12 +1,26 @@
-import { execFile } from 'node:child_process';
+import { execFile, type SpawnOptions } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RunStore } from '../runs/store.ts';
 import { RunManager } from './run.ts';
 import type { WorkflowDef } from './types.ts';
+
+// Fixtures assert exact check output; developer login profiles must not add stderr or alter the
+// env. Keep real Bash/stdio/env and the production -lc login shell.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawn: (file: string, args: readonly string[], options?: SpawnOptions) => actual.spawn(
+      file,
+      file === 'bash' && args[0] === '-lc' ? ['--noprofile', '--norc', ...args] : args,
+      options ?? {},
+    ),
+  };
+});
 
 const run = promisify(execFile);
 const GIT_ID = ['-c', 'user.name=test', '-c', 'user.email=test@local'];
@@ -88,13 +102,26 @@ describe('check steps are bounded in time, output and environment', () => {
     expect(injected).toMatch(/… \d+ lines omitted …/);
   }, 40_000);
 
-  it('runs the command without host variables outside the allowlist', async () => {
+  it('runs the command with the host environment minus its credentials', async () => {
     setEnv('CEZ_TEST_UNLISTED_HOST_SECRET_XYZ', 'kept');
+    setEnv('CEZ_TEST_DATABASE_URL_XYZ', 'postgres://localhost/test');
+    setEnv('UNLISTED_HOST_SETTING_XYZ', 'kept');
     setEnv('UNLISTED_HOST_SECRET_XYZ', 'leaked');
+    setEnv('UNLISTED_REGISTRY_TOKEN_XYZ', 'leaked');
     const workflow: WorkflowDef = {
       name: 'env',
       source: 'file',
-      steps: [{ id: 'verify', command: 'test -z "${UNLISTED_HOST_SECRET_XYZ:-}" && test -n "$CEZ_TEST_UNLISTED_HOST_SECRET_XYZ" && test -n "$PATH"' }],
+      steps: [{
+        id: 'verify',
+        command: [
+          'shopt -q login_shell',
+          'test -n "$PATH"',
+          'test -n "$CEZ_TEST_UNLISTED_HOST_SECRET_XYZ"',
+          'test -n "$UNLISTED_HOST_SETTING_XYZ"',
+          'test -z "${UNLISTED_HOST_SECRET_XYZ:-}"',
+          'test -z "${UNLISTED_REGISTRY_TOKEN_XYZ:-}"',
+        ].join(' && '),
+      }],
     };
     const record = manager.startRun(workflow, { task: 'x', worktree: false });
     const settled = await settle(record.id, 20_000);

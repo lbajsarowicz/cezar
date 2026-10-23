@@ -1,9 +1,9 @@
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnOptions } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CHECK_OUTPUT_CAP,
   COMMAND_NOT_FOUND_HINT,
@@ -15,6 +15,20 @@ import {
   stripAnsi,
   type CheckResult,
 } from './check-step.ts';
+
+// Fixtures assert exact check output; developer login profiles must not add stderr or alter the
+// env. Keep real Bash/stdio/env and the production -lc login shell.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    spawn: (file: string, args: readonly string[], options?: SpawnOptions) => actual.spawn(
+      file,
+      file === 'bash' && args[0] === '-lc' ? ['--noprofile', '--norc', ...args] : args,
+      options ?? {},
+    ),
+  };
+});
 
 const lines = (n: number, prefix = 'line') => Array.from({ length: n }, (_, i) => `${prefix} ${i}\n`).join('');
 
@@ -83,17 +97,19 @@ describe('formatCheckFailure', () => {
     expect(text).toBe(`$ npm test\n(exit code 1)\n${ENV_PASSTHROUGH_HINT}\n\nboom`);
   });
 
-  it('hints at CEZ_ENV_PASSTHROUGH on any failure, so a dropped variable is not silent', () => {
+  it('hints at the removed credentials and CEZ_ENV_PASSTHROUGH on any failure, so a dropped variable is not silent', () => {
     const text = formatCheckFailure('npm test', { ok: false, exitCode: 3, output: 'ECONNREFUSED', timedOut: false }, 1000);
     expect(text).toContain(ENV_PASSTHROUGH_HINT);
     expect(ENV_PASSTHROUGH_HINT).toContain('CEZ_ENV_PASSTHROUGH');
+    expect(ENV_PASSTHROUGH_HINT).toContain('credential');
+    expect(ENV_PASSTHROUGH_HINT).not.toContain('login profile');
   });
 
-  it('points a command-not-found exit at PATH and CEZ_ENV_PASSTHROUGH', () => {
+  it('points a command-not-found exit at the login profile PATH', () => {
     const text = formatCheckFailure('pnpm test', { ok: false, exitCode: 127, output: 'bash: pnpm: command not found', timedOut: false }, 1000);
     expect(text).toBe(`$ pnpm test\n(exit code 127)\n${COMMAND_NOT_FOUND_HINT}\n\nbash: pnpm: command not found`);
     expect(COMMAND_NOT_FOUND_HINT).toContain('PATH');
-    expect(COMMAND_NOT_FOUND_HINT).toContain('CEZ_ENV_PASSTHROUGH');
+    expect(COMMAND_NOT_FOUND_HINT).toContain('login shell profile');
   });
 
   it('says a timed-out check was killed', () => {
@@ -120,6 +136,11 @@ describe('runCheckCommand', () => {
       return false;
     }
   };
+
+  it('runs the command in a login shell, so profile-provided PATH entries (nvm, asdf) still apply', async () => {
+    const result = await runCheckCommand({ command: 'shopt -q login_shell', cwd: tmp(), env: process.env }).result;
+    expect(result).toMatchObject({ ok: true, exitCode: 0 });
+  });
 
   it('passes and fails on the exit code', async () => {
     const cwd = tmp();

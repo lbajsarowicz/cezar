@@ -8073,7 +8073,7 @@ export class RunManager {
   }
 
   /**
-   * The environment a check step runs with: the least-privilege check env, plus the secrets the step may
+   * The environment a check step runs with: the server's own minus its credentials, plus the secrets the step may
    * read (spec 2026-10-10-project-secrets-vault-options) — the project's and the workspace's
    * with the `checks` audience, or exactly the step's `secrets:` bindings. Read fresh for every
    * check execution, so an edit applies to the next check, never one mid-command. The values
@@ -8107,7 +8107,10 @@ export class RunManager {
     );
     // The run context wins last (Phase 2). Its names are first removed from what the server
     // inherited — a cezar started inside another cezar task carries that task's `CEZ_*` — so a
-    // variable this run does not set is absent, never a stale value from somewhere else.
+    // variable this run does not set is absent, never a stale value from somewhere else. The
+    // login shell `runCheckStep` spawns sources the user's profile after this, so the guarantee
+    // — and the credential scrub — is about the server's environment, not about a profile that
+    // exports one of these names.
     const base: NodeJS.ProcessEnv = buildCheckEnv(process.env, { untrusted });
     for (const name of CHECK_CONTEXT_VARS) {
       // `CEZ_PROJECT_ID` is the one context name that is ALSO a documented CLI input

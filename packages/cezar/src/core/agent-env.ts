@@ -17,7 +17,7 @@
  */
 
 import type { AgentBackend } from './agent-runner.ts';
-import { SECRET_NAME_RE } from './secret-redaction.ts';
+import { SECRET_NAME_RE, isCredentialName } from './secret-redaction.ts';
 
 /**
  * Env var names are matched case-INSENSITIVELY (#427 review). Windows spells
@@ -415,15 +415,15 @@ function readPassthrough(source: NodeJS.ProcessEnv): ReadonlySet<string> {
   );
 }
 
-/** CI-convention flags a check command's toolchain reads to pick non-interactive output. */
-const CHECK_ALLOW_NAMES: ReadonlySet<string> = upperSet(['CI']);
-
 /**
- * The environment a workflow check command runs in: the same least-privilege base an agent's
- * own shell gets (minus the per-task temp directory), `CEZ_*`, `gh` auth and the
- * `CEZ_ENV_PASSTHROUGH` / `CEZ_AGENT_ENV_FULL` escape hatches — but no backend's model
- * credentials, which a shell command has no use for.
+ * The environment a workflow check command runs in: the host environment with its credentials
+ * removed. A check is the project's own verification command (`npm test`, `make lint`), so the
+ * host's PATH, toolchain and connection settings (`DATABASE_URL`, `REDIS_URL`, `AWS_PROFILE`)
+ * stay; what goes is every credential-shaped name — the one classification `secret-redaction.ts`
+ * also redacts by — except cezar's own `CEZ_*`, the shell/toolchain base the agent env forwards
+ * (`SSH_AUTH_SOCK`), and `gh` auth.
  *
+ * `CEZ_ENV_PASSTHROUGH` names credentials to keep anyway; `CEZ_AGENT_ENV_FULL=1` keeps them all.
  * `untrusted` (a fork PR's head) removes the `gh` credentials from whatever the rest of this
  * function would have produced, the escape hatches included.
  */
@@ -431,32 +431,19 @@ export function buildCheckEnv(
   source: NodeJS.ProcessEnv = process.env,
   options: { untrusted?: boolean } = {},
 ): NodeJS.ProcessEnv {
-  const env = buildCheckEnvTrusted(source);
-  if (options.untrusted) {
-    for (const name of Object.keys(env)) {
-      if (GH_CREDENTIAL_NAMES.has(name.toUpperCase())) delete env[name];
-    }
-  }
-  return env;
-}
-
-function buildCheckEnvTrusted(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  if (isTruthy(readVar(source, 'CEZ_AGENT_ENV_FULL'))) return { ...source };
+  const full = isTruthy(readVar(source, 'CEZ_AGENT_ENV_FULL'));
   const passthrough = readPassthrough(source);
   const out: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(source)) {
     if (value === undefined) continue;
     const key = name.toUpperCase();
-    if (
-      key.startsWith('CEZ_') ||
-      CHECK_ALLOW_NAMES.has(key) ||
-      GH_ALLOW_NAMES.has(key) ||
-      passthrough.has(key) ||
-      BASE_ALLOW_NAMES.has(key) ||
-      (matchesPrefix(key, BASE_ALLOW_PREFIXES) && !looksSecret(key))
-    ) {
-      out[name] = value;
-    }
+    if (options.untrusted && GH_CREDENTIAL_NAMES.has(key)) continue;
+    if (full || passthrough.has(key) || !isCheckCredential(key)) out[name] = value;
   }
   return out;
+}
+
+function isCheckCredential(key: string): boolean {
+  if (key.startsWith('CEZ_') || GH_ALLOW_NAMES.has(key) || BASE_ALLOW_NAMES.has(key)) return false;
+  return isCredentialName(key);
 }
