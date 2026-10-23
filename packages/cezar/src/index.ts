@@ -312,9 +312,12 @@ async function serveCommand(
   const providerRuntimeAuth = new ProviderRuntimeAuthObserver(providerAuth, (status) => {
     workspaceEvents.emit('provider-status', status);
   });
-  const { name: pkgName, version } = readOwnManifest();
+  const { name: pkgName } = readOwnManifest();
+  // Shown on health and the banner; update checks compare the raw version.
+  const version = await shownVersion();
   // Opt-in telemetry: every send below is a no-op until the user agreed (docs/telemetry.md).
-  await initTelemetry({ version });
+  // It gets the raw version (`build.version_full`) and derives `-dev` itself.
+  await initTelemetry({ version: readOwnManifest().version });
   installCrashReporter();
   track('app_start');
   startDailyPing();
@@ -342,7 +345,8 @@ async function serveCommand(
   // chip can apply it when this cezar runs from the managed layout (`cezar install`).
   const update: { latest?: string } = {};
   const selfUpdate = await buildSelfUpdateService({
-    activeRuns: () => store.listRuns().filter((r) => ['queued', 'waiting', 'running'].includes(r.status)).length,
+    // Workspace-wide, every project's manager — not the boot repo's store (#1524).
+    runs: semaphore,
     // The server's own predicate, not a second spelling of it: the `/apply` guard decides hosted
     // mode through `resolveCapabilities`, and the two must never disagree (they did, on 127.0.0.2).
     trimPaths: () => !resolveCapabilities(process.env, bindHost).localHandoff,
@@ -925,7 +929,7 @@ async function openStore(repoRoot: string, opts?: { keepLive?: boolean }): Promi
 
 /** The self-update service over THIS process: its package, version and entry file. */
 async function buildSelfUpdateService(
-  overrides: Partial<Pick<ConstructorParameters<typeof SelfUpdateService>[0], 'restart' | 'activeRuns' | 'trimPaths'>> & {
+  overrides: Partial<Pick<ConstructorParameters<typeof SelfUpdateService>[0], 'restart' | 'runs' | 'trimPaths'>> & {
     restart: () => void;
   },
 ): Promise<SelfUpdateService> {
@@ -937,10 +941,21 @@ async function buildSelfUpdateService(
   return new SelfUpdateService({
     pkgName,
     version,
+    displayVersion: await shownVersion(),
     entry: resolve(process.argv[1] ?? fileURLToPath(import.meta.url)),
     supervised: isSupervised(),
     ...overrides,
   });
+}
+
+/** The running version as shown: `-dev` when the code is a source checkout, linked or not. */
+async function shownVersion(): Promise<string> {
+  const [{ runsFromCheckout }, { devVersion }] = await Promise.all([
+    import('./self-update/layout.ts'),
+    import('./self-update/semver.ts'),
+  ]);
+  const { version } = readOwnManifest();
+  return runsFromCheckout(resolve(process.argv[1] ?? fileURLToPath(import.meta.url))) ? devVersion(version) : version;
 }
 
 let ownManifest: { name: string; version: string } | undefined;
