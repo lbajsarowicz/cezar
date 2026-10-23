@@ -132,6 +132,7 @@ function serve({
     liveTitleUpdates: null,
     effectiveLiveTitleUpdates: false,
     reviewGate: null,
+    profile: null, taskWorkspace: null, landing: null, landingBlocked: null, requiredChecks: [], defaultSkill: null, askSkill: null, teamSkills: true,
     ...config,
   }
   const json = (payload: unknown, status = 200) =>
@@ -737,7 +738,7 @@ describe('the tasks section', () => {
     fireEvent.click(toggle)
     await waitFor(() => expect(puts()).toHaveLength(1))
     expect(puts()[0]?.body).toEqual({ liveTitleUpdates: true })
-    await waitFor(() => expect(screen.getByText('On')).toBeTruthy())
+    await waitFor(() => expect(toggle.closest('label')?.textContent).toBe('On'))
   })
 
   it('live title updates: an env opt-in with no config key shows ON and turns off in one click', async () => {
@@ -751,14 +752,14 @@ describe('the tasks section', () => {
     await waitFor(() =>
       expect(toggle.getAttribute('aria-checked') ?? toggle.getAttribute('data-state')).toMatch(/true|checked/),
     )
-    expect(screen.getByText(/^On/)).toBeTruthy()
+    expect(toggle.closest('label')?.textContent).toMatch(/^On/)
     fireEvent.click(toggle)
     await waitFor(() => expect(puts()).toHaveLength(1))
     expect(puts()[0]?.body).toEqual({ liveTitleUpdates: false })
     await waitFor(() =>
       expect(toggle.getAttribute('aria-checked') ?? toggle.getAttribute('data-state')).toMatch(/false|unchecked/),
     )
-    expect(screen.getByText('Off')).toBeTruthy()
+    expect(toggle.closest('label')?.textContent).toBe('Off')
   })
   it('review gate: the switch defaults OFF and PUTs the toggle (#489)', async () => {
     serve()

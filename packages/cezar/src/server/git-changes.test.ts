@@ -221,6 +221,21 @@ describe('collectChanges — structured diff vs base', () => {
     expect(result.changes.files[0]?.patch).toContain('… (patch truncated)');
   });
 
+  it("excludeCezarData leaves cezar's own .ai/cezar files out of an in-place task's Changes", async () => {
+    writeFileSync(join(dir, 'tracked.txt'), 'a\n');
+    g(dir, 'add', '-A');
+    g(dir, 'commit', '-m', 'base');
+    mkdirSync(join(dir, '.ai/cezar'), { recursive: true });
+    for (const name of ['.gitignore', 'config.json', 'ui-state.json']) writeFileSync(join(dir, '.ai/cezar', name), '{}\n');
+    writeFileSync(join(dir, 'summary.md'), 'notes\n');
+
+    const scoped = await collectChanges(dir, 'main', { intentToAdd: false, excludeCezarData: true });
+    expect(scoped.ok && scoped.changes.files.map((f) => f.path)).toEqual(['summary.md']);
+    // The repo-wide view still shows everything.
+    const all = await collectChanges(dir, 'main', { intentToAdd: false });
+    expect(all.ok && all.changes.files.length).toBe(4);
+  });
+
   it('intentToAdd:false never stages into the index (#major-index-mutation)', async () => {
     writeFileSync(join(dir, 'tracked.txt'), 'a\n');
     g(dir, 'add', '-A');
@@ -592,6 +607,22 @@ describe('session git API routes', () => {
     expect((await apiRequest(app, `/api/v1/runs/${removed.id}/git/status`)).status).toBe(409);
   });
 
+  it('GET /git/status answers for an in-place write task from the checkout, never for a read-only one', async () => {
+    mkdirSync(join(repoRoot, '.ai/cezar'), { recursive: true });
+    writeFileSync(join(repoRoot, '.ai/cezar/config.json'), '{}\n');
+    writeFileSync(join(repoRoot, 'summary.md'), 'notes\n');
+    const inPlace = store.createRun({ title: 'in place', workflow: 'quick-task', task: 'x', steps: [] });
+    store.updateRun(inPlace.id, { worktree: false });
+    const res = await apiRequest(app, `/api/v1/runs/${inPlace.id}/git/status`);
+    expect(res.status).toBe(200);
+    // cezar's own files are not the task's work; no upstream means null counts.
+    expect(await res.json()).toMatchObject({ uncommitted: 1, unpushed: null, behind: null });
+
+    const asked = store.createRun({ title: 'ask', workflow: 'quick-task', task: 'x', steps: [] });
+    store.updateRun(asked.id, { worktree: false, readOnly: true });
+    expect((await apiRequest(app, `/api/v1/runs/${asked.id}/git/status`)).status).toBe(409);
+  });
+
   it('GET /changes uses the persisted task branch to detect a repointed HEAD', async () => {
     writeFileSync(join(worktree, 'reviewed.txt'), 'reviewed branch history\n');
     g(worktree, 'add', '-A');
@@ -864,6 +895,27 @@ describe('session git API routes', () => {
 
     expect((await commit(run.id, { message: '   ' })).status).toBe(400);
     expect((await commit(run.id, {})).status).toBe(400);
+  });
+
+  it('POST pr/adopt records the PR found by branch, leaves the status alone, and is idempotent', async () => {
+    const previous = process.env.CEZ_DRY_RUN;
+    process.env.CEZ_DRY_RUN = '1'; // the forge lookup answers the fixed demo PR, no gh
+    try {
+      const adopt = () => apiRequest(app, `/api/v1/runs/${run.id}/pr/adopt`, { method: 'POST' });
+      // No remote, no target: nothing to look up.
+      expect(await (await adopt()).json()).toEqual({ found: false });
+
+      g(worktree, 'remote', 'add', 'origin', 'git@github.com:open-mercato/cezar.git');
+      store.updateRun(run.id, { status: 'waiting' });
+      const url = 'https://github.com/open-mercato/demo/pull/777';
+      expect(await (await adopt()).json()).toEqual({ found: true, url });
+      expect(store.getRun(run.id)).toMatchObject({ pullRequestUrl: url, status: 'waiting' });
+      expect(await (await adopt()).json()).toEqual({ found: true, url });
+      expect((await apiRequest(app, '/api/v1/runs/nope/pr/adopt', { method: 'POST' })).status).toBe(404);
+    } finally {
+      if (previous === undefined) delete process.env.CEZ_DRY_RUN;
+      else process.env.CEZ_DRY_RUN = previous;
+    }
   });
 
   it('POST git/push with no remote is a 409 with a human reason', async () => {
@@ -1325,7 +1377,7 @@ describe('worktreeGitStatus — what has not left the worktree', () => {
       g(dir, 'push', '-q', 'origin', 'main');
       const fork = g(dir, 'rev-parse', 'HEAD').trim();
       g(dir, 'checkout', '-q', '-b', 'task');
-      expect((await worktreeGitStatus(dir, 'main')) as { behind: number | null }).toMatchObject({ behind: 0 });
+      expect((await worktreeGitStatus(dir, 'main')) as { behind: number | null }).toMatchObject({ behind: 0, ahead: 0 });
 
       // One commit lands on the REMOTE main (another clone pushed it) and is fetched — the local
       // main never moves, so only the remote-tracking ref knows the branch is behind.
