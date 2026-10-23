@@ -282,16 +282,14 @@ describe('finishTitle', () => {
 
 describe('resolveConflictsPrompt', () => {
   it('names the pull request, because a task can point at more than one', () => {
-    // The reason the number is in the words at all (#901: the PR a task opened AND the PR it is
-    // about both get chips). Told to "resolve the conflicts" with no number, the agent picks one
-    // at even odds — and half the time it is not the chip the user pressed.
-    expect(resolveConflictsPrompt(534)).toBe('Merge head branch and resolve conflicts in PR number 534')
-    expect(resolveConflictsPrompt(902)).toContain('PR number 902')
+    // The reason the number rides along at all (#901: the PR a task opened AND the PR it is about
+    // both get chips). Told to resolve conflicts with no number, the agent picks one at even odds.
+    expect(resolveConflictsPrompt(534)).toBe('Resolve conflicts in PR 534')
   })
 
-  it('still reads as a sentence for a reference with no number', () => {
+  it('still reads for a reference with no number', () => {
     // `taskPrUrl`'s tolerance: a forge whose PR URLs do not end in a number still gets a chip.
-    expect(resolveConflictsPrompt()).toBe('Merge head branch and resolve conflicts in this pull request')
+    expect(resolveConflictsPrompt()).toBe('Resolve conflicts')
   })
 })
 
