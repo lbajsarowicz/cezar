@@ -22,11 +22,19 @@ describe('the dispatch prompt', () => {
     for (const flag of ['--title', '--review-of', '--success', '--evidence', '--tools', '--runner', '--model', '--retry-limit']) {
       expect(DISPATCH_PROMPT).not.toContain(flag);
     }
-    expect(DISPATCH_PROMPT.length).toBeLessThan(2500);
+    expect(DISPATCH_PROMPT.length).toBeLessThan(2700);
   });
 
   it('never lets an uncapped parent invent a cap for its children', () => {
     expect(DISPATCH_PROMPT).toContain('Never invent a --budget');
+  });
+
+  it('warns against leaving processes behind and against pkill -f on a generic pattern (#1411)', () => {
+    for (const prompt of [DISPATCH_PROMPT, CHILD_DISPATCH_PROMPT]) {
+      expect(prompt).toContain('timeout 300');
+      expect(prompt).toContain('never with pkill -f');
+      expect(prompt).toContain('check ps');
+    }
   });
 
   it('says when NOT to dispatch — the task-shape gate the evidence demands', () => {

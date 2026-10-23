@@ -10,6 +10,8 @@
  */
 import { type DispatchIntent, type DispatchKind, type RunDispatch } from '@open-mercato/cezar-contract';
 
+const PROCESSES = `Processes. Put a time limit on anything that could hang (timeout 300 <test binary>). Stop a process you started by its pid, never with pkill -f on a generic pattern — it can match your own shell. Before you report, check ps for anything you started that is still running and stop it; cezar stops what is left when the task settles.`;
+
 const GUARD = `The Guard. Before anything irreversible, financial, or outside the scope you were given — pushing to a shared branch, merging into the base branch, deleting a branch or a remote, spending beyond your budget, touching production or a credential — end the turn with CEZ:ASK and stop. Never work around a blocked action.`;
 
 export const DISPATCH_PROMPT = `Dispatching tasks. cezar can run other cezar tasks for you, each in its own git worktree forked off your last commit, each reporting back into this session when it settles. Use it only for work that is genuinely INDEPENDENT of yours — unrelated fixes, a review by a fresh pair of eyes, a wide read-only investigation, disjoint parts of the repository — and NOT for one tightly coupled change: split coupled work gets slower, more expensive and inconsistent. When in doubt, do it yourself.
@@ -20,6 +22,8 @@ While children work and you have nothing else to do, end your turn with a line c
 
 A report is a CLAIM. cezar attaches the child's branch, diff size and cost — and, for a scoped child that settled successfully, its own scope check. Do not re-derive any of those; judge the work: read its diff and run the tests it names before merging. Merge an accepted child into YOUR branch with git merge --no-ff <branch>, one at a time, re-running the repository's checks after each. Never merge into the repository's base branch and never push it. When the stakes call for it, dispatch a --kind review task and merge only after its verdict is approve.
 
+${PROCESSES}
+
 ${GUARD}`;
 
 export const CHILD_DISPATCH_PROMPT = `You were dispatched. Another cezar task ordered this one: the text above the "## Task order" block is your whole assignment, and the order's scope, success criteria and required evidence are what you are judged on. Stay inside the scope — cezar checks your changed files against it when you settle. Keep your running notes in your notes.md in the tree directory your order names (CEZ_TREE_DIR); brief.md there is the root's objective.
@@ -27,6 +31,8 @@ export const CHILD_DISPATCH_PROMPT = `You were dispatched. Another cezar task or
 Before you finish, report: node "$CEZ_BIN" task report --status done|partial|failed|blocked --result "<what you did and the state now>" [--evidence "…" …]. node "$CEZ_BIN" task --help lists every flag (verdict, suggestions for the root, confidence). Be honest: a done that is not done costs your parent a whole extra round trip. Evidence is commands you ran and what they printed, files you changed, tests that passed.
 
 A part of your order that is genuinely independent and large may be dispatched in turn — node "$CEZ_BIN" task --help says how.
+
+${PROCESSES}
 
 ${GUARD}`;
 
