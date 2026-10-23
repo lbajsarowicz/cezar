@@ -144,11 +144,13 @@ describe('skillDelivery — which skills travel as a path', () => {
     expect(skillDelivery(dirSkill, 'claude', agents)).toEqual({
       mode: 'path',
       file: join(agents, '.agents/skills/om-code-review/SKILL.md'),
+      skillTool: false,
     });
     const claude = cwdWith('.claude/skills');
     expect(skillDelivery(dirSkill, 'claude', claude)).toEqual({
       mode: 'path',
       file: join(claude, '.claude/skills/om-code-review/SKILL.md'),
+      skillTool: false,
     });
   });
 
@@ -193,9 +195,9 @@ describe('skillDelivery — which skills travel as a path', () => {
     mkdirSync(join(cwd, '.ai/skills/demo'), { recursive: true });
     writeFileSync(file, '---\nname: demo\n---\nbody\n');
     const skill = { name: 'demo', path: file, source: 'ai' as const };
-    expect(skillDelivery(skill, 'claude', cwd)).toEqual({ mode: 'path', file });
+    expect(skillDelivery(skill, 'claude', cwd)).toEqual({ mode: 'path', file, skillTool: false });
     expect(skillDelivery(skill, 'claude', cwd, ['Skill'])).toEqual({ mode: 'inline' });
-    expect(skillDelivery(skill, 'claude', cwd, ['Read'])).toEqual({ mode: 'path', file });
+    expect(skillDelivery(skill, 'claude', cwd, ['Read'])).toEqual({ mode: 'path', file, skillTool: false });
   });
 
   it('inlines when a Claude step allowlist does not grant Read', () => {
@@ -239,8 +241,11 @@ describe('skillDelivery — which skills travel as a path', () => {
     expect(skillDelivery(dirSkill, 'claude', cwd)).toEqual({
       mode: 'path',
       file: join(cwd, '.claude/skills/om-code-review/SKILL.md'),
+      skillTool: false,
     });
-    expect(skillDelivery(dirSkill, 'codex', cwd).mode).toBe('path');
+    expect(skillDelivery(dirSkill, 'codex', cwd)).toMatchObject({ mode: 'path', skillTool: true });
+    expect(skillDelivery(dirSkill, 'opencode', cwd)).toMatchObject({ mode: 'path', skillTool: true });
+    expect(skillDelivery(dirSkill, 'claude', cwd, ['Read', 'Skill'])).toMatchObject({ mode: 'path', skillTool: true });
   });
 });
 
@@ -248,12 +253,18 @@ describe('skillSystemPrompt — path delivery', () => {
   const skill = { name: 'om-code-review', description: 'Review a diff.', body: 'Do the review.', source: 'agents' as const, path: '/p/SKILL.md' };
 
   it('carries identity, the file and the load instruction, but not the body', () => {
-    const out = skillSystemPrompt(skill, { mode: 'path', file: '/wt/.agents/skills/om-code-review/SKILL.md' });
+    const out = skillSystemPrompt(skill, { mode: 'path', file: '/wt/.agents/skills/om-code-review/SKILL.md', skillTool: true });
     expect(out).toContain('Selected skill: /om-code-review');
     expect(out).toContain('Description: Review a diff.');
     expect(out).toContain('Skill file: /wt/.agents/skills/om-code-review/SKILL.md');
-    expect(out).toContain('skill tool');
+    expect(out).toContain('Load this skill with your skill tool, or read that file before acting.');
     expect(out).not.toContain('Do the review.');
+  });
+
+  it('only tells the agent to read the file when it has no skill tool', () => {
+    const out = skillSystemPrompt(skill, { mode: 'path', file: '/wt/.claude/skills/om-code-review/SKILL.md', skillTool: false });
+    expect(out).toContain('Read that file before acting.');
+    expect(out).not.toContain('skill tool');
   });
 
   it('keeps the inlined body by default', () => {

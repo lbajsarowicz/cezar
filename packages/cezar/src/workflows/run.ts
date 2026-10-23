@@ -8367,7 +8367,9 @@ export function makeRunTitle(task: string, workflow: WorkflowDef, attachmentCoun
 }
 
 /** How a selected skill reaches the agent: its whole body, or its identity and file path. */
-export type SkillDelivery = { mode: 'inline' } | { mode: 'path'; file: string };
+export type SkillDelivery =
+  | { mode: 'inline' }
+  | { mode: 'path'; file: string; skillTool: boolean };
 
 /* Verified to discover `SKILL.md` directories natively (spec 2026-09-30-skills-in-worktree). */
 const NATIVE_SKILL_BACKENDS: ReadonlySet<AgentBackend> = new Set(['claude', 'claude-cli', 'codex', 'opencode']);
@@ -8397,7 +8399,9 @@ export function skillDelivery(
   }
   if (skill.source !== 'team' && basename(skill.path) !== 'SKILL.md') return { mode: 'inline' };
   const file = provisionedSkillFile(cwd, skill);
-  return file ? { mode: 'path', file } : { mode: 'inline' };
+  if (!file) return { mode: 'inline' };
+  const isClaude = backend === 'claude' || backend === 'claude-cli';
+  return { mode: 'path', file, skillTool: !isClaude || allowedTools.includes('Skill') };
 }
 
 /**
@@ -8427,7 +8431,7 @@ export function skillSystemPrompt(
     lines.push(
       '',
       `Skill file: ${delivery.file}`,
-      `Load this skill with your skill tool, or read that file before acting. ` +
+      `${delivery.skillTool ? 'Load this skill with your skill tool, or read that file' : 'Read that file'} before acting. ` +
         `Resolve any file it references (for example references/*.md) against its directory.`,
     );
     return lines.join('\n');

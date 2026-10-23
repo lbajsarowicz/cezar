@@ -477,7 +477,7 @@ describe('systemPrompt end-to-end (dry run)', () => {
         path: join(repoRoot, '.ai/skills/om-auto-review-pr/SKILL.md'),
         source: 'ai',
       },
-      { mode: 'path', file: join(worktreePath, '.claude/skills/om-auto-review-pr/SKILL.md') },
+      { mode: 'path', file: join(worktreePath, '.claude/skills/om-auto-review-pr/SKILL.md'), skillTool: false },
     );
     expect(capturedSystemPrompt()).toBe(
       composeSystemPrompt(skillPrompt, CONFIG_PROMPT, HANDOFF_INSTRUCTIONS),
