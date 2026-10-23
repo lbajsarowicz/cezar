@@ -253,7 +253,7 @@ async function serveCommand(
     { ProviderRuntimeAuthObserver, recoverWithProviderRuntimeAuthObservation },
     { resolveCapabilities },
     { detectEnvironment },
-    { sweepStartupWorktrees },
+    { bootInOrder, sweepStartupWorktrees },
     { isSupervised, restartProcess },
     { printSkillsBanner, printStarBanner },
   ] = await Promise.all([
@@ -325,166 +325,163 @@ async function serveCommand(
   const checks = await detectEnvironment();
   const repo = repoInfo ?? null;
 
-  // Recovery settles before the listener exists: every record the previous process left
-  // queued/running/waiting is owned by the manager (queued or active) before the first request
-  // can cancel, continue or message it.
-  const recovered = store
-    .listRuns()
-    .filter((r) => ['queued', 'waiting', 'running'].includes(r.status)).length;
-  await recoverWithProviderRuntimeAuthObservation(
-    store,
-    () => manager.recover(),
-    providerRuntimeAuth,
-  );
-  if (recovered > 0) console.log(`  recovered ${recovered} run(s) from the previous session`);
-
-  const port = await pickPort(preferredPort);
-
-  // Update discovery (#368) through the self-update service (PoC): the channel's newest
-  // version lands on /api/v1/health as `latestVersion` for the chip, and the dialog behind the
-  // chip can apply it when this cezar runs from the managed layout (`cezar install`).
-  const update: { latest?: string } = {};
-  const selfUpdate = await buildSelfUpdateService({
-    // Workspace-wide, every project's manager — not the boot repo's store (#1524).
-    runs: semaphore,
-    // The server's own predicate, not a second spelling of it: the `/apply` guard decides hosted
-    // mode through `resolveCapabilities`, and the two must never disagree (they did, on 127.0.0.2).
-    trimPaths: () => !resolveCapabilities(process.env, bindHost).localHandoff,
-    restart: () => {
-      void (httpServer?.shutdownLifecycle() ?? manager.lifecycle.shutdown()).then(() => {
-        store.flush({ pretty: true });
-        // The old process stops here, so it reports its own stop before handing over (bounded).
-        track('app_stop', { reason: 'restart' });
-        void flushTelemetry(1_000).finally(() =>
-          restartProcess({ server: httpServer, args: process.argv.slice(2), port, supervised: isSupervised() }),
-        );
-        restartProcess({ server: httpServer, args: process.argv.slice(2), port, supervised: isSupervised() });
-      }).catch((error: unknown) => {
-        console.error('cezar: lifecycle shutdown failed before restart', error);
-        process.exit(1);
-      });
+  const booted = await bootInOrder({
+    recover: async () => {
+      const recovered = store
+        .listRuns()
+        .filter((r) => ['queued', 'waiting', 'running'].includes(r.status)).length;
+      await recoverWithProviderRuntimeAuthObservation(
+        store,
+        () => manager.recover(),
+        providerRuntimeAuth,
+      );
+      if (recovered > 0) console.log(`  recovered ${recovered} run(s) from the previous session`);
     },
-  });
-  void selfUpdate.updateAvailable().then((latest) => {
-    if (!latest) return;
-    update.latest = latest;
-    const how = selfUpdate.installKind === 'managed' ? 'update from the cockpit or: cezar update' : `restart with: npx ${pkgName}@latest`;
-    console.log(`\n  ⬆ cezar ${latest} is available (running ${version}) — ${how}\n`);
-  });
-  // What the process is doing, on every error report (a wide event, not a bare message).
-  registerTelemetryContext(() => {
-    const runs = store.listRuns();
-    const count = (status: string) => runs.filter((r) => r.status === status).length;
-    return {
-      'app.install_kind': selfUpdate.installKind,
-      'runs.running': count('running'),
-      'runs.waiting': count('waiting'),
-      'runs.queued': count('queued'),
-      'runs.total': runs.length,
-    };
-  });
-  // SECURITY: cezar executes agents. A non-loopback bind exposes that box to
-  // whatever can reach the interface, and cezar itself has NO auth — it is only
-  // for a deliberate hosted setup where a reverse proxy in front provides TLS +
-  // auth (see `server-install --external-proxy`). Say so, loudly, every start.
-  if (bindHost && !['127.0.0.1', 'localhost', '::1'].includes(bindHost)) {
-    console.log(
-      `\n  ⚠ binding ${bindHost}:${port} — cezar has no built-in auth.\n` +
-        `    Only do this behind a reverse proxy that enforces authentication,\n` +
-        `    and make sure this interface is not reachable from the internet.\n`,
-    );
-  }
-  // Where a dispatched agent's `cez task` CLI reaches this cockpit (spec 2026-09-10-dispatch).
-  // Set before the first run can start, read by every manager's `agentEnv` while dispatch is on.
-  process.env.CEZ_API_URL = `http://127.0.0.1:${port}`;
-  process.env.CEZ_BIN = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
-  httpServer = startServer({
-    repoRoot,
-    store,
-    manager,
-    version,
-    update,
-    bootProjectId,
-    semaphore,
-    bindHost,
-    providerAuth,
-    providerRuntimeAuth,
-    workspaceEvents,
-    selfUpdate,
-  }, port);
-  const listening = new Promise<void>((resolveListening) => httpServer?.once('listening', () => resolveListening()));
-  const url = `http://localhost:${port}`;
+    serve: async () => {
+      const port = await pickPort(preferredPort);
 
-  console.log(`\n  cezar v${version} — ${repoRoot}`);
-  console.log(`  ${repo ? `branch ${repo.branch}` : 'not a git repository (tasks run in place, one at a time; repo view is empty)'}`);
-  for (const check of checks) {
-    const mark = check.available ? '✓' : '✗';
-    const detail = check.available ? (check.version ?? 'ok') : (check.hint ?? 'missing');
-    console.log(`  ${mark} ${check.name.padEnd(6)} ${detail}`);
-  }
-  if (port !== preferredPort) console.log(`  (port ${preferredPort} was busy — using ${port})`);
-  console.log(`\n  cockpit → ${url}\n`);
-  // Silenced by CEZ_NO_BANNER=1 or by dismissing the cockpit's banner (#391).
-  await printSkillsBanner(repoRoot);
-  // The star ask's terminal line — same block, same two off switches.
-  await printStarBanner(repoRoot);
+      // Update discovery (#368) through the self-update service (PoC): the channel's newest
+      // version lands on /api/v1/health as `latestVersion` for the chip, and the dialog behind the
+      // chip can apply it when this cezar runs from the managed layout (`cezar install`).
+      const update: { latest?: string } = {};
+      const selfUpdate = await buildSelfUpdateService({
+        // Workspace-wide, every project's manager — not the boot repo's store (#1524).
+        runs: semaphore,
+        // The server's own predicate, not a second spelling of it: the `/apply` guard decides hosted
+        // mode through `resolveCapabilities`, and the two must never disagree (they did, on 127.0.0.2).
+        trimPaths: () => !resolveCapabilities(process.env, bindHost).localHandoff,
+        restart: () => {
+          void (httpServer?.shutdownLifecycle() ?? manager.lifecycle.shutdown()).then(() => {
+            store.flush({ pretty: true });
+            // The old process stops here, so it reports its own stop before handing over (bounded).
+            track('app_stop', { reason: 'restart' });
+            void flushTelemetry(1_000).finally(() =>
+              restartProcess({ server: httpServer, args: process.argv.slice(2), port, supervised: isSupervised() }),
+            );
+            restartProcess({ server: httpServer, args: process.argv.slice(2), port, supervised: isSupervised() });
+          }).catch((error: unknown) => {
+            console.error('cezar: lifecycle shutdown failed before restart', error);
+            process.exit(1);
+          });
+        },
+      });
+      void selfUpdate.updateAvailable().then((latest) => {
+        if (!latest) return;
+        update.latest = latest;
+        const how = selfUpdate.installKind === 'managed' ? 'update from the cockpit or: cezar update' : `restart with: npx ${pkgName}@latest`;
+        console.log(`\n  ⬆ cezar ${latest} is available (running ${version}) — ${how}\n`);
+      });
+      // What the process is doing, on every error report (a wide event, not a bare message).
+      registerTelemetryContext(() => {
+        const runs = store.listRuns();
+        const count = (status: string) => runs.filter((r) => r.status === status).length;
+        return {
+          'app.install_kind': selfUpdate.installKind,
+          'runs.running': count('running'),
+          'runs.waiting': count('waiting'),
+          'runs.queued': count('queued'),
+          'runs.total': runs.length,
+        };
+      });
+      // SECURITY: cezar executes agents. A non-loopback bind exposes that box to
+      // whatever can reach the interface, and cezar itself has NO auth — it is only
+      // for a deliberate hosted setup where a reverse proxy in front provides TLS +
+      // auth (see `server-install --external-proxy`). Say so, loudly, every start.
+      if (bindHost && !['127.0.0.1', 'localhost', '::1'].includes(bindHost)) {
+        console.log(
+          `\n  ⚠ binding ${bindHost}:${port} — cezar has no built-in auth.\n` +
+            `    Only do this behind a reverse proxy that enforces authentication,\n` +
+            `    and make sure this interface is not reachable from the internet.\n`,
+        );
+      }
+      // Where a dispatched agent's `cez task` CLI reaches this cockpit (spec 2026-09-10-dispatch).
+      // Set before the first run can start, read by every manager's `agentEnv` while dispatch is on.
+      process.env.CEZ_API_URL = `http://127.0.0.1:${port}`;
+      process.env.CEZ_BIN = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
+      httpServer = startServer({
+        repoRoot,
+        store,
+        manager,
+        version,
+        update,
+        bootProjectId,
+        semaphore,
+        bindHost,
+        providerAuth,
+        providerRuntimeAuth,
+        workspaceEvents,
+        selfUpdate,
+      }, port);
+      const listening = new Promise<void>((resolveListening) => httpServer?.once('listening', () => resolveListening()));
+      const url = `http://localhost:${port}`;
 
-  // Under the desktop shell a managed install may exist without launchers (the shell installs
-  // cezar itself on first launch, spec 2026-09-25-desktop-distribution): write them so
-  // `cezar` in a terminal works too. Idempotent; never touches the shell profile.
-  if (process.env.CEZ_DESKTOP === '1' && selfUpdate.installKind === 'managed') {
-    const { writeLaunchers } = await import('./self-update/launcher.ts');
-    try {
-      writeLaunchers();
-    } catch {
-      // A read-only home is not a reason to refuse to serve.
-    }
-  }
-  // A supervisor that names itself (the desktop shell sets CEZ_SUPERVISOR_PID) may die without
-  // a chance to kill us — a force-quit, a crash. Nobody would find a headless cockpit still
-  // holding the port, so follow the parent down: `kill(pid, 0)` only probes for existence.
-  const supervisorPid = Number(process.env.CEZ_SUPERVISOR_PID);
-  if (Number.isInteger(supervisorPid) && supervisorPid > 0) {
-    // Two independent signals, because either alone has a hole: `kill(pid, 0)` still succeeds
-    // for an unreaped zombie or a reused pid, and the shell exec's us so our parent IS the
-    // supervisor — when it dies we are re-parented to pid 1.
-    //
-    // Re-parenting only speaks when we HAD a parent to lose. A cockpit already at ppid 1 on
-    // boot — a detached launchd/systemd supervisor that still sets CEZ_SUPERVISOR_PID — would
-    // otherwise read its own starting state as "the supervisor is gone" on the first tick and
-    // shut down two seconds after it came up. There, `kill(pid, 0)` is the only honest signal.
-    const initialPpid = process.ppid;
-    const watchesReparenting = initialPpid > 1;
-    setInterval(() => {
-      // `!== initialPpid` already covers re-parenting to 1, because `watchesReparenting` means
-      // we did not start there.
-      let gone = watchesReparenting && process.ppid !== initialPpid;
-      if (!gone) {
+      console.log(`\n  cezar v${version} — ${repoRoot}`);
+      console.log(`  ${repo ? `branch ${repo.branch}` : 'not a git repository (tasks run in place, one at a time; repo view is empty)'}`);
+      for (const check of checks) {
+        const mark = check.available ? '✓' : '✗';
+        const detail = check.available ? (check.version ?? 'ok') : (check.hint ?? 'missing');
+        console.log(`  ${mark} ${check.name.padEnd(6)} ${detail}`);
+      }
+      if (port !== preferredPort) console.log(`  (port ${preferredPort} was busy — using ${port})`);
+      console.log(`\n  cockpit → ${url}\n`);
+      // Silenced by CEZ_NO_BANNER=1 or by dismissing the cockpit's banner (#391).
+      await printSkillsBanner(repoRoot);
+      // The star ask's terminal line — same block, same two off switches.
+      await printStarBanner(repoRoot);
+
+      // Under the desktop shell a managed install may exist without launchers (the shell installs
+      // cezar itself on first launch, spec 2026-09-25-desktop-distribution): write them so
+      // `cezar` in a terminal works too. Idempotent; never touches the shell profile.
+      if (process.env.CEZ_DESKTOP === '1' && selfUpdate.installKind === 'managed') {
+        const { writeLaunchers } = await import('./self-update/launcher.ts');
         try {
-          process.kill(supervisorPid, 0);
-        } catch (error) {
-          // Only "no such process" means gone. EPERM is a supervisor that EXISTS under another
-          // uid — reading that as dead would shut a healthy cockpit down.
-          gone = (error as NodeJS.ErrnoException).code === 'ESRCH';
+          writeLaunchers();
+        } catch {
+          // A read-only home is not a reason to refuse to serve.
         }
       }
-      if (!gone) return;
-      try {
-        process.stderr.write('  supervisor is gone — shutting down\n');
-      } catch {
-        // A closed stderr must not prevent draining scripts.
+      // A supervisor that names itself (the desktop shell sets CEZ_SUPERVISOR_PID) may die without
+      // a chance to kill us — a force-quit, a crash. Nobody would find a headless cockpit still
+      // holding the port, so follow the parent down: `kill(pid, 0)` only probes for existence.
+      const supervisorPid = Number(process.env.CEZ_SUPERVISOR_PID);
+      if (Number.isInteger(supervisorPid) && supervisorPid > 0) {
+        // Two independent signals, because either alone has a hole: `kill(pid, 0)` still succeeds
+        // for an unreaped zombie or a reused pid, and the shell exec's us so our parent IS the
+        // supervisor — when it dies we are re-parented to pid 1.
+        //
+        // Re-parenting only speaks when we HAD a parent to lose. A cockpit already at ppid 1 on
+        // boot — a detached launchd/systemd supervisor that still sets CEZ_SUPERVISOR_PID — would
+        // otherwise read its own starting state as "the supervisor is gone" on the first tick and
+        // shut down two seconds after it came up. There, `kill(pid, 0)` is the only honest signal.
+        const initialPpid = process.ppid;
+        const watchesReparenting = initialPpid > 1;
+        setInterval(() => {
+          // `!== initialPpid` already covers re-parenting to 1, because `watchesReparenting` means
+          // we did not start there.
+          let gone = watchesReparenting && process.ppid !== initialPpid;
+          if (!gone) {
+            try {
+              process.kill(supervisorPid, 0);
+            } catch (error) {
+              // Only "no such process" means gone. EPERM is a supervisor that EXISTS under another
+              // uid — reading that as dead would shut a healthy cockpit down.
+              gone = (error as NodeJS.ErrnoException).code === 'ESRCH';
+            }
+          }
+          if (!gone) return;
+          try {
+            process.stderr.write('  supervisor is gone — shutting down\n');
+          } catch {
+            // A closed stderr must not prevent draining scripts.
+          }
+          shutdown('supervisor_gone');
+        }, 2_000).unref();
       }
-      shutdown('supervisor_gone');
-    }, 2_000).unref();
-  }
-
-  // The worktree sweep only frees disk: neither the listener nor the browser waits for it. The
-  // lifecycle coordinator starts once it settles, so its orphan pass and the sweep's
-  // `pruneOrphans` never act on the same worktree at once.
-  if (!stopping) {
-    startupSweep = repo
-      ? sweepStartupWorktrees(repoRoot, store, manager.lifecycle)
-          .then(({ orphans, reclaimed }) => {
+      return { listening, url };
+    },
+    sweep: repo
+      ? () =>
+          sweepStartupWorktrees(repoRoot, store, manager.lifecycle).then(({ orphans, reclaimed }) => {
             if (orphans.length > 0) {
               console.log(`  cleaned ${orphans.length} orphaned worktree(s): ${orphans.map((id) => id.slice(0, 8)).join(', ')}`);
             }
@@ -492,14 +489,12 @@ async function serveCommand(
               console.log(`  reclaimed ${reclaimed.length} old worktree(s), branch kept: ${reclaimed.map((id) => id.slice(0, 8)).join(', ')}`);
             }
           })
-          .catch(() => {})
-      : Promise.resolve();
-    void startupSweep
-      .then(() => listening)
-      .then(() => {
-        if (!stopping) manager.lifecycle.start();
-      });
-  }
+      : undefined,
+    startLifecycle: () => manager.lifecycle.start(),
+    stopping: () => stopping,
+  });
+  startupSweep = booted.sweep;
+  const { url } = booted.served;
 
   // Open the browser only once the server actually answers, so the first
   // paint is the cockpit and never a connection error.

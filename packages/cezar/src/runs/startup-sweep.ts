@@ -36,3 +36,36 @@ export async function sweepStartupWorktrees(
   const reclaimed = await reclaimWorktrees(repoRoot, store, keep, { lifecycle }).catch(() => [] as string[]);
   return { orphans, reclaimed };
 }
+
+export interface BootSteps<T> {
+  /** Settles before `serve` starts: no request may reach a run the manager does not own yet. */
+  recover: () => Promise<void>;
+  /** Starts the listener; `listening` resolves once it is bound. */
+  serve: () => Promise<T & { listening: Promise<void> }>;
+  /** The disk-only worktree sweep, started after the listener and never awaited by it. */
+  sweep?: () => Promise<void>;
+  startLifecycle: () => void;
+  stopping: () => boolean;
+}
+
+/**
+ * The cockpit's boot order: recovery, then the listener, then the worktree sweep in the
+ * background, then the lifecycle coordinator once the sweep has settled — fulfilled or not —
+ * so its orphan pass and the sweep's `pruneOrphans` never act on the same worktree at once.
+ * Lifecycle-operation recovery therefore waits for the sweep.
+ */
+export async function bootInOrder<T>(steps: BootSteps<T>): Promise<{ served: T; sweep?: Promise<void> }> {
+  await steps.recover();
+  const served = await steps.serve();
+  if (steps.stopping()) return { served };
+  const { sweep: runSweep } = steps;
+  const sweep = Promise.resolve()
+    .then(() => runSweep?.())
+    .then(() => undefined, () => undefined);
+  void sweep
+    .then(() => served.listening)
+    .then(() => {
+      if (!steps.stopping()) steps.startLifecycle();
+    });
+  return { served, sweep };
+}
