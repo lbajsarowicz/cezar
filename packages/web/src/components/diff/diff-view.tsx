@@ -127,6 +127,7 @@ export function DiffView({
   loadFileText,
   imageSrc,
   onOpenInApp,
+  oldImageSrc,
   viewRef,
   comments,
   onAddComment,
@@ -434,6 +435,7 @@ export function DiffView({
         canExpand={loadFileText !== undefined}
         imageSrc={imageSrc}
         onOpenInApp={onOpenInApp}
+        oldImageSrc={oldImageSrc}
       />
     )
   }
@@ -629,6 +631,7 @@ function DiffFileCard({
   canExpand,
   imageSrc,
   onOpenInApp,
+  oldImageSrc,
 }: {
   file: DiffFileChange
   open: boolean
@@ -645,6 +648,7 @@ function DiffFileCard({
   canExpand: boolean
   imageSrc?: (path: string) => string
   onOpenInApp?: (path: string) => void
+  oldImageSrc?: (path: string) => string
 }) {
   const badge = STATUS_BADGE[file.status]
   const commentCount = useLineComments()?.comments.filter((comment) => comment.path === file.path).length ?? 0
@@ -726,6 +730,7 @@ function DiffFileCard({
           canExpand={canExpand}
           imageSrc={imageSrc}
           onOpenInApp={onOpenInApp}
+          oldImageSrc={oldImageSrc}
         />
       ) : held ? (
         <div data-slot="diff-file-held" className="flex items-center gap-3 px-4 py-2.5 text-xs text-soft-foreground">
@@ -755,6 +760,7 @@ function DiffFileBody({
   canExpand,
   imageSrc,
   onOpenInApp,
+  oldImageSrc,
 }: {
   file: DiffFileChange
   expanded: ExpandedGaps
@@ -764,6 +770,7 @@ function DiffFileBody({
   canExpand: boolean
   imageSrc?: (path: string) => string
   onOpenInApp?: (path: string) => void
+  oldImageSrc?: (path: string) => string
 }) {
   const parsed = useMemo(() => parsePatch(file.patch), [file.patch])
   // The trailing (after-last-hunk) region has an unknown length — only offer it when a
@@ -843,7 +850,7 @@ function DiffFileBody({
   // Only images with no text diff to lose take the preview branch — see `shouldPreviewImage`.
   // An SVG git reports as text keeps its rows below, exactly as `DiffFallback` renders it.
   if (shouldPreviewImage(file)) {
-    return <ImagePreview file={file} imageSrc={imageSrc} onOpenInApp={onOpenInApp} />
+    return <ImagePreview file={file} imageSrc={imageSrc} oldImageSrc={oldImageSrc} onOpenInApp={onOpenInApp} />
   }
   if (file.binary) {
     return <Note>Binary file — no text diff.</Note>

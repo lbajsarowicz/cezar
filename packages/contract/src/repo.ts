@@ -148,6 +148,8 @@ export const changesPayloadSchema = z.object({
   /** Present only when the aggregate size or file-count cap dropped trailing files or blanked
    *  their patches. `stat` still counts every changed file. */
   truncated: z.literal(true).optional(),
+  /** The diff's anchor commit as a full sha — the `rev` an image's old side is fetched at. */
+  baseSha: z.string().optional(),
 });
 export type ChangesPayload = z.infer<typeof changesPayloadSchema>;
 
