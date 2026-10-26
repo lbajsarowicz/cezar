@@ -71,6 +71,7 @@ import type {
   RunDraftsResponse,
   SetRunDraftInput,
   FinishResponse,
+  StartNowResponse,
   LandResponse,
   FsBrowseResponse,
   GitCommitResponse,
@@ -1266,8 +1267,9 @@ export async function getRunFile(id: string, path: string, opts?: ReadOptions): 
 /** The same-origin URL an `<img>` can load an image file's bytes from (R5 Files tab). The
  *  server serves raw ONLY for image extensions within the size cap — everything else 409s.
  *  Scoped here rather than in send() — this URL is handed to an `<img>`, never fetched. */
-export function runFileRawUrl(id: string, path: string): string {
-  return apiPath(runPath(id, `/files?path=${encodeURIComponent(path)}&raw=1`))
+export function runFileRawUrl(id: string, path: string, rev?: string): string {
+  const at = rev ? `&rev=${encodeURIComponent(rev)}` : ''
+  return apiPath(runPath(id, `/files?path=${encodeURIComponent(path)}&raw=1${at}`))
 }
 
 /** The variant-compare data (spec 010): one entry per variant of the group, with the legacy
@@ -1462,6 +1464,16 @@ export async function cancelRun(id: string): Promise<CancelResponse> {
       param: { projectId: queryScope(), id: encodeURIComponent(id) },
     }),
     runPath(id, '/cancel'),
+  )
+}
+
+/** "Start now": run a queued task over the `maxParallel` cap. 409 when it is no longer queued. */
+export async function startRunNow(id: string): Promise<StartNowResponse> {
+  return unwrap(
+    await cez.api.v1.p[':projectId'].runs[':id']['start-now'].$post({
+      param: { projectId: queryScope(), id: encodeURIComponent(id) },
+    }),
+    runPath(id, '/start-now'),
   )
 }
 
@@ -2402,6 +2414,8 @@ export async function getWorkspaceConfig(opts?: ReadOptions): Promise<WorkspaceC
       ? { ...answer.branding, logoUrl: answer.branding.logoUrl ? resolveApiUrl(answer.branding.logoUrl) : null }
       : { name: 'cezar', logoUrl: null },
     agentDefaults: answer.agentDefaults ?? {},
+    // Additive key: an older server omits it.
+    orgSkillsRepos: answer.orgSkillsRepos ?? [],
     resources: {
       ...answer.resources,
       // Older servers omit this additive key; preserve an explicit null (disabled) while
@@ -2660,7 +2674,9 @@ export async function cancelScheduledSelfUpdate(): Promise<SelfUpdateStatus> {
 export async function putWorkspaceConfig(
   patch: SetWorkspaceConfigInput,
 ): Promise<WorkspaceConfigResponse> {
-  return unwrap(await cez.api.v1.workspace.config.$put({ json: patch }), '/workspace/config')
+  const answer = await unwrap(await cez.api.v1.workspace.config.$put({ json: patch }), '/workspace/config')
+  // Same additive-key fallback as getWorkspaceConfig: an older server omits it.
+  return { ...answer, orgSkillsRepos: answer.orgSkillsRepos ?? [] }
 }
 
 /** Set/clear the agents' config knobs — base branch, default runner, system prompt, per-runner

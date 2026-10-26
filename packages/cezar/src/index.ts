@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { spawn, execFileSync } from 'node:child_process';
-import { createServer } from 'node:net';
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -256,6 +255,8 @@ async function serveCommand(
     { bootInOrder, sweepStartupWorktrees },
     { isSupervised, restartProcess },
     { printSkillsBanner, printStarBanner },
+    { apiOrigin, pickPort },
+    { collectFeatureInventory },
   ] = await Promise.all([
     import('./workspace/boot.ts'),
     import('./workspace/semaphore.ts'),
@@ -270,6 +271,8 @@ async function serveCommand(
     import('./runs/startup-sweep.ts'),
     import('./self-update/restart.ts'),
     import('./skills-banner.ts'),
+    import('./api-origin.ts'),
+    import('./feature-telemetry.ts'),
   ]);
 
   const bootProjectId = await initWorkspace(repoRoot);
@@ -283,7 +286,7 @@ async function serveCommand(
   // the previous process exited are re-queued or resumed instead of failed.
   const store = await openStore(repoRoot, { keepLive: true });
   const manager = new RunManager(store, repoRoot, { semaphore, projectId: bootProjectId, resolveTrackerEnv: resolveTrackerAgentEnv });
-  const { flushTelemetry, initTelemetry, installCrashReporter, registerTelemetryContext, startDailyPing, track } =
+  const { flushTelemetry, initTelemetry, installCrashReporter, registerDailyInventory, registerTelemetryContext, startDailyPing, track } =
     await import('./telemetry.ts');
   let httpServer: ReturnType<typeof startServer> | null = null;
   let stopping = false;
@@ -300,7 +303,7 @@ async function serveCommand(
       })
       .then(() => {
         store.flush({ pretty: true });
-        track('app_stop', { reason });
+        track('app_stop', { label: reason });
         return flushTelemetry(reason === 'signal' ? undefined : 1_000);
       })
       .finally(() => process.exit(process.exitCode ?? 0));
@@ -320,6 +323,7 @@ async function serveCommand(
   await initTelemetry({ version: readOwnManifest().version });
   installCrashReporter();
   track('app_start');
+  registerDailyInventory(collectFeatureInventory);
   startDailyPing();
 
   const checks = await detectEnvironment();
@@ -338,7 +342,7 @@ async function serveCommand(
       if (recovered > 0) console.log(`  recovered ${recovered} run(s) from the previous session`);
     },
     serve: async () => {
-      const port = await pickPort(preferredPort);
+      const port = await pickPort(preferredPort, bindHost);
 
       // Update discovery (#368) through the self-update service (PoC): the channel's newest
       // version lands on /api/v1/health as `latestVersion` for the chip, and the dialog behind the
@@ -354,7 +358,7 @@ async function serveCommand(
           void (httpServer?.shutdownLifecycle() ?? manager.lifecycle.shutdown()).then(() => {
             store.flush({ pretty: true });
             // The old process stops here, so it reports its own stop before handing over (bounded).
-            track('app_stop', { reason: 'restart' });
+            track('app_stop', { label: 'restart' });
             void flushTelemetry(1_000).finally(() =>
               restartProcess({ server: httpServer, args: process.argv.slice(2), port, supervised: isSupervised() }),
             );
@@ -396,7 +400,7 @@ async function serveCommand(
       }
       // Where a dispatched agent's `cez task` CLI reaches this cockpit (spec 2026-09-10-dispatch).
       // Set before the first run can start, read by every manager's `agentEnv` while dispatch is on.
-      process.env.CEZ_API_URL = `http://127.0.0.1:${port}`;
+      process.env.CEZ_API_URL = apiOrigin(bindHost, port);
       process.env.CEZ_BIN = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
       httpServer = startServer({
         repoRoot,
@@ -502,23 +506,6 @@ async function serveCommand(
     const healthy = await waitForHealth(`${url}/api/v1/health`, 5_000);
     if (healthy) openUrl(url);
   }
-}
-
-/** First free port starting at `start` (the launch.mjs pattern from janitor). */
-async function pickPort(start: number): Promise<number> {
-  for (let port = start; port < start + 50; port++) {
-    if (await canListen(port)) return port;
-  }
-  return start; // let the server fail loudly if 50 ports are somehow busy
-}
-
-function canListen(port: number): Promise<boolean> {
-  return new Promise((resolvePort) => {
-    const probe = createServer();
-    probe.once('error', () => resolvePort(false));
-    probe.once('listening', () => probe.close(() => resolvePort(true)));
-    probe.listen(port, '127.0.0.1');
-  });
 }
 
 async function waitForHealth(healthUrl: string, timeoutMs: number): Promise<boolean> {
@@ -663,7 +650,7 @@ async function runCommand(
 
   const { flushTelemetry, initTelemetry, track } = await import('./telemetry.ts');
   await initTelemetry({ version: readOwnManifest().version });
-  const run = manager.startRun(workflow, { task, model });
+  const run = manager.startRun(workflow, { task, model, origin: 'cli' });
   // No cockpit device here: the CLI's message counts under the installation's own id.
   track('message_sent', { label: 'cli' });
   // `review` is terminal here too (spec 009) — headless runs must not hang on

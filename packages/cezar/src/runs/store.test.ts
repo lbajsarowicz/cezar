@@ -73,6 +73,69 @@ describe('RunStore — uncreatable data dir (telemetry 5af5aec6)', () => {
     store.appendEvent(run.id, { type: 'note', text: 'two' });
     expect(readFileSync(join(dataDir, 'runs', `${run.id}.ndjson`), 'utf8')).toContain('"text":"two"');
   });
+
+  // chmod cannot deny root, and Windows ignores the write bit on files.
+  const canDenyWrites = process.platform !== 'win32' && process.getuid?.() !== 0;
+
+  it.skipIf(!canDenyWrites)('degrades to live-only when an event file stops being writable mid-session (telemetry 73c6e796)', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const dataDir = join(parent, 'cezar');
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] });
+    const eventsFile = join(dataDir, 'runs', `${run.id}.ndjson`);
+    // A read-only event file: the append is refused with EACCES, as macOS refused it with EPERM.
+    writeFileSync(eventsFile, '');
+    chmodSync(eventsFile, 0o444);
+    const live: unknown[] = [];
+    store.on('event', (e) => live.push(e));
+
+    expect(() => store.appendEvent(run.id, { type: 'user-message', text: 'one' })).not.toThrow();
+    expect(() => store.appendEvent(run.id, { type: 'note', text: 'two' })).not.toThrow();
+    expect(live).toHaveLength(2);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('events stay live-only'));
+
+    chmodSync(eventsFile, 0o644);
+    store.appendEvent(run.id, { type: 'note', text: 'three' });
+    expect(readFileSync(eventsFile, 'utf8')).toContain('"text":"three"');
+  });
+
+  it.skipIf(!canDenyWrites)('one refused event file degrades only that run: other runs and the index keep saving', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const dataDir = join(parent, 'cezar');
+    const store = RunStore.open(dataDir);
+    const refused = store.createRun({ title: 'a', workflow: 'quick-task', task: 't', steps: [] });
+    store.appendEvent(refused.id, { type: 'note', text: 'before' });
+    store.flush();
+    const refusedFile = join(dataDir, 'runs', `${refused.id}.ndjson`);
+    chmodSync(refusedFile, 0o444);
+    store.appendEvent(refused.id, { type: 'note', text: 'refused' });
+
+    const other = store.createRun({ title: 'b', workflow: 'quick-task', task: 't', steps: [] });
+    store.appendEvent(other.id, { type: 'note', text: 'other' });
+    store.flush();
+
+    const index = JSON.parse(readFileSync(join(dataDir, 'runs.json'), 'utf8')) as Array<{ id: string }>;
+    expect(index.map((r) => r.id)).toContain(other.id);
+    expect(readFileSync(join(dataDir, 'runs', `${other.id}.ndjson`), 'utf8')).toContain('"text":"other"');
+    expect(() => store.flush({ throwOnError: true })).not.toThrow();
+    expect(store.readEvents(refused.id).map((e) => (e as { text?: string }).text)).toEqual(['before', 'refused']);
+
+    chmodSync(refusedFile, 0o644);
+    store.appendEvent(refused.id, { type: 'note', text: 'after' });
+    const lines = readFileSync(refusedFile, 'utf8').trim().split('\n').map((l) => (JSON.parse(l) as { text: string }).text);
+    expect(lines).toEqual(['before', 'refused', 'after']);
+    expect(error).toHaveBeenCalledTimes(1);
+  });
+
+  it('still throws when the project itself is gone — only a refused write degrades (#1105)', () => {
+    const dataDir = join(parent, 'cezar');
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] });
+    rmSync(dataDir, { recursive: true, force: true });
+
+    expect(() => store.appendEvent(run.id, { type: 'note', text: 'late' })).toThrow(/ENOENT/);
+  });
 });
 
 describe('RunStore — directional usage persistence', () => {
@@ -143,6 +206,64 @@ describe('RunStore — directional usage persistence', () => {
     expect(store.getRun(run.id)?.inputTokens).toBeUndefined();
     store.updateStep(run.id, 'task', { usageInvocationsObserved: 2, usageTurnsStarted: 2 });
     expect(store.getRun(run.id)?.inputTokens).toBeUndefined();
+  });
+});
+
+describe('RunStore — workflow retry accounting (#1300)', () => {
+  let dataDir: string;
+  const legacyCheck = {
+    id: 'verify',
+    name: 'Verify the task',
+    kind: 'check',
+    status: 'failed',
+    iterations: 1,
+    tokensUsed: 0,
+  };
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cez-store-'));
+  });
+
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('round-trips a consumed check retry through runs.json', () => {
+    const store = RunStore.open(dataDir);
+    const run = store.createRun({
+      title: 'bounded retry',
+      workflow: 'checked-task',
+      task: 'verify the task',
+      steps: [{ id: 'verify', name: 'Verify the task', kind: 'check' }],
+    });
+    store.updateStep(run.id, 'verify', { retriesUsed: 1 });
+    store.flush();
+
+    const reopened = RunStore.open(dataDir).getRun(run.id);
+    expect(reopened).toBeDefined();
+    expect(reopened?.steps[0]?.retriesUsed).toBe(1);
+  });
+
+  it('keeps legacy checks readable without materializing retry accounting', () => {
+    writeFileSync(join(dataDir, 'runs.json'), JSON.stringify([{ ...LEGACY_RUN, steps: [legacyCheck] }]), 'utf8');
+
+    const reopened = RunStore.open(dataDir).getRun(LEGACY_RUN.id);
+    expect(reopened).toBeDefined();
+    expect(reopened?.steps[0]?.iterations).toBe(1);
+    expect(reopened?.steps[0]?.retriesUsed).toBeUndefined();
+  });
+
+  it.each([-1, 1.5, '1'])('salvages invalid retry accounting %j without evicting records', (retriesUsed) => {
+    writeFileSync(join(dataDir, 'runs.json'), JSON.stringify([
+      { ...LEGACY_RUN, id: 'invalid-retries', steps: [{ ...legacyCheck, retriesUsed }] },
+      { ...LEGACY_RUN, id: 'valid-retries', steps: [{ ...legacyCheck, retriesUsed: 1 }] },
+    ]), 'utf8');
+
+    const reopened = RunStore.open(dataDir);
+    expect(reopened.getRun('invalid-retries')).toBeDefined();
+    expect(reopened.getRun('invalid-retries')?.steps[0]?.iterations).toBe(1);
+    expect(reopened.getRun('invalid-retries')?.steps[0]?.retriesUsed).toBeUndefined();
+    expect(reopened.getRun('valid-retries')?.steps[0]?.retriesUsed).toBe(1);
   });
 });
 
