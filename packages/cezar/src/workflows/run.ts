@@ -4631,6 +4631,8 @@ export class RunManager {
       (event) => this.store.appendEvent(runId, { ...event, stepId }),
       (event) => this.handleRunnerUiEvent(runId, state, sink, event),
       resumeFallbackPredicate(backend, 'continue'),
+      undefined,
+      (event) => onEvent(event),
     );
     const resumedUsage = new ResumedUsage(
       backend === 'codex' && sessionId !== undefined
@@ -6834,6 +6836,7 @@ export class RunManager {
       (event) => this.handleRunnerUiEvent(runId, state, sink, event),
       retry ? resumeFallbackPredicate(backend, 'retry') : undefined,
       retry ? vetoesRetryFallback : undefined,
+      (event) => onEvent(event),
     );
     let resumeGuard = guardResume(resumeFrom !== undefined || graphHooks?.resumeSessionId !== undefined, resumeFrom !== undefined);
     const resumedUsage = new ResumedUsage(backend === 'codex' ? source?.sessionTokensTotal : undefined);

@@ -80,10 +80,12 @@ export class ResumeFallback {
   private pending: boolean;
   private missing = false;
   private vetoed = false;
-  private held: AgentEvent[] = [];
+  private heldError = false;
+  /** `live` events were held only to keep a frame's order; they are released through `deliver`. */
+  private held: { event: AgentEvent; live: boolean }[] = [];
   private heldUi: UiEvent[] = [];
   private sent: ContentBlock[][] = [];
-  private settleQueued = false;
+  private frameOpen = false;
 
   constructor(
     resuming: boolean,
@@ -95,6 +97,8 @@ export class ResumeFallback {
     private readonly isMissing: (message: string) => boolean = isClaudeMissingSessionError,
     /** Held errors that rule the fallback out even when another one says the session is gone. */
     private readonly vetoes: (message: string) => boolean = () => false,
+    /** The caller's live event path, for held text and the events that followed it. */
+    private readonly deliver: (event: AgentEvent) => void = emit,
   ) {
     this.pending = resuming;
   }
@@ -105,24 +109,34 @@ export class ResumeFallback {
     if (event.type === 'error') {
       if (this.vetoes(event.message)) this.vetoed = true;
       else if (this.isMissing(event.message)) this.missing = true;
-      this.held.push(event);
+      this.heldError = true;
+      this.held.push({ event, live: false });
       return true;
     }
     // Once an error is held, the dying attempt's turn bookkeeping goes with it.
-    if (this.held.length > 0 && (event.type === 'turn-end' || event.type === 'note' || event.type === 'done')) {
-      this.held.push(event);
+    if (this.heldError && (event.type === 'turn-end' || event.type === 'note' || event.type === 'done')) {
+      this.held.push({ event, live: false });
       return true;
     }
-    if (event.type === 'text') {
+    if (event.type === 'text' && !this.heldError) {
+      this.held.push({ event, live: true });
       this.settleAfterFrame();
-      return false;
+      return true;
     }
     const alive =
+      event.type === 'text' ||
       event.type === 'tool-call' ||
       event.type === 'tool-result' ||
       event.type === 'image' ||
       event.type === 'turn-end';
-    if (alive) this.settle();
+    if (alive) {
+      this.settle();
+      return false;
+    }
+    if (this.frameOpen) {
+      this.held.push({ event, live: true });
+      return true;
+    }
     return false;
   }
 
@@ -133,27 +147,29 @@ export class ResumeFallback {
       this.heldUi.push(event);
       return true;
     }
-    if (isMessageText(event)) this.settleAfterFrame();
-    else this.settle();
+    if (isMessageText(event) && !this.heldError) {
+      this.heldUi.push(event);
+      this.settleAfterFrame();
+      return true;
+    }
+    this.settle();
     return false;
   }
 
   /**
-   * Text proves the session alive only when no error follows in the same wire frame: Claude can
+   * Text proves the session alive only when no error follows in the same stdout line: Claude can
    * echo a missing-session reason into the `result` of the error frame, which arrives as text
-   * just before the error. A frame's events are delivered synchronously, so a microtask runs
-   * after all of them.
+   * just before the error. One line's events are delivered synchronously and the runners await
+   * between lines, so a microtask runs after all of them. OpenCode's SSE reader dispatches every
+   * frame of one network chunk in the same tick, so there a later frame's error can still count
+   * against text that came before it.
    */
   private settleAfterFrame(): void {
-    if (this.held.length > 0) {
-      this.settle();
-      return;
-    }
-    if (this.settleQueued) return;
-    this.settleQueued = true;
+    if (this.frameOpen) return;
+    this.frameOpen = true;
     queueMicrotask(() => {
-      this.settleQueued = false;
-      if (this.pending && this.held.length === 0) this.settle();
+      this.frameOpen = false;
+      if (this.pending && !this.heldError) this.settle();
     });
   }
 
@@ -182,6 +198,7 @@ export class ResumeFallback {
     this.pending = false;
     this.missing = false;
     this.vetoed = false;
+    this.heldError = false;
     this.held = [];
     this.heldUi = [];
     this.sent = [];
@@ -189,7 +206,6 @@ export class ResumeFallback {
   }
 
   private settle(): void {
-    this.pending = false;
     this.sent = [];
     this.release();
   }
@@ -197,10 +213,12 @@ export class ResumeFallback {
   private release(): void {
     const held = this.held;
     const heldUi = this.heldUi;
+    this.pending = false;
+    this.heldError = false;
     this.held = [];
     this.heldUi = [];
     for (const event of heldUi) this.emitUi(event);
-    for (const event of held) this.emit(event);
+    for (const { event, live } of held) (live ? this.deliver : this.emit)(event);
   }
 }
 

@@ -329,6 +329,14 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
       expect(notesOf(id).some((m) => m.includes('sending only the failure'))).toBe(true);
     }, 30_000);
 
+    it('persists a resumed turn\'s bookkeeping ahead of its first message', async () => {
+      const { id } = await runClaude('mock:plain');
+      const events = store.readEvents(id);
+      const resumedAt = events.findIndex((e) => e.type === 'note' && String(e.message).includes('sending only the failure'));
+      const resumed = events.slice(resumedAt).map((e) => e.type);
+      expect(resumed.slice(0, 5)).toEqual(['note', 'session.started', 'turn.started', 'item.started', 'item.completed']);
+    }, 30_000);
+
     it.each([
       ['the CLI reports it on stderr', () => setEnv('CEZ_MOCK_MISSING_SESSIONS', '*'), 'mock:plain'],
       ['the CLI reports it only in the result frame `errors`', () => undefined, 'mock:session-gone'],
