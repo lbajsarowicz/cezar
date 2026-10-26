@@ -71,4 +71,42 @@ describe('run start reads the base branch fresh', () => {
     // …the run must not.
     expect(current?.baseBranch).toBe('feature');
   }, 30_000);
+
+  describe('in-place branch run', () => {
+    const settle = async (id: string) => {
+      const deadline = Date.now() + 20_000;
+      while (!['done', 'review', 'failed', 'cancelled'].includes(store.getRun(id)?.status ?? '')) {
+        if (Date.now() > deadline) throw new Error('run did not finish in time');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return store.getRun(id);
+    };
+    const startInPlace = async () => {
+      await run('git', ['checkout', '-q', '-b', 'feature'], { cwd: repoRoot });
+      writeFileSync(join(repoRoot, 'b.txt'), 'two\n');
+      await run('git', ['add', '-A'], { cwd: repoRoot });
+      await run('git', [...GIT_ID, 'commit', '-q', '-m', 'feature work'], { cwd: repoRoot });
+      await run('git', ['checkout', '-q', 'main'], { cwd: repoRoot });
+      expect((await getRepoInfo(repoRoot))?.branch).toBe('main');
+      await run('git', ['checkout', '-q', 'feature'], { cwd: repoRoot });
+      const featureSha = (await run('git', ['rev-parse', 'feature'], { cwd: repoRoot })).stdout.trim();
+      const record = manager.startRun(SINGLE_STEP, {
+        task: 'mock:done hello',
+        worktree: false,
+        newBranch: true,
+        branch: 'task/inplace',
+      });
+      return { featureSha, done: await settle(record.id) };
+    };
+
+    it('forks the new branch off a checkout moved inside the memo TTL', async () => {
+      const { featureSha, done } = await startInPlace();
+      expect(done?.baseBranch).toBe(featureSha);
+    }, 30_000);
+
+    it('reports the switched branch to default readers right after the switch', async () => {
+      await startInPlace();
+      expect((await getRepoInfo(repoRoot))?.branch).toBe('task/inplace');
+    }, 30_000);
+  });
 });
