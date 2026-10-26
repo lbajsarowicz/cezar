@@ -343,6 +343,7 @@ describe('request shapes', () => {
     // The one URL this module builds without fetching it (an <img> loads it) — same invariant
     // as every case above: unscoped means exactly the pre-multi-project path.
     expect(runFileRawUrl('run-1', 'shots/final.png')).toBe('/api/v1/runs/run-1/files?path=shots%2Ffinal.png&raw=1')
+    expect(runFileRawUrl('run-1', 'a.png', 'abc123')).toBe('/api/v1/runs/run-1/files?path=a.png&raw=1&rev=abc123')
   })
 
   it('forwards an abort signal to fetch', async () => {
