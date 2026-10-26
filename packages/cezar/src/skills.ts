@@ -150,6 +150,14 @@ export function invalidateSkillsCache(repoRoot?: string): void {
   else scanMemo.delete(repoRoot);
 }
 
+/** The repo's and the user's own skill files, read from disk only: unlike `discoverSkills`, it
+ *  never starts a team-repo clone or fetch (the daily `feature_inventory` reads every project). */
+export async function discoverLocalSkills(repoRoot: string): Promise<Skill[]> {
+  const lists = await scanSkillDirs(repoRoot);
+  const seen = new Set<string>();
+  return lists.flat().filter((skill) => !seen.has(skill.name) && Boolean(seen.add(skill.name)));
+}
+
 /**
  * The imported team-skill names from a raw `ui-state.json` object, as a tri-state:
  * `undefined` means the key is absent — "not curated", so every default skill shows
