@@ -10,7 +10,7 @@ vi.mock('node:child_process', () => ({ execFile, spawn }));
 vi.mock('node:fs', async (original) => ({
   ...await original<typeof import('node:fs')>(), existsSync: () => true,
 }));
-vi.mock('./config.ts', () => ({ loadConfig }));
+vi.mock('./config.ts', () => ({ loadConfig, projectGatedSkillsRepos: async () => new Set<string>() }));
 vi.mock('./skills-cache-state.ts', () => ({ readJsonCache: () => null, writeJsonCache: () => {} }));
 
 import {

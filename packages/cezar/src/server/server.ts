@@ -155,10 +155,11 @@ import { selfUpdateApplyRequestSchema, selfUpdateChannelRequestSchema, selfUpdat
 import { SelfUpdateBusyError, SelfUpdateService } from '../self-update/service.ts';
 import { StarCountReader } from './star-count.ts';
 import { DesignProxies } from './preview/design-proxy.ts';
-import { getTeamSkillsCached, refreshTeamSkills, waitForTeamSkills } from '../skills-remote.ts';
+import { getTeamSkillsCached, isSafeRef, refreshTeamSkills, safeRemoteFor, waitForTeamSkills } from '../skills-remote.ts';
 import { appendHandoffHeartbeat, handoffProgressExcerpt, readHandoff } from '../handoff.ts';
 import { markStarted, onTodosChanged, readTodos, removeTodo, todoTaskText, type TodoItem } from '../todos.ts';
 import type { RunEvent, RunRecord, RunStatus, RunStore } from '../runs/store.ts';
+import { onRunFrames } from './run-frames.ts';
 import {
   HistoryCursorError,
   deriveRunContextEvents,
@@ -211,6 +212,8 @@ import {
   imageMimeType,
   isOsOpenableImage,
   listRepoPaths,
+  isCommitSha,
+  readImageAtRev,
   pushCurrentBranch,
   worktreeGitStatus,
   readWorktreePath,
@@ -305,6 +308,7 @@ import {
   telemetryBlockedBy,
   track,
 } from '../telemetry.ts';
+import { automationLabel } from '../feature-telemetry.ts';
 import {
   setTelemetryConsentInputSchema,
   telemetryErrorInputSchema,
@@ -605,6 +609,12 @@ const automationLogQuerySchema = z.object({
   // never needed.
   limit: z.coerce.number().int().min(1).max(100).optional(),
 });
+
+/** A by-hand schedule launch that started no run, in words that say why (telemetry 411fac74:
+ *  "see the execution log" alone sent the user elsewhere for the one line that mattered). */
+function launchFailedMessage(outcome: { reason?: string }): string {
+  return outcome.reason ? `the launch failed: ${outcome.reason}` : 'the launch failed — see the execution log';
+}
 
 function editableAutomation(definition: AutomationDefinition) {
   return {
@@ -3541,6 +3551,7 @@ export function createApp(deps: ServerDeps) {
     projectsDir: config.projectsDir,
     skillsAutoUpdate: config.skillsAutoUpdate ?? null,
     effectiveSkillsAutoUpdate: effectiveSkillsAutoUpdate(config),
+    orgSkillsRepos: config.orgSkillsRepos ?? [],
     composerDefaults: {
       autonomous: config.composerDefaults.autonomous ?? null,
       worktree: config.composerDefaults.worktree ?? null,
@@ -3591,7 +3602,17 @@ export function createApp(deps: ServerDeps) {
 
     .put('/workspace/config', jsonZodValidator(() => setWorkspaceConfigInputSchema), async (c) => {
       const parsed = { data: c.req.valid('json') };
-      const { browseRoot, projectsDir, skillsAutoUpdate, composerDefaults, resources, agentDefaults, branding } = parsed.data;
+      const { browseRoot, projectsDir, skillsAutoUpdate, orgSkillsRepos, composerDefaults, resources, agentDefaults, branding } = parsed.data;
+      for (const src of orgSkillsRepos ?? []) {
+        if (safeRemoteFor(src.repo) === null || !isSafeRef(src.ref)) {
+          return c.json({ error: `unsafe skills repo: ${src.repo}@${src.ref}` }, 400);
+        }
+        // Global setting, shared by processes started in different directories: a relative path
+        // would resolve differently in each, while the cache directory is the same.
+        if (/^\.{1,2}([\\/]|$)/.test(src.repo)) {
+          return c.json({ error: `use an absolute path for a local skills repo: ${src.repo}` }, 400);
+        }
+      }
       for (const [configuredRoot, create] of [
         [browseRoot, false],
         [projectsDir, true],
@@ -3629,6 +3650,10 @@ export function createApp(deps: ServerDeps) {
           if (projectsDir !== undefined) config.projectsDir = projectsDir;
           if (skillsAutoUpdate === null) delete config.skillsAutoUpdate;
           else if (skillsAutoUpdate !== undefined) config.skillsAutoUpdate = skillsAutoUpdate;
+          if (orgSkillsRepos !== undefined) {
+            if (orgSkillsRepos.length === 0) delete config.orgSkillsRepos;
+            else config.orgSkillsRepos = orgSkillsRepos;
+          }
           if (composerDefaults?.autonomous === null) delete config.composerDefaults.autonomous;
           else if (composerDefaults?.autonomous !== undefined) {
             config.composerDefaults.autonomous = composerDefaults.autonomous;
@@ -3880,6 +3905,7 @@ export function createApp(deps: ServerDeps) {
         const message = err instanceof Error ? err.message : String(err);
         return c.json({ error: message }, 500);
       }
+      track('workflow_saved', { label: parsed.data.overwrite ? 'chain_updated' : 'chain_created' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ path, name: parsed.data.name }, 201);
     })
 
@@ -3904,6 +3930,7 @@ export function createApp(deps: ServerDeps) {
       } catch (err) {
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
       }
+      track('workflow_saved', { label: 'deleted' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ ok: true, path: target });
     })
 
@@ -3939,6 +3966,7 @@ export function createApp(deps: ServerDeps) {
         }
         return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
       }
+      track('workflow_saved', { label: body.overwrite ? 'graph_updated' : 'graph_created' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ path, name: body.name }, 201);
     })
 
@@ -4272,6 +4300,7 @@ export function createApp(deps: ServerDeps) {
         );
         emitAutomationChange(c.get('project'), automation.id, automation.revision);
         automationsChanged();
+        track('automation_created', { label: automationLabel(automation) }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
         return c.json({ automation }, 201);
       } catch (error) {
         return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
@@ -4366,6 +4395,9 @@ export function createApp(deps: ServerDeps) {
           }
         }
         if (kind !== 'tracker' && automation.enabled && !current.enabled) armAutomation(automationStore, automation);
+        if (automation.enabled !== current.enabled) {
+          track('automation_toggled', { label: automation.enabled ? 'enabled' : 'paused' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
+        }
         emitAutomationChange(c.get('project'), automation.id, automation.revision);
         automationsChanged();
         return c.json({ automation });
@@ -4408,6 +4440,7 @@ export function createApp(deps: ServerDeps) {
       if (!current || !store.delete(id)) return c.json({ error: 'not found' }, 404);
       emitAutomationChange(c.get('project'), id, current.revision, true);
       automationsChanged();
+      track('automation_deleted', { label: automationLabel(current) }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.body(null, 204);
     })
 
@@ -4433,6 +4466,7 @@ export function createApp(deps: ServerDeps) {
       catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
       emitAutomationChange(c.get('project'), automation.id, automation.revision);
       automationsChanged();
+      if (!current.enabled) track('automation_toggled', { label: 'enabled' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ automation });
     })
 
@@ -4446,6 +4480,7 @@ export function createApp(deps: ServerDeps) {
       catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
       emitAutomationChange(c.get('project'), automation.id, automation.revision);
       automationsChanged();
+      if (current.enabled) track('automation_toggled', { label: 'paused' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ automation });
     })
 
@@ -4517,7 +4552,7 @@ export function createApp(deps: ServerDeps) {
         automationsChanged();
         return c.json({ error: automation.deferredStart
           ? store.get(automation.id)?.deferredStart?.error ?? 'The task could not start. Refresh its details in Tasks.'
-          : 'the launch failed — see the execution log' }, 409);
+          : launchFailedMessage(outcome) }, 409);
       }
       automationsChanged();
       return c.json({ runId: outcome.runId }, 202);
@@ -4545,7 +4580,7 @@ export function createApp(deps: ServerDeps) {
       if (isScheduleAutomation(definition)) {
         const outcome = await new ScheduleRunner(scheduleHandle(project)).retry(definition, receipt);
         if (outcome.result === 'lease-held') return c.json({ error: 'automation polling lease is held by another process' }, 409);
-        if (!('runId' in outcome)) return c.json({ error: 'the launch failed — see the execution log' }, 409);
+        if (!('runId' in outcome)) return c.json({ error: launchFailedMessage(outcome) }, 409);
         return c.json({ receiptId: receipt.receiptId, runId: outcome.runId }, 202);
       }
       if (isTrackerAutomation(definition)) {
@@ -4943,6 +4978,17 @@ export function createApp(deps: ServerDeps) {
       return c.json({ cancelled });
     })
 
+    // "Start now": jump a queued run past the `maxParallel` cap.
+    .post('/runs/:id/start-now', async (c) => {
+      const { store, manager } = c.get('project');
+      const id = c.req.param('id');
+      if (!store.getRun(id)) return c.json({ error: 'not found' }, 404);
+      const outcome = await manager.startNow(id);
+      if (outcome === 'not-queued') return c.json({ error: 'run is not queued' }, 409);
+      if (outcome === 'held') return c.json({ error: 'the agent account is held by a usage limit' }, 409);
+      return c.json({ started: true as const });
+    })
+
     // Live-session participation (spec 002): deliver a user message (text +
     // pasted screenshots) into the run's open claude session.
     .post('/runs/:id/messages', jsonZodValidator(messageSchema), async (c) => {
@@ -5080,9 +5126,11 @@ export function createApp(deps: ServerDeps) {
     .post('/runs/:id/finish', (c) => {
       const { store, manager } = c.get('project');
       const id = c.req.param('id');
-      if (!store.getRun(id)) return c.json({ error: 'not found' }, 404);
+      const before = store.getRun(id);
+      if (!before) return c.json({ error: 'not found' }, 404);
       const finished = manager.finish(id);
       if (!finished) return c.json({ error: 'no open session' }, 409);
+      if (before.status === 'review') track('review_decided', { label: 'accepted' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ finished: true });
     })
 
@@ -5092,6 +5140,7 @@ export function createApp(deps: ServerDeps) {
       const id = c.req.param('id');
       if (!store.getRun(id)) return c.json({ error: 'not found' }, 404);
       const answer = await manager.land(id);
+      if (answer.outcome === 'landed') track('review_decided', { label: 'landed' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({
         outcome: answer.outcome,
         message: answer.message,
@@ -5433,7 +5482,7 @@ export function createApp(deps: ServerDeps) {
     // An `Accept` that asks for images reaches the same raw branch without the flag — which is
     // what an `<img>` sends — while the flag still wins whenever it is present and `*<slash>*`
     // (every `fetch`) still gets the JSON listing. See `negotiate`.
-    .get('/runs/:id/files', queryZodValidator(z.object({ path: queryValue, raw: queryValue })), async (c) => {
+    .get('/runs/:id/files', queryZodValidator(z.object({ path: queryValue, raw: queryValue, rev: queryValue.refine((v) => v === undefined || isCommitSha(v), 'rev must be a full commit sha') })), async (c) => {
       const { root: repoRoot, store } = c.get('project');
       const query = c.req.valid('query');
       c.header('vary', 'Accept');
@@ -5445,6 +5494,20 @@ export function createApp(deps: ServerDeps) {
       if (!run) return c.json({ error: 'not found' }, 404);
       const workingDirectory = workingDirectoryOf(run, repoRoot);
       if (!workingDirectory) return c.json({ error: NO_WORKTREE }, 409);
+      // `rev` (a full sha, the changes payload's `baseSha`) serves an image's OLD side from git —
+      // the before of a modified image, the only picture of a deleted one. Bytes only.
+      if (query.rev !== undefined) {
+        if (!wantsRaw) return c.json({ error: 'rev is only served as raw image bytes' }, 409);
+        const old = await readImageAtRev(workingDirectory, query.rev, query.path ?? '');
+        if (old.kind === 'refused') return c.json({ error: old.error }, 409);
+        return c.body(new Uint8Array(old.bytes).buffer as ArrayBuffer, 200, {
+          'content-type': old.mime,
+          'x-content-type-options': 'nosniff',
+          'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+          // Addressed by content: the same sha and path are the same bytes forever.
+          'cache-control': 'private, max-age=31536000, immutable',
+        });
+      }
       const result = await readWorktreePath(workingDirectory, query.path ?? '');
       if (result.kind === 'invalid' || result.kind === 'missing') {
         return c.json({ error: result.error }, 409);
@@ -5579,6 +5642,7 @@ export function createApp(deps: ServerDeps) {
       // One publish per run at a time: a cockpit re-asking after its response was lost (telemetry
       // 9119d21a) joins the publish still running instead of racing its autosave commit and push.
       const key = `${dataDir}\0${id}`;
+      const sid = deviceSid(c.req.header('x-cezar-sid'));
       let publish = prPublishes.get(key);
       if (!publish) {
         const branch = run.branch;
@@ -5592,6 +5656,7 @@ export function createApp(deps: ServerDeps) {
           // ahead of the push looks like. It exists now.
           const createdNumber = refNumberFromUrl(outcome.url);
           if (createdNumber !== null) forgetRefStatus(repoRoot, createdNumber);
+          track('pr_opened', { label: draft ? 'draft' : 'ready' }, { sid });
           store.updateRun(id, {
             pullRequestUrl: outcome.url,
             status: 'done',
@@ -5634,6 +5699,7 @@ export function createApp(deps: ServerDeps) {
       // Unlike `POST /pr`, the status stays: the agent's session, not the cockpit, owns the run.
       store.updateRun(id, { pullRequestUrl: pr.url });
       store.appendEvent(id, { type: 'note', message: `PR opened by the agent: ${pr.url}` });
+      track('pr_opened', { label: 'agent' }, { sid: deviceSid(c.req.header('x-cezar-sid')) });
       return c.json({ found: true as const, url: pr.url });
     })
 
@@ -6153,6 +6219,8 @@ export function createApp(deps: ServerDeps) {
           task,
           runner: parsed.data?.runner,
           model: parsed.data?.model,
+          origin: 'inbox',
+          deviceSid: deviceSid(c.req.header('x-cezar-sid')),
         });
         await markStarted(dataDir, id, run.id);
         return c.json({ run }, 201);
@@ -6205,15 +6273,14 @@ export function createApp(deps: ServerDeps) {
           if (replaying) buffered.push(event);
           else void writeEvent(event);
         };
-        const onRun = (run: RunRecord) => {
-          if (run.id !== id) return;
-          void stream.writeSSE({ event: 'run', data: JSON.stringify(run) });
-        };
         const offEvent = onRunEvent(store, id, onEvent);
-        store.on('run', onRun);
+        const offRun = onRunFrames(store, (run, frames) => {
+          if (run.id !== id) return;
+          void stream.writeSSE({ event: 'run', data: frames.record() });
+        });
         stream.onAbort(() => {
           offEvent();
-          store.off('run', onRun);
+          offRun();
         });
 
         const replay = query.cursor
@@ -6249,7 +6316,6 @@ export function createApp(deps: ServerDeps) {
     .get('/events', (c) => {
       const { dataDir, store } = c.get('project');
       return streamSSENoBuffer(c, async (stream) => {
-        const onRun = (run: RunRecord) => void stream.writeSSE({ event: 'run', data: JSON.stringify(run) });
         const onDeleted = (id: string) =>
           void stream.writeSSE({
             event: 'run-deleted',
@@ -6278,10 +6344,10 @@ export function createApp(deps: ServerDeps) {
           }
           void stream.writeSSE({ event: 'usage', data: JSON.stringify(owned) });
         });
-        store.on('run', onRun);
+        const offRun = onRunFrames(store, (_run, frames) => void stream.writeSSE({ event: 'run', data: frames.record() }));
         const offDeleted = onRunDeleted(store, onDeleted);
         stream.onAbort(() => {
-          store.off('run', onRun);
+          offRun();
           offDeleted();
           offTodos();
           offUsage();
@@ -6303,11 +6369,6 @@ export function createApp(deps: ServerDeps) {
         const attach = (project: string, ctx: Pick<ProjectContext, 'store' | 'dataDir' | 'manager'>): void => {
           if (attached.has(project)) return;
           const { store, dataDir } = ctx;
-          const onRun = (run: RunRecord) =>
-            void stream.writeSSE({
-              event: 'run',
-              data: JSON.stringify({ ...run, project }),
-            });
           const onDeleted = (id: string) =>
             void stream.writeSSE({
               event: 'run-deleted',
@@ -6323,16 +6384,18 @@ export function createApp(deps: ServerDeps) {
           // Same opt-in gate as the per-project stream (#471): no capability, no
           // watcher — and each subscription is scoped to its own dataDir (2.3).
           const offTodos = capabilities().followups ? onTodosChanged(dataDir, () => void sendTodos()) : () => undefined;
+          const offRun = onRunFrames(store, (_run, frames) =>
+            void stream.writeSSE({ event: 'run', data: frames.workspace(project) }),
+          );
           const offLifecycle = ctx.manager.lifecycle?.onChange(event => {
             const payload: WorktreeLifecycleInvalidation = { ...event, projectId: project };
             void stream.writeSSE({ event: 'worktree-lifecycle', data: JSON.stringify(payload) });
           });
-          store.on('run', onRun);
           const offDeleted = onRunDeleted(store, onDeleted);
           attached.set(project, {
             store,
             detach: () => {
-              store.off('run', onRun);
+              offRun();
               offDeleted();
               offTodos();
               offLifecycle?.();
@@ -6554,7 +6617,7 @@ export function createApp(deps: ServerDeps) {
       // Not autonomous: an autonomous run skips the review gate (`settleSuccess`) a user may have
       // turned on, and the setup's whole point is a branch the user reviews before it lands. Its agent step is not the last
       // step, so it hands on to the checks without parking.
-      const run = project.manager.startRun(workflow, { task: E2E_SETUP_TASK });
+      const run = project.manager.startRun(workflow, { task: E2E_SETUP_TASK, origin: 'e2e_setup' });
       return c.json({ runId: run.id }, 201);
     });
 

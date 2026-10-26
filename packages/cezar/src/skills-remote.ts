@@ -1,12 +1,13 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { loadConfig, type SkillsRepoSource } from './config.ts';
-import { cezarCacheDir } from './paths.ts';
+import { loadConfig, projectGatedSkillsRepos, type SkillsRepoSource } from './config.ts';
+import { cezarCacheDir, workspaceConfigPath } from './paths.ts';
 import { parseFrontmatter, type Skill } from './skills.ts';
 import { readJsonCache, writeJsonCache } from './skills-cache-state.ts';
+import { loadWorkspaceConfig } from './workspace/config.ts';
 
 /**
  * Team skills from remote git repos (spec 005), janitor-style: a bare clone
@@ -344,7 +345,7 @@ async function resolveRef(bareDir: string, ref: string): Promise<string | null> 
   return null;
 }
 
-// ---- skill discovery (three conventions) --------------------------------------
+// ---- skill discovery --------------------------------------------------------
 
 interface SkillPathHit {
   /** null → the name comes from the file's frontmatter (markdown convention). */
@@ -352,8 +353,13 @@ interface SkillPathHit {
   kind: 'skill' | 'command' | 'markdown';
 }
 
+/** A markdown file is under a `skills/` folder when a directory so named is among its ancestors. */
+function isUnderSkillsDir(line: string): boolean {
+  return line.endsWith('.md') && line.split('/').slice(0, -1).includes('skills');
+}
+
 /**
- * Match the janitor conventions plus our own:
+ * Default discovery — the three conventions (BACKWARD_COMPATIBILITY §5, additive only):
  *  - `**\/SKILL.md`          → skill named after the parent directory (with references/)
  *  - `**\/commands/<n>.md`   → skill `<n>`
  *  - `.ai/skills/**\/*.md` or `.ai/cezar/skills/**\/*.md` → frontmatter/basename name
@@ -372,11 +378,49 @@ function matchSkillPath(line: string): SkillPathHit | null {
 }
 
 /**
+ * Strict discovery for organisation repos: only what lives under a `skills/` folder, at any depth.
+ *  - `…/skills/**\/<name>/SKILL.md` → directory skill named after its folder; the other files
+ *    in that folder (`references/…`) belong to it and are not skills of their own
+ *  - any other `…/skills/**\/*.md` → a flat skill (frontmatter name, else the file name)
+ */
+function matchSkillsDirPath(line: string, skillDirs: readonly string[]): SkillPathHit | null {
+  if (!isUnderSkillsDir(line)) return null;
+  const parts = line.split('/');
+  if (parts[parts.length - 1] === 'SKILL.md') {
+    const parent = parts[parts.length - 2];
+    return parent && parent !== 'skills' ? { name: parent, kind: 'skill' } : null;
+  }
+  if (skillDirs.some((dir) => line.startsWith(`${dir}/`))) return null;
+  return { name: null, kind: 'markdown' };
+}
+
+/**
+ * Read one file from the bare clone at the source's ref. Null on any failure.
+ * `atCommit` pins the read to an already-resolved commit, so a caller listing
+ * many files reads them all at the same commit (and skips re-resolving).
+ */
+export async function readRemoteSkill(
+  src: SkillsRepoSource,
+  path: string,
+  atCommit?: string,
+): Promise<string | null> {
+  const bareDir = bareDirFor(src.repo);
+  if (!existsSync(join(bareDir, 'HEAD'))) return null;
+  const ref = atCommit ?? (await resolveRef(bareDir, src.ref));
+  if (ref === null) return null;
+  const res = await git(['show', `${ref}:${path}`], LIST_TIMEOUT_MS, bareDir);
+  return res.ok ? res.stdout : null;
+}
+
+/**
  * List every skill the repo defines at `src.ref`. Reads from the local bare
  * clone only — no network. Empty list when the clone doesn't exist yet or
  * the ref can't be resolved.
  */
-export async function listRemoteSkills(src: SkillsRepoSource): Promise<Skill[]> {
+export async function listRemoteSkills(
+  src: SkillsRepoSource,
+  opts: { skillsDirOnly?: boolean } = {},
+): Promise<Skill[]> {
   const bareDir = bareDirFor(src.repo);
   if (!existsSync(join(bareDir, 'HEAD'))) return [];
   // An immutable SHA (#428): the tree listing and every body below are read at
@@ -389,20 +433,29 @@ export async function listRemoteSkills(src: SkillsRepoSource): Promise<Skill[]> 
   const ls = await git(['ls-tree', '-r', commit, '--'], LIST_TIMEOUT_MS, bareDir);
   if (!ls.ok) return [];
 
-  const entries: Array<{ path: string; sha: string; hit: SkillPathHit }> = [];
+  const entries: Array<{ path: string; sha: string }> = [];
   for (const line of ls.stdout.split('\n')) {
     const tab = line.indexOf('\t');
     if (tab === -1) continue;
     const sha = line.slice(0, tab).split(' ')[2];
     const path = line.slice(tab + 1);
-    const hit = path ? matchSkillPath(path) : null;
-    if (sha && hit) entries.push({ path, sha, hit });
+    if (sha && path) entries.push({ path, sha });
   }
-  const blobs = await batchReadBlobs(bareDir, [...new Set(entries.map((entry) => entry.sha))]);
+  const paths = entries.map((entry) => entry.path);
+  const skillDirs = paths
+    .filter((p) => isUnderSkillsDir(p) && p.endsWith('/SKILL.md'))
+    .map((p) => p.slice(0, -'/SKILL.md'.length))
+    .filter((dir) => dir.split('/').pop() !== 'skills');
+  const wanted = entries.filter((entry) =>
+    opts.skillsDirOnly ? matchSkillsDirPath(entry.path, skillDirs) : matchSkillPath(entry.path),
+  );
+  const blobs = await batchReadBlobs(bareDir, [...new Set(wanted.map((entry) => entry.sha))]);
 
   const skills: Skill[] = [];
   const seen = new Set<string>();
-  for (const { path: skillPath, sha, hit } of entries) {
+  for (const { path: skillPath, sha } of wanted) {
+    const hit = opts.skillsDirOnly ? matchSkillsDirPath(skillPath, skillDirs) : matchSkillPath(skillPath);
+    if (!hit) continue;
     const raw = blobs.get(sha);
     if (raw === undefined) continue;
     const { frontmatter, body } = parseFrontmatter(raw);
@@ -580,7 +633,38 @@ function beginTeamLoad(repoRoot: string, refresh: boolean): Promise<Skill[]> {
   return load;
 }
 
+/** Forget every project's team-skill list — the workspace's org repos changed. */
+let teamSkillsGeneration = 0;
+let lastOrgSignature: string | undefined;
+
+/** The org repos as currently on disk. `~/.cezar/` is shared by every cezar process, so another
+ *  server's save must invalidate this process's cache too — a local callback cannot see it. */
+function orgReposSignature(): string {
+  try {
+    const raw: unknown = JSON.parse(readFileSync(workspaceConfigPath(), 'utf8'));
+    return JSON.stringify((raw as { orgSkillsRepos?: unknown } | null)?.orgSkillsRepos ?? null);
+  } catch {
+    return 'null';
+  }
+}
+
+export function invalidateTeamSkills(): void {
+  teamSkillsGeneration++;
+  teamSkillsByRoot.clear();
+  teamLoadInFlight.clear();
+  lastListByRoot.clear();
+}
+
+/** Drop every cached list when the org repos on disk differ from the ones last loaded. */
+function syncOrgSignature(): void {
+  const signature = orgReposSignature();
+  if (signature === lastOrgSignature) return;
+  lastOrgSignature = signature;
+  invalidateTeamSkills();
+}
+
 function initialTeamSkillsLoad(repoRoot: string): Promise<Skill[]> {
+  syncOrgSignature();
   const loadedAt = lastListByRoot.get(repoRoot);
   if (
     teamSkillsByRoot.has(repoRoot) &&
@@ -619,13 +703,40 @@ export function refreshTeamSkills(repoRoot: string): Promise<Skill[]> {
   return beginTeamLoad(repoRoot, true);
 }
 
+/** Which repository a source names: the cache directory, with GitHub's case-insensitive
+ *  owner/name folded (shorthand and github.com URLs); local paths keep their case. */
+export function sourceIdentity(repo: string): string {
+  const key = basename(bareDirFor(repo));
+  const github = /^[\w.-]+\/[\w.-]+$/.test(repo) || /^(?:[a-z+]+:\/\/|git@)(?:[^@/]+@)?github\.com[/:]/i.test(repo);
+  return github ? key.toLowerCase() : key;
+}
+
 async function loadTeamSkills(repoRoot: string, refresh: boolean, epoch: number): Promise<Skill[]> {
   if (backgroundWorkAborted) return teamSkillsByRoot.get(repoRoot) ?? [];
   hydrateFetchState();
+  syncOrgSignature();
+  const generation = teamSkillsGeneration;
   const config = await loadConfig(repoRoot);
+  const org = (await loadWorkspaceConfig().catch(() => null))?.orgSkillsRepos ?? [];
+  // Org repos are the user's own: strict `skills/` discovery, so docs and commands stay out.
+  // Order: what the project lists itself, then the org repos, then the implicit default. The
+  // project's own list is kept as written (one repo at several refs is legitimate); org and
+  // default entries are dropped when their repository (by cache identity) is already present.
+  const implicit = await projectGatedSkillsRepos(repoRoot);
+  const orgSources = org.map((src) => ({ repo: src.repo, ref: src.ref, skillsDirOnly: true }));
+  const own = config.skillsRepos.filter((src) => !implicit.has(src.repo));
+  const defaults = config.skillsRepos.filter((src) => implicit.has(src.repo));
+  const sources: Array<SkillsRepoSource & { skillsDirOnly?: boolean }> = [...own];
+  const seenRepos = new Set(own.map((src) => sourceIdentity(src.repo)));
+  for (const src of [...orgSources, ...defaults]) {
+    const identity = sourceIdentity(src.repo);
+    if (seenRepos.has(identity)) continue;
+    seenRepos.add(identity);
+    sources.push(src);
+  }
   const out: Skill[] = [];
   const seen = new Set<string>();
-  for (const src of config.skillsRepos) {
+  for (const src of sources) {
     if (backgroundWorkAborted) break;
     try {
       if (refresh) {
@@ -660,7 +771,7 @@ async function loadTeamSkills(repoRoot: string, refresh: boolean, epoch: number)
       // offline / no access — list whatever an older clone has (or nothing)
     }
     try {
-      for (const skill of await listRemoteSkills(src)) {
+      for (const skill of await listRemoteSkills(src, { skillsDirOnly: src.skillsDirOnly })) {
         if (seen.has(skill.name)) continue;
         seen.add(skill.name);
         out.push(skill);
@@ -670,8 +781,9 @@ async function loadTeamSkills(repoRoot: string, refresh: boolean, epoch: number)
     }
   }
   // Discard a superseded (older) completion: a refresh racing the passive load
-  // must not leave the stale list cached.
-  if (loadEpoch.get(repoRoot) === epoch) {
+  // must not leave the stale list cached. An invalidation during this load means
+  // its source list is stale too.
+  if (loadEpoch.get(repoRoot) === epoch && generation === teamSkillsGeneration) {
     teamSkillsByRoot.set(repoRoot, out);
     lastListByRoot.set(repoRoot, Date.now());
   }
