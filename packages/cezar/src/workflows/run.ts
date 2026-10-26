@@ -2351,6 +2351,7 @@ export class RunManager {
       this.store.appendEvent(runId, { type: 'lifecycle', message: 'review accepted — finished without a PR' });
     }
     state?.releaseWorktree?.();
+    if (state) state.releaseWorktree = undefined;
     state?.releaseRepoRoot?.();
     if (state) state.releaseRepoRoot = undefined;
     if (state?.cancellationTimer) clearTimeout(state.cancellationTimer);
@@ -3019,9 +3020,11 @@ export class RunManager {
   private staleActive(runId: string): ActiveRun | undefined {
     const state = this.active.get(runId);
     if (!state?.sessionEverOpened || state.cancelled || state.cancellationTimer) return undefined;
+    if (state.turnSettled || state.continueOnDrop) return undefined;
     const run = this.store.getRun(runId);
     if (!run || !CONTINUABLE_STATUSES.includes(run.status)) return undefined;
-    const turnLeftOpen = run.steps.some((step) => step.status === 'running' || step.status === 'waiting');
+    const ownSteps = state.currentStepId ? run.steps.filter((step) => step.id === state.currentStepId) : run.steps;
+    const turnLeftOpen = ownSteps.some((step) => step.status === 'running' || step.status === 'waiting');
     return turnLeftOpen ? state : undefined;
   }
 
