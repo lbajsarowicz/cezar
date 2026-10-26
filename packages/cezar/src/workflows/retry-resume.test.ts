@@ -332,6 +332,7 @@ describe('onFail.retry resumes the retried step instead of restarting it', () =>
     it.each([
       ['the CLI reports it on stderr', () => setEnv('CEZ_MOCK_MISSING_SESSIONS', '*'), 'mock:plain'],
       ['the CLI reports it only in the result frame `errors`', () => undefined, 'mock:session-gone'],
+      ['the CLI also echoes it into the result frame `result`', () => undefined, 'mock:session-gone-text'],
     ])('a pruned conversation on retry goes through the missing-session fallback when %s', async (_label, arm, marker) => {
       arm();
       const { id, argv, prompts } = await runClaude(marker);

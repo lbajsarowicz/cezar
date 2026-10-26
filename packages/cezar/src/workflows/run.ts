@@ -6749,11 +6749,14 @@ export class RunManager {
     // `execute`. Expand before the chain/check/attachment prefixes so the leading slash still
     // matches; a leading `/name` that is not a known skill passes through byte-for-byte.
     userPrompt = expandRegistrySlashSkillText(userPrompt, state.skills ?? []);
+    const withChainNote = (prompt: string): string => chainNote ? `${chainNote}\n\n---\n\n${prompt}` : prompt;
+    // The instructions a later retry compares against: the step's own, without the preamble a
+    // usage-limit resume adds. A restart resume replaces the prompt altogether, so it records none.
+    const instructions = withChainNote(userPrompt);
     if (resumeStep) userPrompt = `${AUTO_RESUME_PROMPT}\n\nCurrent task and queued updates:\n\n${userPrompt}`;
-    if (chainNote) userPrompt = `${chainNote}\n\n---\n\n${userPrompt}`;
-    const instructions = userPrompt;
+    userPrompt = withChainNote(userPrompt);
     const previousInstructions = state.stepInstructions?.get(step.id);
-    (state.stepInstructions ??= new Map()).set(step.id, instructions);
+    if (step.prompt !== RESTART_CONTINUATION_PROMPT) (state.stepInstructions ??= new Map()).set(step.id, instructions);
     // A commander recovered after a restart opens its first session holding whatever its children
     // reported while it was gone (spec Q7). Prepended and cleared here, after the slash expansion
     // so a leading `/skill` still matched, and before the failure/attachment suffixes.
@@ -6790,7 +6793,7 @@ export class RunManager {
       ? this.store.getRun(runId)?.steps.find((s) => s.id === step.id)
       : undefined;
     let resumeFrom = previous?.sessionId && previous.backend === backend && isResumableSession(previous, backend)
-      ? { sessionId: previous.sessionId, profileId: previous.profileId }
+      ? { sessionId: previous.sessionId, profileId: previous.profileId ?? DEFAULT_AGENT_ACCOUNT_ID }
       : undefined;
     // A graph node re-renders its prompt from upstream outputs on every pass, so a retry whose
     // instructions changed must carry the new ones, not just the failure.
@@ -7143,7 +7146,7 @@ export class RunManager {
     const runner = createRunner(stepBackend);
     // The session lives in its account's config dir, so under any other account it cannot reopen;
     // and a runner that might quietly open a blank session would lose the task with it.
-    if (resumeFrom && (!runner.strictResume || (resumeFrom.profileId !== undefined && stepProfile.profileId !== resumeFrom.profileId))) {
+    if (resumeFrom && (!runner.strictResume || stepProfile.profileId !== resumeFrom.profileId)) {
       resumeFrom = undefined;
       sessionId = randomUUID();
       this.store.updateStep(runId, step.id, { sessionId, backend, sessionConfirmed: backend === 'claude' });

@@ -63,6 +63,12 @@ const HELD_UI_EVENTS = new Set<UiEvent['type']>([
   'usage.updated',
 ]);
 
+function isMessageText(event: UiEvent): boolean {
+  if (event.type === 'item.delta') return event.field === 'text';
+  return (event.type === 'item.started' || event.type === 'item.updated' || event.type === 'item.completed')
+    && event.item.kind === 'message';
+}
+
 /**
  * Guards one resumed session against a conversation the backend no longer has (Claude prunes
  * transcripts after `cleanupPeriodDays`; see `resumeFallbackPredicate` for the rest). Until the resume shows signs of life its errors and
@@ -77,6 +83,7 @@ export class ResumeFallback {
   private held: AgentEvent[] = [];
   private heldUi: UiEvent[] = [];
   private sent: ContentBlock[][] = [];
+  private settleQueued = false;
 
   constructor(
     resuming: boolean,
@@ -106,8 +113,11 @@ export class ResumeFallback {
       this.held.push(event);
       return true;
     }
+    if (event.type === 'text') {
+      this.settleAfterFrame();
+      return false;
+    }
     const alive =
-      event.type === 'text' ||
       event.type === 'tool-call' ||
       event.type === 'tool-result' ||
       event.type === 'image' ||
@@ -123,8 +133,28 @@ export class ResumeFallback {
       this.heldUi.push(event);
       return true;
     }
-    this.settle();
+    if (isMessageText(event)) this.settleAfterFrame();
+    else this.settle();
     return false;
+  }
+
+  /**
+   * Text proves the session alive only when no error follows in the same wire frame: Claude can
+   * echo a missing-session reason into the `result` of the error frame, which arrives as text
+   * just before the error. A frame's events are delivered synchronously, so a microtask runs
+   * after all of them.
+   */
+  private settleAfterFrame(): void {
+    if (this.held.length > 0) {
+      this.settle();
+      return;
+    }
+    if (this.settleQueued) return;
+    this.settleQueued = true;
+    queueMicrotask(() => {
+      this.settleQueued = false;
+      if (this.pending && this.held.length === 0) this.settle();
+    });
   }
 
   /** Remember what the user sends while the resume is unproven, to replay into a fresh session. */

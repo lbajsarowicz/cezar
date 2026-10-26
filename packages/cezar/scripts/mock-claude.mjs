@@ -143,13 +143,15 @@ async function respond(userText, imageCount) {
   await pace(250);
   // `mock:session-gone` on a `--resume` spawn → the other envelope Claude Code emits for a
   // conversation it no longer has: an `is_error` result carrying the reason only in `errors`,
-  // then exit 1.
+  // then exit 1. `mock:session-gone-text` also echoes the reason into `result`.
   if (resumedId && userText.includes('mock:session-gone')) {
+    const reason = `No conversation found with session ID: ${resumedId}`;
     emit({
       type: 'result',
       subtype: 'error_during_execution',
       is_error: true,
-      errors: [`No conversation found with session ID: ${resumedId}`],
+      ...(userText.includes('mock:session-gone-text') ? { result: reason } : {}),
+      errors: [reason],
       usage: { input_tokens: 0, output_tokens: 0 },
       total_cost_usd: 0,
     });
