@@ -1179,10 +1179,11 @@ export function useRunChanges(id: string | undefined, live = false) {
     queryFn: ({ signal }) => getRunChanges(id as string, { signal }),
     enabled: Boolean(id),
     retry: false,
-    // Every run-record update on the stream refetches this (global-events.tsx); each agent
-    // message moves the record's token count, so the tab keeps up message by message. A long
-    // shell command, or a person editing the worktree by hand, changes files while the record
-    // stays still — this slow backstop is for those (#changes-live).
+    // Run-record updates on the stream refetch this, at most once per 1.5 s window
+    // (global-events.tsx); each agent message moves the record's token count, so the tab trails
+    // the agent by one window at most. A long shell command, or a person editing the worktree by
+    // hand, changes files while the record stays still — this slow backstop is for those
+    // (#changes-live).
     refetchInterval: live ? RUN_GIT_BACKSTOP_MS : false,
     // Once a run finishes, polling stops (live === false) — but final agent/post-run-hook
     // writes and the user editing files in the worktree still change the diff. Scope a

@@ -920,11 +920,12 @@ export async function worktreeChangedFiles(
   opts: { taskBranch?: string; runStartedAt?: string } = {},
 ): Promise<string[] | null> {
   if (!isSafeGitRef(baseBranch)) return null;
-  await git(worktreePath, ['add', '-N', '.']);
-  const { base } = await resolveTaskDiffBase((args) => git(worktreePath, args), baseBranch, opts);
-  const res = await git(worktreePath, ['diff', '--name-only', base]);
-  if (!res.ok) return null;
-  return res.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+  return withScratchIntentToAddIndex(worktreePath, async (env) => {
+    const { base } = await resolveTaskDiffBase((args) => git(worktreePath, args, envOpts(env)), baseBranch, opts);
+    const res = await git(worktreePath, ['diff', '--name-only', base], envOpts(env));
+    if (!res.ok) return null;
+    return res.stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+  });
 }
 
 export async function worktreeShortstat(
@@ -935,7 +936,7 @@ export async function worktreeShortstat(
   if (!isSafeGitRef(baseBranch)) return null;
   return withScratchIntentToAddIndex(worktreePath, async (env) => {
     const { base, repointedHead } = await resolveTaskDiffBase(
-      (args) => git(worktreePath, args, env),
+      (args) => git(worktreePath, args, envOpts(env)),
       baseBranch,
       opts,
     );

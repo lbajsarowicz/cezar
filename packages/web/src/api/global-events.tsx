@@ -566,7 +566,10 @@ function applyGlobalEvent(
     case 'run': {
       const listKey = queryKeys.runs.list()
       const list = queryClient.getQueryData<ApiRun[]>(listKey)
+      // The step-state baseline for the commit-list check below; a slim frame carries no steps,
+      // so it is compared after merging onto this.
       const previous = list?.find((run) => run.id === event.run.id)
+        ?? queryClient.getQueryData<ApiRun>(queryKeys.runs.detail(event.run.id))
       if (list && !isFullRunRecord(event.run) && !list.some((row) => row.id === event.run.id)) {
         // A run this list never held arrives as a slim frame, which is not a row: fetch the one.
         unknownRun.run(event.run.id, event.run)
@@ -592,8 +595,8 @@ function applyGlobalEvent(
       // token count), so only a step or run state change refetches it; a commit made mid-step
       // shows by the Commits tab's slow backstop.
       const commitsKey = queryKeys.runs.commits(event.run.id)
-      const next = previous ? mergeRun(previous, event.run) : isFullRunRecord(event.run) ? event.run : undefined
-      if (queryClient.getQueryData(commitsKey) !== undefined && (next === undefined || stepProgress(previous) !== stepProgress(next))) {
+      const stepStateChanged = previous === undefined || stepProgress(previous) !== stepProgress(mergeRun(previous, event.run))
+      if (queryClient.getQueryData(commitsKey) !== undefined && stepStateChanged) {
         void queryClient.invalidateQueries({ queryKey: commitsKey })
       }
       // A terminal transition can reclaim (or re-materialize) a worktree (#483); keep the
