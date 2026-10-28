@@ -1,3 +1,4 @@
+import { ensureDataGitignore } from '../data-gitignore.ts';
 import { join } from 'node:path';
 import { AutomationStore } from '../automations/store.ts';
 import { reconcileAutomationReceipts } from '../automations/task-template.ts';
@@ -92,6 +93,8 @@ export class ProjectContextError extends Error {
  */
 export class ProjectContexts {
   private readonly contexts = new Map<string, ProjectContext>();
+  private readonly preparationListeners = new Set<(context: ProjectContext) => Promise<void | (() => void)>>();
+  private readonly preparationCleanup = new WeakMap<ProjectContext, (() => void)[]>();
   private shutdownPromise?: Promise<void>;
   private readonly building = new Map<string, Promise<ProjectContext>>();
   /** Startup worktree sweeps still running; shutdown waits for them. */
@@ -126,6 +129,11 @@ export class ProjectContexts {
     } finally {
       this.building.delete(projectId);
     }
+  }
+
+  /** Preparation may return cleanup, called on failed recovery and normal disposal. */
+  onBeforeRecover(listener: (context: ProjectContext) => Promise<void | (() => void)>): () => void {
+    this.preparationListeners.add(listener); return () => this.preparationListeners.delete(listener);
   }
 
   /**
@@ -194,6 +202,7 @@ export class ProjectContexts {
     const ctx = this.contexts.get(projectId);
     if (!ctx) return false;
     this.contexts.delete(projectId);
+    this.cleanupPreparation(ctx);
     teardown(ctx);
     return true;
   }
@@ -221,12 +230,21 @@ export class ProjectContexts {
     return this.shutdownPromise;
   }
 
+  private cleanupPreparation(context: ProjectContext): void {
+    const cleanups = this.preparationCleanup.get(context) ?? [];
+    this.preparationCleanup.delete(context);
+    for (const cleanup of cleanups.reverse()) {
+      try { cleanup(); } catch { /* Optional teardown must not prevent task cleanup. */ }
+    }
+  }
+
   private async build(projectId: string): Promise<ProjectContext> {
     const projects = await this.deps.listProjects();
     const project = projects.find((p) => p.id === projectId);
     if (!project) throw new ProjectContextError('unknown-project', projectId);
     if (project.status === 'missing') throw new ProjectContextError('missing-root', projectId);
 
+    ensureDataGitignore(project.root);
     const dataDir = join(project.root, '.ai/cezar');
     // keepLive + recover() (#367), same as serveCommand: runs that were live
     // when this project's context last existed are re-queued or resumed.
@@ -236,8 +254,16 @@ export class ProjectContexts {
     reconcileAutomationReceipts(automationStore, store);
     this.notifyStoreCreated(store);
     const manager = new RunManager(store, project.root, { semaphore: this.semaphore, projectId: project.id, resolveTrackerEnv: resolveTrackerAgentEnv });
+    let context: ProjectContext | undefined;
     try {
       const launchKey = ensureLaunchKey(dataDir);
+      context = { id: project.id, root: project.root, dataDir, store, manager, automationStore, launchKey };
+      const cleanups: (() => void)[] = [];
+      this.preparationCleanup.set(context, cleanups);
+      for (const prepare of this.preparationListeners) {
+        try { const cleanup = await prepare(context); if (cleanup) cleanups.push(cleanup); }
+        catch { /* Optional services never block recovery. */ }
+      }
       await manager.recover();
       // Which repository this project IS (#945), so the referenced tier stops adopting another
       // repo's PR/issue as a task's subject. Fire-and-forget on purpose — it costs a `gh` spawn
@@ -267,9 +293,10 @@ export class ProjectContexts {
           });
         });
       }
-      return { id: project.id, root: project.root, dataDir, store, manager, automationStore, launchKey };
+      return context;
     } catch (err) {
       // A failed build must not leak the half-built context's subscriptions.
+      if (context) this.cleanupPreparation(context);
       teardown({ store, manager });
       throw err;
     }

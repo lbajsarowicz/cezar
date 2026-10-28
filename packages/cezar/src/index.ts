@@ -255,8 +255,14 @@ async function serveCommand(
     { bootInOrder, sweepStartupWorktrees },
     { isSupervised, restartProcess },
     { printSkillsBanner, printStarBanner },
-    { apiOrigin, pickPort },
+    { apiOrigin },
+    { pickStartupPort },
     { collectFeatureInventory },
+    { WebhookCoordinator },
+    { webhooksEnabled },
+    { allocateProjectSlug, listProjects },
+    { listServerInstances: webhookServerInstances },
+    { loadWorkspaceConfig },
   ] = await Promise.all([
     import('./workspace/boot.ts'),
     import('./workspace/semaphore.ts'),
@@ -272,7 +278,13 @@ async function serveCommand(
     import('./self-update/restart.ts'),
     import('./skills-banner.ts'),
     import('./api-origin.ts'),
+    import('./startup-port.ts'),
     import('./feature-telemetry.ts'),
+    import('./webhooks/coordinator.ts'),
+    import('./webhooks/service.ts'),
+    import('./workspace/projects.ts'),
+    import('./server-install/state.ts'),
+    import('./workspace/config.ts'),
   ]);
 
   const bootProjectId = await initWorkspace(repoRoot);
@@ -329,6 +341,19 @@ async function serveCommand(
   const checks = await detectEnvironment();
   const repo = repoInfo ?? null;
 
+  let webhookPort = preferredPort;
+  const webhooks = webhooksEnabled() ? new WebhookCoordinator({
+    mode: () => resolveCapabilities(process.env, bindHost).localHandoff ? 'local' : 'hosted',
+    ports: () => [webhookPort, ...webhookServerInstances().map(instance => instance.state.primaryPort)],
+    projects: async () => listProjects(), dryRun: process.env.CEZ_DRY_RUN === '1',
+    singleProject: resolveCapabilities(process.env, bindHost).singleProject,
+  }) : undefined;
+  if (webhooks) {
+    const registry = (await loadWorkspaceConfig()).projects;
+    const publicId = bootProjectId ?? allocateProjectSlug(repoRoot, registry.map(project => project.id));
+    await webhooks.attach({ root: repoRoot, store, manager }, publicId, false, true);
+  }
+
   const booted = await bootInOrder({
     recover: async () => {
       const recovered = store
@@ -340,9 +365,11 @@ async function serveCommand(
         providerRuntimeAuth,
       );
       if (recovered > 0) console.log(`  recovered ${recovered} run(s) from the previous session`);
+      webhooks?.ready(repoRoot);
     },
     serve: async () => {
-      const port = await pickPort(preferredPort, bindHost);
+      const port = await pickStartupPort(preferredPort, process.env.CEZ_REMOTE === '1', bindHost);
+      webhookPort = port;
 
       // Update discovery (#368) through the self-update service (PoC): the channel's newest
       // version lands on /api/v1/health as `latestVersion` for the chip, and the dialog behind the
@@ -414,6 +441,7 @@ async function serveCommand(
         providerAuth,
         providerRuntimeAuth,
         workspaceEvents,
+        webhooks,
         selfUpdate,
       }, port);
       const listening = new Promise<void>((resolveListening) => httpServer?.once('listening', () => resolveListening()));
@@ -504,7 +532,10 @@ async function serveCommand(
   // paint is the cockpit and never a connection error.
   if (openBrowser) {
     const healthy = await waitForHealth(`${url}/api/v1/health`, 5_000);
-    if (healthy) openUrl(url);
+    if (healthy) {
+      const { launchPageUrl } = await import('./cockpit-address.ts');
+      openUrl(launchPageUrl(url));
+    }
   }
 }
 
