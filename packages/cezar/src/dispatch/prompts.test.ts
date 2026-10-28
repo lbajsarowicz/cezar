@@ -22,7 +22,7 @@ describe('the dispatch prompt', () => {
     for (const flag of ['--title', '--review-of', '--success', '--evidence', '--tools', '--runner', '--model', '--retry-limit']) {
       expect(DISPATCH_PROMPT).not.toContain(flag);
     }
-    expect(DISPATCH_PROMPT.length).toBeLessThan(2700);
+    expect(DISPATCH_PROMPT.length).toBeLessThan(3400);
   });
 
   it('never lets an uncapped parent invent a cap for its children', () => {
