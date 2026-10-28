@@ -9070,7 +9070,7 @@ export function skillSystemPrompt(
     lines.push(
       '',
       `Skill file: ${delivery.file}`,
-      `${delivery.skillTool ? 'Load this skill with your skill tool, or read that file' : 'Read that file'} before acting. ` +
+      `${delivery.skillTool ? 'Read that file, or load this skill with your skill tool,' : 'Read that file'} before acting. ` +
         `Resolve any file it references (for example references/*.md) against its directory.`,
     );
     return lines.join('\n');

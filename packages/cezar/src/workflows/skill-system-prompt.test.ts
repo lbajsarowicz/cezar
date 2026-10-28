@@ -257,7 +257,7 @@ describe('skillSystemPrompt — path delivery', () => {
     expect(out).toContain('Selected skill: /om-code-review');
     expect(out).toContain('Description: Review a diff.');
     expect(out).toContain('Skill file: /wt/.agents/skills/om-code-review/SKILL.md');
-    expect(out).toContain('Load this skill with your skill tool, or read that file before acting.');
+    expect(out).toContain('Read that file, or load this skill with your skill tool, before acting.');
     expect(out).not.toContain('Do the review.');
   });
 
