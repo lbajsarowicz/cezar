@@ -70,8 +70,9 @@ export class OpencodeHttpError extends Error {
     readonly method: string,
     readonly path: string,
     body: string,
+    detail: string = body.slice(0, 200),
   ) {
-    super(`${method} ${path} → ${status} ${body.slice(0, 200)}`);
+    super(`${method} ${path} → ${status} ${detail}`);
     this.name = 'OpencodeHttpError';
   }
 }
